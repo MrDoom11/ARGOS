@@ -1,6 +1,8 @@
 # ARGOS
 
-Monitor de hardware em desenvolvimento para Windows 11, escrito em Rust. O primeiro protótipo é uma sonda de console para descobrir quais sensores o driver disponibiliza. A GPU de referência é a NVIDIA GeForce RTX 5060 Ti de 16 GB.
+Monitor de hardware em desenvolvimento para Windows 11, escrito em Rust. O console oferece diagnóstico de sensores e coleta contínua com histórico em memória. A GPU de referência é a NVIDIA GeForce RTX 5060 Ti de 16 GB.
+
+As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.md).
 
 ## Compilar e executar
 
@@ -14,11 +16,26 @@ cargo build --release --locked
 
 O comando padrão consulta todas as GPUs NVIDIA enumeradas pela NVML. Cada GPU recebe uma leitura dos sensores básicos e uma tentativa de leitura dos contadores GPM, com 1 s entre as coletas. `--samples` aumenta o número de intervalos GPM por GPU. `--interval-ms` aceita a partir de 101 ms, pois a NVIDIA exige mais de 100 ms entre amostras. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 
+## Coleta contínua
+
+```powershell
+.\target\release\argos.exe watch
+.\target\release\argos.exe watch --gpu 0 --gpu-interval-ms 500 --gpm-interval-ms 1000 --system-interval-ms 2000 --duration-secs 20
+```
+
+`watch` lê os sensores básicos de uma GPU NVIDIA, os contadores GPM e o uso de CPU e RAM. Cada grupo usa inicialmente um intervalo mínimo de 1 s e tem seu próprio ajuste. A GPU de índice 0 é a padrão. Quando ela está indisponível, o monitor mantém a leitura de CPU e RAM. Ao informar `--gpu`, um índice inválido é tratado como erro.
+
+A primeira leitura de CPU e dos contadores GPM aguarda duas amostras. Falhas temporárias e métricas indisponíveis deixam lacunas no histórico. O horário exibido é o tempo decorrido desde o início da coleta. Para GPM, a saída também indica o intervalo observado entre amostras. O uso de CPU é calculado com os tempos ocupado e ocioso do Windows. Em máquinas com múltiplos grupos de processadores, essa leitura fica indisponível, pois a API consultada cobre apenas o grupo primário. [Tempos de CPU do Windows](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getsystemtimes)
+
+O histórico retém até 5 minutos por grupo em memória. O console recebe as atualizações de forma independente da coleta, com uma fila limitada. Pressione `Ctrl+C` ou use `--duration-secs` para encerrar e ver o resumo. Use `watch --help` para consultar os intervalos aceitos.
+
+Na sessão de validação de 30 min e 5 s, com intervalo de 1 s por grupo e saída redirecionada, cada grupo reteve 298 de 300 amostras possíveis na janela final. O processo usou em média 0,082% de um processador lógico e chegou a 31,35 MiB nas medições de memória residente. Esse teste serve de referência para o modo console. O impacto nos tempos de quadro será medido separadamente.
+
 ## Como interpretar as leituras
 
 - O inventário usa as APIs do Windows para identificar o sistema, a CPU, os processadores lógicos ativos e a RAM utilizável.
 - A NVML fornece o modelo da GPU, as versões do driver e da biblioteca, o modo do driver, a VRAM, a atividade geral da GPU e da memória, a temperatura, a potência, os clocks e a atividade de NVENC e NVDEC. Cada API tem sua própria janela de medição. Por exemplo, o driver retorna a potência média de 1 s na GPU de referência. [Consultas de dispositivos da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)
-- A consulta de suporte GPM é feita por GPU. Quando há suporte, duas amostras alimentam o cálculo dos cinco contadores percentuais abaixo. O tempo impresso é o intervalo entre coletas observado pelo programa. Uma leitura válida de `0%` é exibida como valor. Falhas na consulta, na coleta ou em um contador individual são exibidas com o motivo disponível. [Definições dos contadores GPM](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmEnums.html)
+- A consulta de suporte GPM é feita por GPU. Quando há suporte, duas amostras alimentam o cálculo dos cinco contadores percentuais abaixo. Uma leitura válida de `0%` é exibida como valor. A sonda de diagnóstico mostra o motivo disponível quando a consulta, a coleta ou um contador individual falha. [Definições dos contadores GPM](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmEnums.html)
 
 | ID GPM | Métrica | O que o driver mede |
 | --- | --- | --- |
@@ -40,7 +57,7 @@ Na janela de 1 s, o driver reportou 11,81% de atividade FP32, 0,31% de atividade
 2. Repita durante uma carga conhecida. Para validar a resposta dos contadores, mantenha a carga estável por vários intervalos e use cargas que exercitem operações FP32 e Tensor em execuções separadas.
 3. Se quiser comparar com a ferramenta da NVIDIA, faça uma execução separada com `nvidia-smi dmon -i 0 -c 5 -d 1 --gpm-metrics 2,3,5,10,12 --gpm-options d`, nos drivers que aceitam essa opção. O `nvidia-smi` é opcional para a comparação. [Referência do NVIDIA System Management Interface](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 
-RT Cores, cache L2, FPS e frametime seguem em investigação. A interface gráfica, o histórico e a medição de impacto no desempenho pertencem às fases posteriores.
+RT Cores, cache L2, FPS e frametime seguem em investigação. A interface gráfica e a medição de impacto nos tempos de quadro pertencem às fases posteriores.
 
 ## Licença
 

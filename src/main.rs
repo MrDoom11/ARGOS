@@ -8,6 +8,10 @@ mod nvml;
 mod probe;
 #[cfg(windows)]
 mod system;
+#[cfg(windows)]
+mod telemetry;
+#[cfg(windows)]
+mod watch;
 
 #[cfg(windows)]
 fn main() -> ExitCode {
@@ -18,20 +22,30 @@ fn main() -> ExitCode {
             print!("{}", cli::HELP);
             ExitCode::SUCCESS
         }
+        Ok(Command::WatchHelp) => {
+            print!("{}", cli::WATCH_HELP);
+            ExitCode::SUCCESS
+        }
         Ok(Command::Version) => {
             println!("ARGOS {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Command::Probe(options)) => match probe::run(options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("ARGOS: {error}");
-                ExitCode::FAILURE
-            }
-        },
+        Ok(Command::Probe(options)) => report_result(probe::run(options)),
+        Ok(Command::Watch(options)) => report_result(watch::run(options)),
         Err(error) => {
             eprintln!("ARGOS: {error}\nConsulte argos --help.");
             ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn report_result(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("ARGOS: {error}");
+            ExitCode::FAILURE
         }
     }
 }

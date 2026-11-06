@@ -10,6 +10,8 @@ use std::{
 // NVIDIA NVML C declarations: https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h
 type Status = i32;
 const SUCCESS: Status = 0;
+const NOT_SUPPORTED: Status = 3;
+const FUNCTION_NOT_FOUND: Status = 13;
 const NO_DATA: Status = 21;
 const CLOCK_GRAPHICS: u32 = 0;
 const CLOCK_MEMORY: u32 = 2;
@@ -104,7 +106,7 @@ pub struct GpmMetric {
     pub name: &'static str,
 }
 
-static GPM_METRICS: [GpmMetric; 5] = [
+pub(crate) static GPM_METRICS: [GpmMetric; 5] = [
     GpmMetric {
         id: 12,
         name: "Atividade FP32",
@@ -142,6 +144,19 @@ pub enum Error {
     InvalidInterval,
 }
 
+impl Error {
+    pub(crate) fn is_unsupported(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingSymbol(_)
+                | Self::Nvml {
+                    status: NOT_SUPPORTED | FUNCTION_NOT_FOUND,
+                    ..
+                }
+        )
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -160,13 +175,13 @@ impl fmt::Display for Error {
                 )
             }
             Self::Nvml { function, status } => {
-                let reason = match status {
+                let reason = match *status {
                     1 => "NVML não inicializada",
                     2 => "argumento inválido",
-                    3 => "recurso não suportado",
+                    NOT_SUPPORTED => "recurso não suportado",
                     4 => "permissão insuficiente",
                     9 => "driver NVIDIA não carregado",
-                    13 => "função indisponível",
+                    FUNCTION_NOT_FOUND => "função indisponível",
                     15 => "GPU inacessível",
                     17 => "acesso bloqueado pelo sistema operacional",
                     18 => "versões incompatíveis do driver e da biblioteca",
@@ -602,22 +617,47 @@ pub struct GpmReading {
 
 impl GpmSampler<'_> {
     pub fn read(&mut self, interval: Duration) -> Result<GpmReading, Error> {
-        if interval <= GPM_MIN_EXCLUSIVE {
-            return Err(Error::InvalidInterval);
-        }
-        let query = self.nvml.gpm_sample;
-        let sample_get = query.get()?;
-        let start = if let Some(start) = self.baseline.take() {
-            start
-        } else {
-            // The device and both sample handles belong to the live NVML session.
-            query.check(unsafe { sample_get(self.device, self.first.handle) })?;
-            Instant::now()
+        Self::validate_interval(interval)?;
+        let start = match self.baseline {
+            Some(start) => start,
+            None => self.capture(self.first.handle)?,
         };
         thread::sleep(interval.saturating_sub(start.elapsed()));
-        // The second handle is a distinct buffer allocated for this live session.
-        query.check(unsafe { sample_get(self.device, self.second.handle) })?;
-        let end = Instant::now();
+        self.finish_read(start)
+    }
+
+    /// Starts or completes a GPM window without sleeping for the next sample.
+    /// `None` indicates a new baseline or a window that is still in progress.
+    pub(crate) fn try_read(&mut self, interval: Duration) -> Result<Option<GpmReading>, Error> {
+        Self::validate_interval(interval)?;
+        match self.baseline {
+            Some(start) if start.elapsed() >= interval => self.finish_read(start).map(Some),
+            Some(_) => Ok(None),
+            None => {
+                self.baseline = Some(self.capture(self.first.handle)?);
+                Ok(None)
+            }
+        }
+    }
+
+    fn validate_interval(interval: Duration) -> Result<(), Error> {
+        if interval <= GPM_MIN_EXCLUSIVE {
+            Err(Error::InvalidInterval)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn capture(&self, sample: SampleHandle) -> Result<Instant, Error> {
+        let query = self.nvml.gpm_sample;
+        // The device and sample buffer belong to the live NVML session.
+        query.check(unsafe { query.get()?(self.device, sample) })?;
+        Ok(Instant::now())
+    }
+
+    fn finish_read(&mut self, start: Instant) -> Result<GpmReading, Error> {
+        self.baseline = None;
+        let end = self.capture(self.second.handle)?;
 
         let mut request = MetricsRequest {
             version: GPM_VERSION,
