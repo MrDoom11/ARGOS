@@ -1,0 +1,7 @@
+[package]
+name = "argos"
+version = "0.1.0"
+edition = "2024"
+description = "Sonda de telemetria de hardware para Windows"
+license = "MIT"
+publish = false
