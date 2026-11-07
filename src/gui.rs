@@ -21,9 +21,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_NEXT, VK_PRIOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-use windows_sys::w;
 
 use crate::frames::{Process, SENSOR_COUNT, visible_processes};
+use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
 use crate::watch::{
     CPU_TEMPERATURE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS, Monitor, Snapshot,
 };
@@ -33,8 +33,6 @@ mod chart;
 
 use board::{Board, MAX_COLUMNS, MAX_ROWS, MAX_SLOTS};
 
-const CLASS: *const u16 = w!("ArgosMonitorWindow");
-const TITLE: *const u16 = w!("ARGOS — Monitor de hardware");
 const TIMER: usize = 1;
 const PERIOD_FIRST: usize = 201;
 const RESET_SENSORS: usize = 205;
@@ -78,6 +76,9 @@ const SERIES: [COLORREF; 16] = [
 ];
 
 pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
+    let Some(mut panel_instance) = instance::enter()? else {
+        return Ok(());
+    };
     let saved_board = Board::load();
     let restored = saved_board.is_some();
     let board = saved_board.unwrap_or_else(|| Board::new(DEFAULT_METRICS));
@@ -93,7 +94,7 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        lpszClassName: CLASS,
+        lpszClassName: WINDOW_CLASS,
         ..Default::default()
     };
     if unsafe { RegisterClassW(&class) } == 0 {
@@ -106,8 +107,8 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_APPWINDOW,
-            CLASS,
-            TITLE,
+            WINDOW_CLASS,
+            WINDOW_TITLE,
             WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
             start.left,
             start.top,
@@ -158,6 +159,7 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
             );
         }
     }
+    panel_instance.ready();
 
     let mut message = MSG::default();
     loop {
@@ -1670,6 +1672,7 @@ fn window_error(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::w;
 
     #[test]
     fn explicit_grid_keeps_its_capacity_at_different_sizes() {
