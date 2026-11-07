@@ -204,10 +204,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     resize_hit(bounds, message_point(lp), scale(5, dpi)) as LRESULT
                 }
             }
-            WM_SETCURSOR if u32::from(lp as u16) == HTCLIENT && window_move(state).is_active() => {
-                SetCursor(LoadCursorW(null_mut(), IDC_SIZEALL));
-                1
-            }
             WM_GETMINMAXINFO => {
                 let dpi = state.try_borrow().map_or(96, |app| app.dpi);
                 let info = &mut *(lp as *mut MINMAXINFO);
@@ -291,25 +287,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CAPTURECHANGED => {
-                if let Ok(mut app) = state.try_borrow_mut()
-                    && matches!(app.window_move, WindowMove::Dragging { .. })
-                {
-                    app.window_move = WindowMove::Idle;
-                }
                 clear_drag(hwnd, state);
                 0
             }
-            WM_ACTIVATE if u32::from(wp as u16) == WA_INACTIVE => {
-                stop_window_move(hwnd, state, false);
-                DefWindowProcW(hwnd, msg, wp, lp)
-            }
             WM_CANCELMODE => {
-                stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_CONTEXTMENU | WM_NCRBUTTONUP => {
-                stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 // O clique na borda chega como mensagem não cliente, com coordenadas de tela.
                 let point = if lp == -1 {
@@ -321,7 +306,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_DESTROY => {
-                stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 KillTimer(hwnd, TIMER);
                 PostQuitMessage(0);
@@ -375,78 +359,6 @@ fn menu_center(hwnd: HWND) -> POINT {
     point
 }
 
-#[derive(Clone, Copy, Default)]
-enum WindowMove {
-    #[default]
-    Idle,
-    Armed,
-    Dragging {
-        original: RECT,
-        anchor: POINT,
-    },
-}
-
-impl WindowMove {
-    fn is_active(self) -> bool {
-        !matches!(self, Self::Idle)
-    }
-
-    fn begin(&mut self, hwnd: HWND, mut anchor: POINT) -> bool {
-        if !matches!(self, Self::Armed) {
-            return false;
-        }
-        let mut original = RECT::default();
-        *self = if unsafe {
-            GetWindowRect(hwnd, &mut original) != 0 && ClientToScreen(hwnd, &mut anchor) != 0
-        } {
-            Self::Dragging { original, anchor }
-        } else {
-            Self::Idle
-        };
-        true
-    }
-
-    fn apply(self, hwnd: HWND, mut point: POINT) -> bool {
-        let Self::Dragging { original, anchor } = self else {
-            return false;
-        };
-        // O ponto chega em coordenadas de uma janela que já pode ter mudado de lugar.
-        unsafe {
-            if ClientToScreen(hwnd, &mut point) != 0 {
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    original.left + (point.x - anchor.x),
-                    original.top + (point.y - anchor.y),
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-        }
-        true
-    }
-}
-
-fn window_move(state: &RefCell<Window>) -> WindowMove {
-    state
-        .try_borrow()
-        .map_or(WindowMove::Idle, |app| app.window_move)
-}
-
-fn stop_window_move(hwnd: HWND, state: &RefCell<Window>, restore: bool) -> bool {
-    let movement = state.try_borrow_mut().map_or(WindowMove::Idle, |mut app| {
-        std::mem::take(&mut app.window_move)
-    });
-    if let WindowMove::Dragging { original, .. } = movement {
-        release_mouse(hwnd);
-        if restore {
-            position_window(hwnd, original);
-        }
-    }
-    movement.is_active()
-}
-
 struct PanelDrag {
     source: usize,
     origin: POINT,
@@ -470,9 +382,6 @@ impl PanelDrag {
 
 fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
     let started = state.try_borrow_mut().is_ok_and(|mut app| {
-        if app.window_move.begin(hwnd, point) {
-            return app.window_move.is_active();
-        }
         let Some(source) = app.layout(client(hwnd)).panel_at(app.page, point) else {
             return false;
         };
@@ -491,16 +400,12 @@ fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
         // Alterar a captura pode despachar mensagens, por isso o estado já foi liberado.
         unsafe { SetCapture(hwnd) };
         if unsafe { GetCapture() } != hwnd {
-            stop_window_move(hwnd, state, false);
             clear_drag(hwnd, state);
         }
     }
 }
 
 fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        return;
-    }
     let repaint = state.try_borrow_mut().is_ok_and(|mut app| {
         if app.drag.is_none() {
             return false;
@@ -517,10 +422,6 @@ fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
 }
 
 fn finish_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        stop_window_move(hwnd, state, false);
-        return;
-    }
     let drag = state.try_borrow_mut().ok().and_then(|mut app| {
         let mut drag = app.drag.take()?;
         let target = app.layout(client(hwnd)).panel_at(app.page, point);
@@ -571,7 +472,7 @@ fn release_mouse(hwnd: HWND) {
 
 fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
     let section = match key {
-        VK_ESCAPE => return stop_window_move(hwnd, state, true) || cancel_drag(hwnd, state),
+        VK_ESCAPE => return cancel_drag(hwnd, state),
         VK_F2 => MenuSection::Sensors,
         VK_F3 => MenuSection::Period,
         VK_F4 => MenuSection::Grid,
@@ -587,7 +488,6 @@ fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
         }
         _ => return false,
     };
-    stop_window_move(hwnd, state, false);
     cancel_drag(hwnd, state);
     show_options(hwnd, state, menu_center(hwnd), section);
     true
@@ -706,11 +606,11 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         if matches!(section, MenuSection::All) {
             menu.separator();
             if unsafe { IsZoomed(hwnd) } != 0 {
-                menu.label("Mover janela");
+                menu.label("Mover");
                 menu.label("Redimensionar");
                 menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
             } else {
-                menu.item(MOVE_WINDOW, "Mover janela", false);
+                menu.item(MOVE_WINDOW, "Mover", false);
                 menu.item(SIZE_WINDOW, "Redimensionar", false);
                 menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
             }
@@ -734,13 +634,13 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
     } as usize;
     match choice {
         0 => {}
-        MOVE_WINDOW => {
-            if let Ok(mut app) = state.try_borrow_mut() {
-                app.window_move = WindowMove::Armed;
-            }
-        }
-        SIZE_WINDOW => {
-            unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, SC_SIZE as WPARAM, -1) };
+        MOVE_WINDOW | SIZE_WINDOW => {
+            let command = if choice == MOVE_WINDOW {
+                SC_MOVE
+            } else {
+                SC_SIZE
+            };
+            unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, command as WPARAM, -1) };
         }
         MINIMIZE_WINDOW => {
             unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
@@ -865,7 +765,6 @@ struct Window {
     custom_colors: [COLORREF; 16],
     page: usize,
     wheel_remainder: i32,
-    window_move: WindowMove,
     drag: Option<PanelDrag>,
     dpi: u32,
     chart_fonts: chart::ChartFonts,
@@ -883,7 +782,6 @@ impl Window {
             custom_colors: SERIES,
             page: 0,
             wheel_remainder: 0,
-            window_move: WindowMove::Idle,
             drag: None,
             dpi,
             chart_fonts: chart::ChartFonts::new(dpi),
@@ -1716,49 +1614,6 @@ mod tests {
         assert!(drag.active);
         assert!(drag.update(POINT { x: -1, y: 51 }, None, 4));
         assert_eq!(drag.target, None);
-    }
-
-    #[test]
-    fn window_drag_moves_a_hidden_window_without_resizing_or_activating_it() {
-        let hwnd = unsafe {
-            CreateWindowExW(
-                0,
-                w!("STATIC"),
-                null(),
-                WS_POPUP,
-                -300,
-                50,
-                320,
-                200,
-                null_mut(),
-                null_mut(),
-                GetModuleHandleW(null()),
-                null(),
-            )
-        };
-        assert!(!hwnd.is_null());
-        let _guard = OwnedWindow(hwnd);
-        let bounds = || {
-            let mut rect = RECT::default();
-            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
-            (rect.left, rect.top, width(rect), height(rect))
-        };
-        let press = POINT { x: 25, y: 35 };
-        let mut movement = WindowMove::Idle;
-        assert!(!movement.begin(hwnd, press));
-        movement = WindowMove::Armed;
-        assert!(!movement.apply(hwnd, POINT { x: 80, y: 75 }));
-        assert_eq!(bounds(), (-300, 50, 320, 200));
-
-        assert!(movement.begin(hwnd, press));
-        assert!(movement.apply(hwnd, POINT { x: 95, y: 20 }));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, press));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, POINT { x: -55, y: 55 }));
-        assert_eq!(bounds(), (-310, 55, 320, 200));
-        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
-        assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
     }
 
     #[test]

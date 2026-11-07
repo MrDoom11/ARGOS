@@ -44,8 +44,6 @@ O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
 
 Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. A janela sem barra de título começa em um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
 
-Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Pressione `Esc` para cancelar.
-
 - **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 - **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
 - **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
