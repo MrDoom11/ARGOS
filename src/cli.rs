@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use semver::Version;
 
+use crate::update::Source;
+
 const DEFAULT_INTERVAL_MS: u32 = 1000;
 const MIN_INTERVAL_MS: u32 = 101;
 const MIN_WATCH_INTERVAL_MS: u32 = 100;
@@ -67,7 +69,10 @@ pub(crate) struct WatchOptions {
 pub(crate) enum Command {
     Probe(Options),
     Watch(WatchOptions),
-    Gui(Option<u32>),
+    Gui {
+        gpu: Option<u32>,
+        source: Source,
+    },
     PrepareInstall {
         silent: bool,
         installed_version: Option<Version>,
@@ -122,10 +127,13 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
 
 fn parse_gui(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
     let mut gpu = None;
+    let mut source = Source::Direct;
     while let Some(flag) = args.next() {
         match flag.to_str().ok_or("argumento com texto inválido")? {
             "-h" | "--help" => return Ok(Command::GuiHelp),
             "--gpu" => read_number(&mut gpu, "--gpu", &mut args)?,
+            "--portable" if source == Source::Direct => source = Source::Portable,
+            "--portable-exact" if source == Source::Direct => source = Source::PortableExact,
             flag => {
                 return Err(format!(
                     "opção desconhecida {flag:?} (consulte argos gui --help)"
@@ -133,7 +141,7 @@ fn parse_gui(mut args: impl Iterator<Item = OsString>) -> Result<Command, String
             }
         }
     }
-    Ok(Command::Gui(gpu))
+    Ok(Command::Gui { gpu, source })
 }
 
 fn parse_prepare_install(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
@@ -328,10 +336,19 @@ mod tests {
 
     #[test]
     fn gui_accepts_an_optional_gpu_and_rejects_watch_flags() {
-        assert_eq!(parse(["gui"].map(OsString::from)), Ok(Command::Gui(None)));
+        assert_eq!(
+            parse(["gui"].map(OsString::from)),
+            Ok(Command::Gui {
+                gpu: None,
+                source: Source::Direct
+            })
+        );
         assert_eq!(
             parse(["gui", "--gpu", "1"].map(OsString::from)),
-            Ok(Command::Gui(Some(1)))
+            Ok(Command::Gui {
+                gpu: Some(1),
+                source: Source::Direct
+            })
         );
         assert_eq!(
             parse(["gui", "--help"].map(OsString::from)),
@@ -340,5 +357,19 @@ mod tests {
         for args in [["gui", "--gpu", "-1"], ["gui", "--duration-secs", "1"]] {
             assert!(parse(args.map(OsString::from)).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn gui_distinguishes_portable_cache_from_an_explicit_package() {
+        for (flag, source) in [
+            ("--portable", Source::Portable),
+            ("--portable-exact", Source::PortableExact),
+        ] {
+            assert_eq!(
+                parse(["gui", flag].map(OsString::from)),
+                Ok(Command::Gui { gpu: None, source })
+            );
+        }
+        assert!(parse(["gui", "--portable", "--portable-exact"].map(OsString::from)).is_err());
     }
 }

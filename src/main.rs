@@ -21,13 +21,33 @@ mod system;
 #[cfg(windows)]
 mod telemetry;
 #[cfg(windows)]
+mod update;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 fn main() -> ExitCode {
     use cli::Command;
 
-    match cli::parse(std::env::args_os().skip(1)) {
+    let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "apply-update") {
+        args.next();
+        return report_result(update::run_worker(args));
+    }
+    if args
+        .peek()
+        .is_some_and(|arg| arg == "portable-cache-version")
+    {
+        args.next();
+        if args.next().is_some() {
+            return ExitCode::from(2);
+        }
+        if let Some(version) = update::cached_portable_version() {
+            println!("{version}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    match cli::parse(args) {
         Ok(Command::Help) => {
             print!("{}", cli::HELP);
             ExitCode::SUCCESS
@@ -46,7 +66,7 @@ fn main() -> ExitCode {
         }
         Ok(Command::Probe(options)) => report_result(probe::run(options)),
         Ok(Command::Watch(options)) => report_result(watch::run(options)),
-        Ok(Command::Gui(gpu)) => report_result(gui::run(gpu)),
+        Ok(Command::Gui { gpu, source }) => report_result(gui::run(gpu, source)),
         Ok(Command::PrepareInstall {
             silent,
             installed_version,

@@ -228,7 +228,7 @@ impl Board {
                 "columns" => board.columns = bounded(value, MAX_COLUMNS).unwrap_or(board.columns),
                 "rows" => board.rows = bounded(value, MAX_ROWS).unwrap_or(board.rows),
                 "period" => {
-                    if let Ok(seconds) = value.parse()
+                    if let Ok(seconds) = value.parse::<u32>()
                         && let Some(index) =
                             PERIOD_SECONDS.iter().position(|&period| period == seconds)
                     {
