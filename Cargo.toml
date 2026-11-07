@@ -5,6 +5,7 @@ edition = "2024"
 description = "Sonda de telemetria de hardware para Windows"
 license = "MIT"
 publish = false
+default-run = "argos"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

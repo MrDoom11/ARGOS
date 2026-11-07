@@ -22,13 +22,14 @@ Name: "ptbr"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 
 [Files]
 Source: "..\target\x86_64-pc-windows-msvc\release\argos.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\x86_64-pc-windows-msvc\release\argos-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"
 
 [Icons]
-Name: "{userprograms}\ARGOS"; Filename: "{app}\argos.exe"; Parameters: "gui"; WorkingDir: "{app}"
+Name: "{userprograms}\ARGOS"; Filename: "{app}\argos-gui.exe"; WorkingDir: "{app}"
 
 [Run]
-Filename: "{app}\argos.exe"; Parameters: "gui"; Description: "Abrir o painel do ARGOS"; Flags: postinstall nowait skipifsilent runhidden
+Filename: "{app}\argos-gui.exe"; WorkingDir: "{app}"; Description: "Abrir o painel do ARGOS"; Flags: postinstall nowait skipifsilent
 
 [Code]
 procedure RunWithoutInstalling;
