@@ -10,14 +10,24 @@ pub(crate) const HELP: &str = "ARGOS — sonda de telemetria para Windows
 
 Uso: argos [--gpu ÍNDICE] [--samples N] [--interval-ms MS]
      argos watch [OPÇÕES]
+     argos gui [--gpu ÍNDICE]
 
   --gpu ÍNDICE      Seleciona uma GPU NVIDIA pelo índice NVML (começa em 0).
                     Por padrão, consulta todas as GPUs NVIDIA encontradas.
   --samples N       Número de intervalos GPM por GPU (padrão: 1).
   --interval-ms MS  Tempo entre amostras GPM (padrão: 1000, mínimo: 101).
   watch --help      Exibe as opções da coleta contínua.
+  gui               Abre a janela de monitoramento.
   -h, --help        Exibe esta ajuda.
   -V, --version     Exibe a versão do ARGOS.
+";
+
+pub(crate) const GUI_HELP: &str = "ARGOS — janela de monitoramento
+
+Uso: argos gui [--gpu ÍNDICE]
+
+  --gpu ÍNDICE  Seleciona a GPU NVIDIA (padrão: 0, quando disponível).
+  -h, --help    Exibe esta ajuda.
 ";
 
 pub(crate) const WATCH_HELP: &str = "ARGOS — coleta contínua (Ctrl+C para encerrar)
@@ -55,7 +65,9 @@ pub(crate) struct WatchOptions {
 pub(crate) enum Command {
     Probe(Options),
     Watch(WatchOptions),
+    Gui(Option<u32>),
     WatchHelp,
+    GuiHelp,
     Help,
     Version,
 }
@@ -65,6 +77,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     if args.peek().is_some_and(|arg| arg == "watch") {
         args.next();
         return parse_watch(args);
+    }
+    if args.peek().is_some_and(|arg| arg == "gui") {
+        args.next();
+        return parse_gui(args);
     }
 
     let mut gpu = None;
@@ -92,6 +108,22 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         samples,
         interval: interval(interval_ms, "--interval-ms", MIN_INTERVAL_MS)?,
     }))
+}
+
+fn parse_gui(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let mut gpu = None;
+    while let Some(flag) = args.next() {
+        match flag.to_str().ok_or("argumento com texto inválido")? {
+            "-h" | "--help" => return Ok(Command::GuiHelp),
+            "--gpu" => read_number(&mut gpu, "--gpu", &mut args)?,
+            flag => {
+                return Err(format!(
+                    "opção desconhecida {flag:?} (consulte argos gui --help)"
+                ));
+            }
+        }
+    }
+    Ok(Command::Gui(gpu))
 }
 
 fn parse_watch(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
@@ -234,6 +266,22 @@ mod tests {
             ["watch", "--duration-secs", "0"],
             ["watch", "--samples", "2"],
         ] {
+            assert!(parse(args.map(OsString::from)).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn gui_accepts_an_optional_gpu_and_rejects_watch_flags() {
+        assert_eq!(parse(["gui"].map(OsString::from)), Ok(Command::Gui(None)));
+        assert_eq!(
+            parse(["gui", "--gpu", "1"].map(OsString::from)),
+            Ok(Command::Gui(Some(1)))
+        );
+        assert_eq!(
+            parse(["gui", "--help"].map(OsString::from)),
+            Ok(Command::GuiHelp)
+        );
+        for args in [["gui", "--gpu", "-1"], ["gui", "--duration-secs", "1"]] {
             assert!(parse(args.map(OsString::from)).is_err(), "{args:?}");
         }
     }

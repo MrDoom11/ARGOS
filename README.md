@@ -1,20 +1,33 @@
 # ARGOS
 
-Monitor de hardware em desenvolvimento para Windows 11, escrito em Rust. O console oferece diagnóstico de sensores e coleta contínua com histórico em memória. A GPU de referência é a NVIDIA GeForce RTX 5060 Ti de 16 GB.
+Monitor de hardware em desenvolvimento para Windows 11, escrito em Rust. O ARGOS oferece uma janela com gráficos e modos de diagnóstico e coleta contínua no console. A GPU de referência é a NVIDIA GeForce RTX 5060 Ti de 16 GB.
 
 As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.md).
 
 ## Compilar e executar
 
-Use o Rust estável com o alvo `x86_64-pc-windows-msvc` e as ferramentas de compilação C++ da Microsoft. O executável incorpora o runtime C e, para as leituras de GPU, carrega a NVML fornecida pelo driver NVIDIA. O projeto usa a biblioteca padrão do Rust e as APIs nativas, sem dependências do Cargo.
+Use o Rust estável com o alvo `x86_64-pc-windows-msvc` e as ferramentas de compilação C++ da Microsoft. O executável incorpora o runtime C e, para as leituras de GPU, carrega a NVML fornecida pelo driver NVIDIA. A janela usa Win32 e GDI por meio das declarações da biblioteca `windows-sys`. Em execução, ela usa as bibliotecas do Windows. [Rust for Windows](https://github.com/microsoft/windows-rs)
 
 ```powershell
 cargo build --release --locked
+.\target\release\argos.exe gui
 .\target\release\argos.exe
 .\target\release\argos.exe --gpu 0 --samples 5 --interval-ms 1000
 ```
 
 O comando padrão consulta todas as GPUs NVIDIA enumeradas pela NVML. Cada GPU recebe uma leitura dos sensores básicos e uma tentativa de leitura dos contadores GPM, com 1 s entre as coletas. `--samples` aumenta o número de intervalos GPM por GPU. `--interval-ms` aceita a partir de 101 ms, pois a NVIDIA exige mais de 100 ms entre amostras. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
+
+## Janela de monitoramento
+
+Abra com `gui`. A janela começa em um monitor secundário, quando disponível, e pode ser movida ou redimensionada. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
+
+- **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
+- **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
+- **Histórico** (`F3`) alterna entre 30 segundos, 1 minuto, 2 minutos e 5 minutos.
+
+O traçado ocupa a maior parte de cada painel. Escala, legenda e valores ficam compactos nas bordas. Mínimo, máximo e média simples usam as leituras válidas do período selecionado. Leituras ausentes aparecem como lacunas, e a janela indica quando a coleta está atrasada. A coleta segue em segundo plano enquanto a janela está minimizada.
+
+O ARGOS salva a grade, os sensores, as mesclagens e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`. O arquivo guarda as preferências do painel.
 
 ## Coleta contínua
 
@@ -57,7 +70,7 @@ Na janela de 1 s, o driver reportou 11,81% de atividade FP32, 0,31% de atividade
 2. Repita durante uma carga conhecida. Para validar a resposta dos contadores, mantenha a carga estável por vários intervalos e use cargas que exercitem operações FP32 e Tensor em execuções separadas.
 3. Se quiser comparar com a ferramenta da NVIDIA, faça uma execução separada com `nvidia-smi dmon -i 0 -c 5 -d 1 --gpm-metrics 2,3,5,10,12 --gpm-options d`, nos drivers que aceitam essa opção. O `nvidia-smi` é opcional para a comparação. [Referência do NVIDIA System Management Interface](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 
-RT Cores, cache L2, FPS e frametime seguem em investigação. A interface gráfica e a medição de impacto nos tempos de quadro pertencem às fases posteriores.
+RT Cores, cache L2, FPS e frametime seguem em investigação. A medição de impacto nos tempos de quadro pertence a uma etapa posterior.
 
 ## Licença
 

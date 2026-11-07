@@ -104,28 +104,34 @@ const _: () = {
 pub struct GpmMetric {
     pub id: u32,
     pub name: &'static str,
+    pub(crate) key: &'static str,
 }
 
 pub(crate) static GPM_METRICS: [GpmMetric; 5] = [
     GpmMetric {
         id: 12,
         name: "Atividade FP32",
+        key: "gpm-fp32",
     },
     GpmMetric {
         id: 5,
         name: "Atividade Tensor",
+        key: "gpm-tensor",
     },
     GpmMetric {
         id: 2,
         name: "Atividade dos SMs",
+        key: "gpm-sm-active",
     },
     GpmMetric {
         id: 3,
         name: "Ocupação dos SMs",
+        key: "gpm-sm-occupancy",
     },
     GpmMetric {
         id: 10,
         name: "Largura de banda da DRAM",
+        key: "gpm-dram-bandwidth",
     },
 ];
 

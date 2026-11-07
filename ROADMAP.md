@@ -15,9 +15,9 @@ O modo `watch` acompanha temperatura, potência e VRAM de uma GPU junto aos dema
 
 **Validação.** Os testes simulados cobriram agendamento, limite do histórico, lacunas e recuperação após uma falha. A sessão na máquina de referência durou 30 min e 5 s, reteve 298 amostras por grupo na janela final e encerrou normalmente. O encerramento por `Ctrl+C` também passou num teste separado. Os números de CPU e memória do modo console estão no [README](README.md#coleta-contínua).
 
-## 3. Janela de monitoramento · próxima etapa
+## 3. Janela de monitoramento · em validação
 
-Criar uma janela nativa e redimensionável para segundo monitor. Ela consome o histórico do motor e mostra gráficos com escala, unidade, valor atual, mínimo, máximo e média no período selecionado. O usuário pode escolher os sensores visíveis e configurar a duração do histórico.
+A janela nativa e redimensionável usa o histórico do motor e dá prioridade ao traçado. O painel permite escolher os sensores, as linhas e colunas da grade, mesclar curvas da mesma unidade e configurar o período. Essas preferências são salvas localmente.
 
 **Critério para avançar.** Verificar em segundo monitor que o redimensionamento e as pausas na interface preservam o ritmo da coleta. Os gráficos devem representar corretamente os horários e as lacunas nas leituras. Medir o custo da janela comparando com o modo console.
 
