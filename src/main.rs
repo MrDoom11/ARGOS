@@ -5,6 +5,8 @@ mod cli;
 #[cfg(windows)]
 mod cpu_temperature;
 #[cfg(windows)]
+mod desktop;
+#[cfg(windows)]
 mod frames;
 #[cfg(windows)]
 mod gui;
@@ -55,6 +57,13 @@ fn report_result(result: Result<(), String>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            if std::env::var_os(desktop::LAUNCH_ENV).is_some()
+                && std::env::args_os()
+                    .nth(1)
+                    .is_some_and(|argument| argument == "gui")
+            {
+                desktop::show_error(&error);
+            }
             eprintln!("ARGOS: {error}");
             ExitCode::FAILURE
         }
