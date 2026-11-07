@@ -126,39 +126,86 @@ begin
       Result := Output.StdErr[0];
 end;
 
-procedure RunWithoutInstalling;
+procedure ReportRunError(const Error: String; FromUpdater: Boolean);
+begin
+  Log(Error);
+  if not FromUpdater then
+    MsgBox(Error, mbError, MB_OK);
+end;
+
+function CachedPortableVersion: String;
 var
-  ArgosExe, InstalledExe, Version, InstalledLabel: String;
+  ArgosExe: String;
   ResultCode: Integer;
+  Output: TExecOutput;
+begin
+  Result := '';
+  try
+    ArgosExe := PackageArgos;
+    if not ExecAndCaptureOutput(ArgosExe, 'portable-cache-version', ExtractFileDir(ArgosExe),
+      SW_SHOWNORMAL, ewWaitUntilTerminated, ResultCode, Output) then
+      Exit;
+    if (ResultCode <> 0) or Output.Error or (GetArrayLength(Output.StdOut) <> 1) then
+      Exit;
+    if SafeVersion(Output.StdOut[0]) then
+      Result := Output.StdOut[0];
+  except
+    Log('Não foi possível consultar a versão portátil atualizada. ' + GetExceptionMessage);
+  end;
+end;
+
+procedure RunWithoutInstalling(FromUpdater: Boolean);
+var
+  ArgosExe, InstalledExe, Version, CachedVersion, InstalledLabel, Params: String;
+  ResultCode, Choice: Integer;
   Output: TExecOutput;
 begin
   try
     ArgosExe := '';
-    if not PanelIsOpen and InstalledArgos(InstalledExe, Version) then
+    Params := 'gui --portable';
+    if FromUpdater then
+      Params := 'gui --portable-exact'
+    else if not PanelIsOpen and InstalledArgos(InstalledExe, Version) then
     begin
-      InstalledLabel := 'Abrir a versão &instalada';
-      if SafeVersion(Version) then
-        InstalledLabel := InstalledLabel + ' (' + Version + ')';
-      case TaskDialogMsgBox('Qual versão do ARGOS você quer executar?',
-        'Escolha entre o pacote aberto e a cópia instalada.', mbInformation,
-        MB_YESNOCANCEL, ['&Executar a versão deste pacote ({#AppVersion})', InstalledLabel, '&Cancelar'], 0) of
-        IDYES: ArgosExe := '';
-        IDNO: ArgosExe := InstalledExe;
-      else
+      Choice := IDNO;
+      CachedVersion := CachedPortableVersion;
+      if CachedVersion <> '' then
+        Choice := TaskDialogMsgBox('Uma versão portátil atualizada está disponível',
+          'Abra a versão já salva ou escolha entre o pacote aberto e a cópia instalada.', mbInformation,
+          MB_YESNOCANCEL, ['&Abrir portátil atualizada (' + CachedVersion + ')',
+          '&Escolher outra versão', '&Cancelar'], 0);
+      if (Choice <> IDYES) and (Choice <> IDNO) then
         Exit;
+      if Choice = IDNO then
+      begin
+        InstalledLabel := 'Abrir a versão &instalada';
+        if SafeVersion(Version) then
+          InstalledLabel := InstalledLabel + ' (' + Version + ')';
+        case TaskDialogMsgBox('Qual versão do ARGOS você quer executar?',
+          'Escolha entre o pacote aberto e a cópia instalada.', mbInformation,
+          MB_YESNOCANCEL, ['&Executar a versão deste pacote ({#AppVersion})', InstalledLabel, '&Cancelar'], 0) of
+          IDYES: Params := 'gui --portable-exact';
+          IDNO:
+            begin
+              ArgosExe := InstalledExe;
+              Params := 'gui';
+            end;
+        else
+          Exit;
+        end;
       end;
     end;
 
     if ArgosExe = '' then
       ArgosExe := PackageArgos;
-    if not ExecAndCaptureOutput(ArgosExe, 'gui', ExtractFileDir(ArgosExe), SW_SHOWNORMAL,
+    if not ExecAndCaptureOutput(ArgosExe, Params, ExtractFileDir(ArgosExe), SW_SHOWNORMAL,
       ewWaitUntilTerminated, ResultCode, Output) then
-      MsgBox('Falha ao abrir o ARGOS. ' + SysErrorMessage(ResultCode), mbError, MB_OK)
+      ReportRunError('Falha ao abrir o ARGOS. ' + SysErrorMessage(ResultCode), FromUpdater)
     else if ResultCode <> 0 then
-      MsgBox(ProcessError(Output, 'O ARGOS encerrou com erro (código ' + IntToStr(ResultCode) + ').'),
-        mbError, MB_OK);
+      ReportRunError(ProcessError(Output, 'O ARGOS encerrou com erro (código ' + IntToStr(ResultCode) + ').'),
+        FromUpdater);
   except
-    MsgBox('Falha ao preparar o ARGOS. ' + GetExceptionMessage, mbError, MB_OK);
+    ReportRunError('Falha ao preparar o ARGOS. ' + GetExceptionMessage, FromUpdater);
   end;
 end;
 
@@ -261,8 +308,28 @@ begin
   ReleaseLaunchLock;
 end;
 
+function RunPortableRequested: Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), '/ARGOS-RUN-PORTABLE') = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
 function InitializeSetup: Boolean;
 begin
+  if RunPortableRequested then
+  begin
+    RunWithoutInstalling(True);
+    Result := False;
+    Exit;
+  end;
+
   Result := True;
   if WizardSilent then
     Exit;
@@ -272,7 +339,7 @@ begin
     mbInformation, MB_YESNOCANCEL, ['&Somente executar', '&Instalar', '&Cancelar'], 0) of
     IDYES:
       begin
-        RunWithoutInstalling;
+        RunWithoutInstalling(False);
         Result := False;
       end;
     IDNO: Result := True;

@@ -38,6 +38,10 @@ Instale o Inno Setup 6.7 ou mais recente e execute o comando abaixo na raiz do p
 
 O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
 
+### Atualizações pelo painel
+
+O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do painel, use **Verificar nova versão do ARGOS** para consultar novamente. Quando o pacote estiver pronto, escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
+
 ## Janela de monitoramento
 
 ![Painel do ARGOS com gráficos de temperatura, potência, atividade da GPU, VRAM, CPU e RAM](docs/screenshots/painel.jpg)

@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::frames::{Process, SENSOR_COUNT, visible_processes};
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
+use crate::update::{self, Source, Status, Updater};
 use crate::watch::{
     CPU_TEMPERATURE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS, Monitor, Snapshot,
 };
@@ -45,6 +46,11 @@ const SIZE_WINDOW: usize = 332;
 const MINIMIZE_WINDOW: usize = 333;
 const MAXIMIZE_WINDOW: usize = 334;
 const CLOSE_WINDOW: usize = 335;
+const UPDATE_CHECK: usize = 341;
+const UPDATE_RESTART: usize = 342;
+const UPDATE_SCHEDULE: usize = 343;
+const UPDATE_CANCEL: usize = 344;
+const UPDATE_ERROR: usize = 345;
 const REFRESH_FIRST: usize = 401;
 const PAGE_FIRST: usize = 501;
 const SENSOR_FIRST: usize = 1000;
@@ -75,7 +81,10 @@ const SERIES: [COLORREF; 16] = [
     chart::rgb(255, 162, 178),
 ];
 
-pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
+pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
+    if gpu.is_none() && update::launch_cached(source) {
+        return Ok(());
+    }
     let Some(mut panel_instance) = instance::enter()? else {
         return Ok(());
     };
@@ -88,7 +97,9 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
     let dpi = unsafe { GetDpiForSystem() }.max(96);
-    let state = Box::new(RefCell::new(Window::new(monitor, board, restored, dpi)));
+    let state = Box::new(RefCell::new(Window::new(
+        monitor, board, restored, dpi, source,
+    )));
     let instance = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
@@ -160,6 +171,7 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
         }
     }
     panel_instance.ready();
+    let _ = state.borrow_mut().updater.check(false);
 
     let mut message = MSG::default();
     loop {
@@ -265,6 +277,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_TIMER if wp == TIMER => {
+                let notice = state
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut app| app.updater.poll());
+                if let Some(notice) = notice {
+                    update_notice(hwnd, &notice);
+                }
                 if IsIconic(hwnd) == 0
                     && let Ok(mut app) = state.try_borrow_mut()
                 {
@@ -275,6 +294,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     }
                 }
                 0
+            }
+            WM_CLOSE => {
+                if wp != instance::REPLACEMENT_CLOSE
+                    && let Ok(mut app) = state.try_borrow_mut()
+                    && let Err(error) = app.updater.apply(false)
+                {
+                    update::record_error(&error);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_MOUSEWHEEL => {
                 navigate(hwnd, state, PageMove::Wheel((wp >> 16) as i16));
@@ -671,6 +699,25 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
                 menu.group("Sensores", |items| app.sensor_menu(items));
                 menu.group("Quadros do jogo", |items| app.frame_menu(items, &processes));
                 menu.group("Grade", |items| app.grid_menu(items));
+                match app.updater.status() {
+                    Status::Idle => {
+                        menu.item(UPDATE_CHECK, "Verificar nova versão do ARGOS", false)
+                    }
+                    Status::Checking => menu.label("Verificando nova versão do ARGOS…"),
+                    Status::Ready(version, scheduled) => {
+                        menu.group(&format!("ARGOS {version} disponível"), |items| {
+                            items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
+                            if scheduled {
+                                items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
+                            } else {
+                                items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
+                            }
+                        });
+                    }
+                }
+                if update::last_error().is_some() {
+                    menu.item(UPDATE_ERROR, "Ver erro da última atualização", false);
+                }
                 if app.page_count() > 1 {
                     menu.group("Página", |items| {
                         for page in 0..app.page_count() {
@@ -762,6 +809,38 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         CLOSE_WINDOW => {
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         }
+        UPDATE_CHECK => {
+            let result = state
+                .try_borrow_mut()
+                .ok()
+                .map(|mut app| app.updater.check(true));
+            if let Some(Err(error)) = result {
+                update_notice(hwnd, &error);
+            }
+        }
+        UPDATE_RESTART => {
+            let result = state
+                .try_borrow_mut()
+                .ok()
+                .map(|mut app| app.updater.apply(true));
+            match result {
+                Some(Ok(true)) => {
+                    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                }
+                Some(Err(error)) => update_notice(hwnd, &error),
+                _ => {}
+            }
+        }
+        UPDATE_SCHEDULE | UPDATE_CANCEL => {
+            if let Ok(mut app) = state.try_borrow_mut() {
+                app.updater.schedule(choice == UPDATE_SCHEDULE);
+            }
+        }
+        UPDATE_ERROR => {
+            if let Some(error) = update::last_error() {
+                update_notice(hwnd, &error);
+            }
+        }
         choice if (PAGE_FIRST..SENSOR_FIRST).contains(&choice) => {
             if let Ok(mut app) = state.try_borrow_mut() {
                 app.page = (choice - PAGE_FIRST).min(app.page_count() - 1);
@@ -788,6 +867,19 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         }
         choice => edit_board(hwnd, state, |app| app.apply_selection(choice, panel)),
     }
+}
+
+fn update_notice(hwnd: HWND, message: &str) {
+    let message = wide(message);
+    let title = wide("Atualização do ARGOS");
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        )
+    };
 }
 
 fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, panel: usize, sensor: usize) {
@@ -860,6 +952,7 @@ fn panel_label(snapshot: &Snapshot, metrics: &[usize]) -> String {
 
 struct Window {
     monitor: Monitor,
+    updater: Updater,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
     restored: bool,
@@ -875,9 +968,10 @@ struct Window {
 }
 
 impl Window {
-    fn new(monitor: Monitor, board: Board, restored: bool, dpi: u32) -> Self {
+    fn new(monitor: Monitor, board: Board, restored: bool, dpi: u32, source: Source) -> Self {
         Self {
             monitor,
+            updater: Updater::new(source),
             snapshot: None,
             board,
             restored,

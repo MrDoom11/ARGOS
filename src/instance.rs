@@ -36,6 +36,7 @@ use windows_sys::w;
 
 pub(crate) const WINDOW_CLASS: *const u16 = w!("ArgosMonitorWindow");
 pub(crate) const WINDOW_TITLE: *const u16 = w!("ARGOS — Monitor de hardware");
+pub(crate) const REPLACEMENT_CLOSE: usize = 0x4152_474f;
 const PANEL_BUSY: &str = "O painel do ARGOS está aberto. Feche-o antes de continuar.";
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT_MS: u32 = 10_000;
@@ -269,7 +270,7 @@ fn close_panel(window: HWND, pid: u32, process: &OwnedHandle) -> Result<(), Stri
     }
     // Revalide a janela depois de uma confirmação, pois o painel pode ter fechado sozinho.
     if find_panel(Some(pid)) == Some(window) {
-        let posted = unsafe { PostMessageW(window, WM_CLOSE, 0, 0) };
+        let posted = unsafe { PostMessageW(window, WM_CLOSE, REPLACEMENT_CLOSE, 0) };
         if posted == 0 && !exited(process) {
             return Err(PANEL_BUSY.into());
         }
