@@ -270,12 +270,12 @@ fn current_label(view: &SeriesView<'_>, compact: bool, scale: Scale) -> String {
 
 fn compact_name(name: &str) -> &str {
     match name {
-        "Temperatura" => "Temp.",
-        "Atividade de memória" => "Ativ. memória",
+        "Temperatura da GPU" => "Temp. GPU",
+        "Temperatura da CPU" => "Temp. CPU",
+        "VRAM · atividade" => "VRAM ativa",
         "Atividade dos SMs" => "SMs ativos",
         "Ocupação dos SMs" => "Ocup. SMs",
-        "Largura de banda da DRAM" => "Banda DRAM",
-        "Clock de memória" => "Clock mem.",
+        "VRAM · largura de banda" => "VRAM · banda",
         "Uso de CPU" => "CPU",
         _ => name.strip_prefix("Atividade ").unwrap_or(name),
     }

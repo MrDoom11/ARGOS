@@ -29,7 +29,9 @@ Usar a medição inicial para definir limites de consumo. Repetir os testes em r
 
 ## 5. Investigações e expansão
 
-Tratar RT Cores, cache L2, FPS, frametime e novos sensores de sistema como investigações independentes. Cada investigação deve registrar o que a API mede, em quais configurações funciona, quais permissões requer e quanto custa coletar. Só incorporar uma métrica quando houver evidência de disponibilidade, significado e custo aceitável.
+Validar a captura inicial de FPS apresentado, frametime e espera da CPU em `Present()` com uma carga DirectX conhecida. A comparação deve usar a mesma cadeia de apresentação e distinguir a frequência dos eventos da frequência de atualização do painel.
+
+Investigar espera e tempo ocupado da GPU por quadro, RT Cores, cache L2 e novos sensores de sistema. Cada investigação deve registrar o que a API mede, em quais configurações funciona, quais permissões requer e quanto custa coletar. Só incorporar uma métrica quando houver evidência de disponibilidade, significado e custo aceitável.
 
 ## Como manter o foco
 

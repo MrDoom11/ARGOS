@@ -339,6 +339,7 @@ fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::watch::FRAME_SENSOR_START;
 
     #[test]
     fn merges_compatible_panels_in_place_and_splits_the_result() {
@@ -363,6 +364,32 @@ mod tests {
         assert_eq!(Board::decode(&board.encode()), Some(board));
         let empty = Board::new([]);
         assert_eq!(Board::decode(&empty.encode()), Some(empty));
+    }
+
+    #[test]
+    fn frame_charts_keep_independent_visibility_after_reopening() {
+        let fps = FRAME_SENSOR_START;
+        let frametime = fps + 1;
+        let cpu_wait = fps + 2;
+        let mut board = Board::new([0]);
+
+        for sensor in [fps, frametime, cpu_wait] {
+            board.toggle(sensor);
+        }
+        assert_eq!(
+            board.panels,
+            [vec![0], vec![fps], vec![frametime], vec![cpu_wait]]
+        );
+
+        board.toggle(fps);
+        board.toggle(cpu_wait);
+        let config = board.encode();
+        assert!(config.lines().any(|line| line == "panel=present-frametime"));
+        let mut reopened = Board::decode(&config).unwrap();
+        assert_eq!(reopened.panels, [vec![0], vec![frametime]]);
+
+        reopened.toggle(frametime);
+        assert_eq!(Board::decode(&reopened.encode()), Some(Board::new([0])));
     }
 
     #[test]
