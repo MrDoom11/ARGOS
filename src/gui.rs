@@ -1,58 +1,59 @@
-use std::ffi::c_void;
+use std::cell::RefCell;
 use std::io;
-use std::ptr::null_mut;
+use std::mem::size_of;
+use std::ptr::{null, null_mut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW,
+};
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, VK_END, VK_F2, VK_F3, VK_F4, VK_HOME, VK_NEXT, VK_PRIOR,
+    GetCapture, ReleaseCapture, SetCapture, VK_END, VK_ESCAPE, VK_F2, VK_F3, VK_F4, VK_HOME,
+    VK_NEXT, VK_PRIOR,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-use crate::watch::{Monitor, Snapshot};
+use crate::watch::{GUI_INTERVALS_MS, Monitor, Snapshot};
 
 mod board;
 mod chart;
 
-use board::{Board, MAX_COLUMNS, MAX_ROWS};
+use board::{Board, MAX_COLUMNS, MAX_ROWS, MAX_SLOTS};
 
 const CLASS: *const u16 = w!("ArgosMonitorWindow");
 const TITLE: *const u16 = w!("ARGOS — Monitor de hardware");
 const TIMER: usize = 1;
-const STALE_AFTER: Duration = Duration::from_millis(2_500);
-const SENSORS_BUTTON: usize = 101;
-const PERIOD_BUTTON: usize = 102;
-const GRID_BUTTON: usize = 103;
-const PREVIOUS_BUTTON: usize = 104;
-const NEXT_BUTTON: usize = 105;
-const BUTTONS: [usize; 5] = [
-    PERIOD_BUTTON,
-    SENSORS_BUTTON,
-    GRID_BUTTON,
-    PREVIOUS_BUTTON,
-    NEXT_BUTTON,
-];
 const PERIOD_FIRST: usize = 201;
 const RESET_SENSORS: usize = 205;
 const COLUMNS_FIRST: usize = 301;
 const ROWS_FIRST: usize = 311;
 const SPLIT_PANEL: usize = 321;
+const RESET_COLORS: usize = 322;
+const MOVE_WINDOW: usize = 331;
+const SIZE_WINDOW: usize = 332;
+const MINIMIZE_WINDOW: usize = 333;
+const MAXIMIZE_WINDOW: usize = 334;
+const CLOSE_WINDOW: usize = 335;
+const REFRESH_FIRST: usize = 401;
+const PAGE_FIRST: usize = 501;
 const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 2000;
+const COLOR_FIRST: usize = 3000;
+const MOVE_PANEL_FIRST: usize = 4000;
 const PERIODS: [(u64, &str); 4] = [(30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")];
 const DEFAULT_METRICS: [usize; 12] = [0, 1, 2, 5, 6, 7, 11, 12, 13, 14, 16, 17];
-const BACKGROUND: COLORREF = chart::rgb(11, 16, 25);
-const ACCENT: COLORREF = chart::rgb(72, 215, 185);
-const WARNING: COLORREF = chart::rgb(255, 182, 103);
 const SERIES: [COLORREF; 16] = [
-    ACCENT,
+    chart::rgb(72, 215, 185),
     chart::rgb(255, 182, 103),
     chart::rgb(108, 181, 254),
     chart::rgb(185, 157, 255),
@@ -71,14 +72,17 @@ const SERIES: [COLORREF; 16] = [
 ];
 
 pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
-    let monitor = Monitor::start(gpu)?;
-    // A janela e os controles pertencem a esta thread, inclusive durante a troca de monitor.
+    let saved_board = Board::load();
+    let restored = saved_board.is_some();
+    let board = saved_board.unwrap_or_else(|| Board::new(DEFAULT_METRICS));
+    let refresh_ms = board.refresh_ms;
+    let monitor = Monitor::start(gpu, refresh_ms)?;
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
     let dpi = unsafe { GetDpiForSystem() }.max(96);
-    let state = Box::new(std::cell::RefCell::new(Window::new(monitor, dpi)));
-    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    let state = Box::new(RefCell::new(Window::new(monitor, board, restored, dpi)));
+    let instance = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
@@ -92,13 +96,13 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
 
     let work_area = preferred_work_area();
     let start = initial_bounds(work_area, dpi);
-    // SAFETY: a caixa mantém o endereço de Window estável até a destruição de hwnd.
+    // SAFETY: o estado em Box permanece no mesmo endereço até a destruição de hwnd.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_APPWINDOW,
             CLASS,
             TITLE,
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
             start.left,
             start.top,
             width(start),
@@ -106,7 +110,7 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
             null_mut(),
             null_mut(),
             instance,
-            (&*state as *const std::cell::RefCell<Window>).cast(),
+            (&*state as *const RefCell<Window>).cast(),
         )
     };
     if hwnd.is_null() {
@@ -115,37 +119,28 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
     let hwnd_guard = OwnedWindow(hwnd);
     let window_dpi = unsafe { GetDpiForWindow(hwnd) };
     if window_dpi != 0 && window_dpi != dpi {
+        state.borrow_mut().set_dpi(window_dpi);
         position_window(hwnd, initial_bounds(work_area, window_dpi));
     }
-    let dark_mode = 1_i32;
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-            (&dark_mode as *const i32).cast(),
-            4,
+            DWMWA_BORDER_COLOR as u32,
+            (&DWMWA_COLOR_NONE as *const u32).cast(),
+            size_of::<u32>() as u32,
         );
-    }
-
-    let labels = state.borrow().labels();
-    let mut buttons = [null_mut(); BUTTONS.len()];
-    for ((slot, id), label) in buttons.iter_mut().zip(BUTTONS).zip(labels) {
-        *slot = make_button(hwnd, instance, id, &label)?;
-    }
-    {
-        let mut app = state.borrow_mut();
-        app.buttons = buttons;
-        app.set_dpi(window_dpi);
-    }
-    resize(hwnd, &state);
-    update_controls(&state);
-    if unsafe { SetTimer(hwnd, TIMER, 500, None) } == 0 {
-        return Err(window_error("agendar a atualização da janela"));
-    }
-    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            (&DWMWCP_DONOTROUND as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+        if SetTimer(hwnd, TIMER, refresh_ms, None) == 0 {
+            return Err(window_error("agendar a atualização da janela"));
+        }
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         if IsWindowVisible(hwnd) == 0 {
-            // Um launcher pode substituir a primeira chamada a ShowWindow.
+            // O launcher pode substituir a primeira chamada a ShowWindow.
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -168,11 +163,9 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
         if message.message == WM_KEYDOWN && keyboard(hwnd, &state, message.wParam as u16) {
             continue;
         }
-        if unsafe { IsDialogMessageW(hwnd, &message) } == 0 {
-            unsafe {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     }
     drop(hwnd_guard);
@@ -180,18 +173,65 @@ pub(crate) fn run(gpu: Option<u32>) -> Result<(), String> {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // SAFETY: Win32 fornece os parâmetros das mensagens e o ponteiro pertence ao thread da janela.
+    // SAFETY: os ponteiros das mensagens e o estado são válidos durante este despacho.
     unsafe {
+        if msg == WM_NCCALCSIZE {
+            // Toda a área da janela é cliente, mesmo com os estilos nativos de tamanho.
+            return 0;
+        }
         if msg == WM_NCCREATE {
             let create = &*(lp as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const std::cell::RefCell<Window>;
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<Window>;
         let Some(state) = ptr.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
         match msg {
+            WM_NCHITTEST => {
+                let mut bounds = RECT::default();
+                let dpi = state.try_borrow().map_or(96, |app| app.dpi);
+                if IsZoomed(hwnd) != 0 || GetWindowRect(hwnd, &mut bounds) == 0 {
+                    HTCLIENT as LRESULT
+                } else {
+                    resize_hit(bounds, message_point(lp), scale(5, dpi)) as LRESULT
+                }
+            }
+            WM_GETMINMAXINFO => {
+                let dpi = state.try_borrow().map_or(96, |app| app.dpi);
+                let info = &mut *(lp as *mut MINMAXINFO);
+                info.ptMinTrackSize = POINT {
+                    x: scale(510, dpi),
+                    y: scale(200, dpi),
+                };
+                if let Some(monitor) = current_monitor(hwnd) {
+                    info.ptMaxPosition = POINT {
+                        x: monitor.rcWork.left - monitor.rcMonitor.left,
+                        y: monitor.rcWork.top - monitor.rcMonitor.top,
+                    };
+                    info.ptMaxSize = POINT {
+                        x: width(monitor.rcWork),
+                        y: height(monitor.rcWork),
+                    };
+                }
+                0
+            }
+            WM_DPICHANGED => {
+                cancel_drag(hwnd, state);
+                if let Ok(mut app) = state.try_borrow_mut() {
+                    app.set_dpi((wp & 0xffff) as u32);
+                }
+                let suggested = *(lp as *const RECT);
+                let bounds = if IsZoomed(hwnd) != 0 {
+                    current_monitor(hwnd).map_or(suggested, |monitor| monitor.rcWork)
+                } else {
+                    suggested
+                };
+                position_window(hwnd, bounds);
+                invalidate(hwnd);
+                0
+            }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
@@ -206,80 +246,61 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_ERASEBKGND => 1,
             WM_SIZE => {
+                cancel_drag(hwnd, state);
                 if wp as u32 != SIZE_MINIMIZED {
-                    resize(hwnd, state);
+                    invalidate(hwnd);
                 }
-                0
-            }
-            WM_GETMINMAXINFO => {
-                let dpi = state.try_borrow().map_or(96, |app| app.dpi);
-                let info = &mut *(lp as *mut MINMAXINFO);
-                info.ptMinTrackSize = POINT {
-                    x: scale(510, dpi),
-                    y: scale(380, dpi),
-                };
-                0
-            }
-            WM_DPICHANGED => {
-                if let Ok(mut app) = state.try_borrow_mut() {
-                    app.set_dpi((wp & 0xffff) as u32);
-                }
-                let suggested = *(lp as *const RECT);
-                position_window(hwnd, suggested);
-                resize(hwnd, state);
                 0
             }
             WM_TIMER if wp == TIMER => {
                 if IsIconic(hwnd) == 0
                     && let Ok(mut app) = state.try_borrow_mut()
                 {
-                    let refresh = app.refresh();
-                    let redraw = refresh.is_some() || app.snapshot_is_stale(Instant::now());
+                    let redraw = app.refresh() || app.snapshot_is_stale(Instant::now());
                     drop(app);
-                    if refresh == Some(true) {
-                        update_controls(state);
-                    }
                     if redraw {
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        invalidate(hwnd);
                     }
                 }
                 0
             }
-            WM_DRAWITEM => {
-                let item = &*(lp as *const DRAWITEMSTRUCT);
-                if let Ok(app) = state.try_borrow() {
-                    app.paint_button(item);
-                }
-                1
-            }
-            WM_COMMAND if wp >> 16 == 0 => match wp & 0xffff {
-                button @ (PERIOD_BUTTON | SENSORS_BUTTON | GRID_BUTTON) => {
-                    show_menu(hwnd, state, button);
-                    0
-                }
-                PREVIOUS_BUTTON => {
-                    navigate(hwnd, state, PageMove::Previous);
-                    0
-                }
-                NEXT_BUTTON => {
-                    navigate(hwnd, state, PageMove::Next);
-                    0
-                }
-                _ => DefWindowProcW(hwnd, msg, wp, lp),
-            },
             WM_MOUSEWHEEL => {
                 navigate(hwnd, state, PageMove::Wheel((wp >> 16) as i16));
                 0
             }
-            WM_RBUTTONUP => {
-                let point = POINT {
-                    x: lp as i16 as i32,
-                    y: (lp >> 16) as i16 as i32,
+            WM_LBUTTONDOWN => {
+                start_drag(hwnd, state, message_point(lp));
+                0
+            }
+            WM_MOUSEMOVE => {
+                update_drag(hwnd, state, message_point(lp));
+                0
+            }
+            WM_LBUTTONUP => {
+                finish_drag(hwnd, state, message_point(lp));
+                0
+            }
+            WM_CAPTURECHANGED => {
+                clear_drag(hwnd, state);
+                0
+            }
+            WM_CANCELMODE => {
+                cancel_drag(hwnd, state);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_CONTEXTMENU | WM_NCRBUTTONUP => {
+                cancel_drag(hwnd, state);
+                // O clique na borda chega como mensagem não cliente, com coordenadas de tela.
+                let point = if lp == -1 {
+                    menu_center(hwnd)
+                } else {
+                    message_point(lp)
                 };
-                show_panel_menu(hwnd, state, point);
+                show_options(hwnd, state, point, MenuSection::All);
                 0
             }
             WM_DESTROY => {
+                cancel_drag(hwnd, state);
                 KillTimer(hwnd, TIMER);
                 PostQuitMessage(0);
                 0
@@ -293,17 +314,176 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
-fn keyboard(hwnd: HWND, state: &std::cell::RefCell<Window>, key: u16) -> bool {
-    match key {
-        VK_F2 => show_menu(hwnd, state, SENSORS_BUTTON),
-        VK_F3 => show_menu(hwnd, state, PERIOD_BUTTON),
-        VK_F4 => show_menu(hwnd, state, GRID_BUTTON),
-        VK_PRIOR => navigate(hwnd, state, PageMove::Previous),
-        VK_NEXT => navigate(hwnd, state, PageMove::Next),
-        VK_HOME => navigate(hwnd, state, PageMove::First),
-        VK_END => navigate(hwnd, state, PageMove::Last),
-        _ => return false,
+fn resize_hit(bounds: RECT, point: POINT, grip: i32) -> u32 {
+    let left = point.x < bounds.left + grip;
+    let right = point.x >= bounds.right - grip;
+    let top = point.y < bounds.top + grip;
+    let bottom = point.y >= bounds.bottom - grip;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => HTCLIENT,
     }
+}
+
+fn message_point(value: LPARAM) -> POINT {
+    POINT {
+        x: value as i16 as i32,
+        y: (value >> 16) as i16 as i32,
+    }
+}
+
+fn current_monitor(hwnd: HWND) -> Option<MONITORINFO> {
+    monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+}
+
+fn menu_center(hwnd: HWND) -> POINT {
+    let bounds = client(hwnd);
+    let mut point = POINT {
+        x: bounds.left + width(bounds) / 2,
+        y: bounds.top + height(bounds) / 2,
+    };
+    unsafe { ClientToScreen(hwnd, &mut point) };
+    point
+}
+
+struct PanelDrag {
+    source: usize,
+    origin: POINT,
+    target: Option<usize>,
+    active: bool,
+}
+
+impl PanelDrag {
+    fn update(&mut self, point: POINT, target: Option<usize>, threshold: u32) -> bool {
+        let motion = point
+            .x
+            .abs_diff(self.origin.x)
+            .max(point.y.abs_diff(self.origin.y));
+        let active = self.active || motion >= threshold;
+        let repaint = active && (!self.active || self.target != target);
+        self.active = active;
+        self.target = target;
+        repaint
+    }
+}
+
+fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
+    let started = state.try_borrow_mut().is_ok_and(|mut app| {
+        let Some(source) = app.layout(client(hwnd)).panel_at(app.page, point) else {
+            return false;
+        };
+        if app.snapshot.is_none() || !app.panel_is_occupied(source) || app.drag.is_some() {
+            return false;
+        }
+        app.drag = Some(PanelDrag {
+            source,
+            origin: point,
+            target: Some(source),
+            active: false,
+        });
+        true
+    });
+    if started {
+        // Alterar a captura pode despachar mensagens, por isso o estado já foi liberado.
+        unsafe { SetCapture(hwnd) };
+        if unsafe { GetCapture() } != hwnd {
+            clear_drag(hwnd, state);
+        }
+    }
+}
+
+fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
+    let repaint = state.try_borrow_mut().is_ok_and(|mut app| {
+        if app.drag.is_none() {
+            return false;
+        }
+        let target = app.layout(client(hwnd)).panel_at(app.page, point);
+        let threshold = scale(4, app.dpi) as u32;
+        app.drag
+            .as_mut()
+            .is_some_and(|drag| drag.update(point, target, threshold))
+    });
+    if repaint {
+        invalidate(hwnd);
+    }
+}
+
+fn finish_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
+    let drag = state.try_borrow_mut().ok().and_then(|mut app| {
+        let mut drag = app.drag.take()?;
+        let target = app.layout(client(hwnd)).panel_at(app.page, point);
+        drag.update(point, target, scale(4, app.dpi) as u32);
+        Some(drag)
+    });
+    let Some(drag) = drag else { return };
+    release_mouse(hwnd);
+    if drag.active {
+        if let Some(target) = drag.target
+            && target != drag.source
+        {
+            edit_board(hwnd, state, |app| app.place_panel(drag.source, target));
+        }
+        invalidate(hwnd);
+    }
+}
+
+fn clear_drag(hwnd: HWND, state: &RefCell<Window>) -> bool {
+    let drag = state
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut app| app.drag.take());
+    if let Some(drag) = drag {
+        if drag.active {
+            invalidate(hwnd);
+        }
+        return true;
+    }
+    false
+}
+
+fn cancel_drag(hwnd: HWND, state: &RefCell<Window>) -> bool {
+    let cancelled = clear_drag(hwnd, state);
+    if cancelled {
+        release_mouse(hwnd);
+    }
+    cancelled
+}
+
+fn release_mouse(hwnd: HWND) {
+    unsafe {
+        if GetCapture() == hwnd {
+            ReleaseCapture();
+        }
+    }
+}
+
+fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
+    let section = match key {
+        VK_ESCAPE => return cancel_drag(hwnd, state),
+        VK_F2 => MenuSection::Sensors,
+        VK_F3 => MenuSection::Period,
+        VK_F4 => MenuSection::Grid,
+        VK_PRIOR | VK_NEXT | VK_HOME | VK_END => {
+            let step = match key {
+                VK_PRIOR => PageMove::Previous,
+                VK_NEXT => PageMove::Next,
+                VK_HOME => PageMove::First,
+                _ => PageMove::Last,
+            };
+            navigate(hwnd, state, step);
+            return true;
+        }
+        _ => return false,
+    };
+    cancel_drag(hwnd, state);
+    show_options(hwnd, state, menu_center(hwnd), section);
     true
 }
 
@@ -315,8 +495,11 @@ enum PageMove {
     Wheel(i16),
 }
 
-fn navigate(hwnd: HWND, state: &std::cell::RefCell<Window>, step: PageMove) {
+fn navigate(hwnd: HWND, state: &RefCell<Window>, step: PageMove) {
     let changed = state.try_borrow_mut().is_ok_and(|mut app| {
+        if app.drag.is_some() {
+            return false;
+        }
         let last = app.page_count() - 1;
         let page = match step {
             PageMove::Previous => app.page.saturating_sub(1),
@@ -335,131 +518,200 @@ fn navigate(hwnd: HWND, state: &std::cell::RefCell<Window>, step: PageMove) {
         changed
     });
     if changed {
-        update_controls(state);
         invalidate(hwnd);
     }
 }
 
-fn show_menu(hwnd: HWND, state: &std::cell::RefCell<Window>, button: usize) {
-    let (menu, anchor) = {
+enum MenuSection {
+    All,
+    Sensors,
+    Period,
+    Grid,
+}
+
+fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: MenuSection) {
+    let (menu, panel) = {
         let Ok(app) = state.try_borrow() else { return };
         let Some(menu) = Menu::new() else { return };
-        let layout = app.layout(client(hwnd));
-        let anchor = match button {
-            PERIOD_BUTTON => {
-                for (index, (_, label)) in PERIODS.iter().enumerate() {
-                    menu.item(PERIOD_FIRST + index, label, index == app.board.period);
-                }
-                layout.buttons[0]
-            }
-            GRID_BUTTON => {
-                menu.label("Colunas");
-                for count in 1..=MAX_COLUMNS {
-                    menu.item(
-                        COLUMNS_FIRST + count - 1,
-                        &count.to_string(),
-                        count == app.board.columns,
-                    );
-                }
-                menu.separator();
-                menu.label("Linhas");
-                for count in 1..=MAX_ROWS {
-                    menu.item(
-                        ROWS_FIRST + count - 1,
-                        &count.to_string(),
-                        count == app.board.rows,
-                    );
-                }
-                layout.buttons[2]
-            }
-            _ => {
+        match section {
+            MenuSection::Sensors => app.sensor_menu(&menu),
+            MenuSection::Period => app.period_menu(&menu),
+            MenuSection::Grid => app.grid_menu(&menu),
+            MenuSection::All => {
                 if let Some(snapshot) = &app.snapshot {
-                    let mut source = "";
-                    for (index, metric) in snapshot.metrics.iter().enumerate() {
-                        if metric.source != source {
-                            source = metric.source;
-                            if index != 0 {
-                                menu.separator();
-                            }
-                            menu.label(source);
-                        }
-                        menu.item(SENSOR_FIRST + index, metric.name, app.board.contains(index));
+                    if app.snapshot_is_stale(Instant::now()) {
+                        menu.label("Coleta atrasada");
                     }
+                    menu.label(&snapshot.notice);
                     menu.separator();
-                    menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
-                } else {
-                    menu.label("Aguardando a primeira coleta");
                 }
-                layout.buttons[1]
+                menu.group("Atualização", |items| {
+                    for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
+                        items.item(
+                            REFRESH_FIRST + index,
+                            &format!("{ms} ms"),
+                            ms == app.board.refresh_ms,
+                        );
+                    }
+                });
+                menu.group("Histórico", |items| app.period_menu(items));
+                menu.group("Sensores", |items| app.sensor_menu(items));
+                menu.group("Grade", |items| app.grid_menu(items));
+                if app.page_count() > 1 {
+                    menu.group("Página", |items| {
+                        for page in 0..app.page_count() {
+                            items.item(
+                                PAGE_FIRST + page,
+                                &format!("Página {}", page + 1),
+                                page == app.page,
+                            );
+                        }
+                    });
+                }
+                if app.save_failed {
+                    menu.label("Configuração disponível nesta sessão");
+                }
             }
+        }
+        let panel = if matches!(section, MenuSection::All) {
+            let mut point = screen;
+            if unsafe { ScreenToClient(hwnd, &mut point) } == 0 {
+                None
+            } else {
+                app.layout(client(hwnd))
+                    .panel_at(app.page, point)
+                    .filter(|&index| app.panel_is_occupied(index))
+            }
+        } else {
+            None
         };
-        (menu, anchor)
+        if let Some(index) = panel
+            && let Some(snapshot) = &app.snapshot
+        {
+            menu.separator();
+            app.panel_menu(&menu, snapshot, index);
+        }
+        if matches!(section, MenuSection::All) {
+            menu.separator();
+            if unsafe { IsZoomed(hwnd) } != 0 {
+                menu.label("Mover");
+                menu.label("Redimensionar");
+                menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
+            } else {
+                menu.item(MOVE_WINDOW, "Mover", false);
+                menu.item(SIZE_WINDOW, "Redimensionar", false);
+                menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
+            }
+            menu.item(MINIMIZE_WINDOW, "Minimizar", false);
+            menu.item(CLOSE_WINDOW, "Fechar", false);
+        }
+        (menu, panel)
     };
-    let point = POINT {
-        x: anchor.right,
-        y: anchor.bottom,
-    };
-    if let Some(choice) = pick_menu(hwnd, &menu, point, TPM_RIGHTALIGN) {
-        edit_board(hwnd, state, |app| app.apply_selection(choice));
+
+    // TrackPopupMenu e ChooseColorW despacham mensagens. Nenhum empréstimo vive aqui.
+    let choice = unsafe {
+        TrackPopupMenu(
+            menu.0,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            screen.x,
+            screen.y,
+            0,
+            hwnd,
+            null(),
+        )
+    } as usize;
+    match choice {
+        0 => {}
+        MOVE_WINDOW | SIZE_WINDOW => {
+            let command = if choice == MOVE_WINDOW {
+                SC_MOVE
+            } else {
+                SC_SIZE
+            };
+            unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, command as WPARAM, -1) };
+        }
+        MINIMIZE_WINDOW => {
+            unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        }
+        MAXIMIZE_WINDOW => {
+            unsafe {
+                ShowWindow(
+                    hwnd,
+                    if IsZoomed(hwnd) == 0 {
+                        SW_MAXIMIZE
+                    } else {
+                        SW_RESTORE
+                    },
+                )
+            };
+        }
+        CLOSE_WINDOW => {
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        }
+        choice if (PAGE_FIRST..SENSOR_FIRST).contains(&choice) => {
+            if let Ok(mut app) = state.try_borrow_mut() {
+                app.page = (choice - PAGE_FIRST).min(app.page_count() - 1);
+            }
+            invalidate(hwnd);
+        }
+        choice if (COLOR_FIRST..MOVE_PANEL_FIRST).contains(&choice) => {
+            if let Some(panel) = panel {
+                choose_series_color(hwnd, state, panel, choice - COLOR_FIRST);
+            }
+        }
+        choice => edit_board(hwnd, state, |app| app.apply_selection(choice, panel)),
     }
 }
 
-fn show_panel_menu(hwnd: HWND, state: &std::cell::RefCell<Window>, point: POINT) {
-    let (menu, clicked) = {
+fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, panel: usize, sensor: usize) {
+    let (initial, mut custom) = {
         let Ok(app) = state.try_borrow() else { return };
-        let Some(snapshot) = &app.snapshot else {
+        let Some(panel) = app.board.panels.get(panel) else {
             return;
         };
-        let layout = app.layout(client(hwnd));
-        let Some(clicked) = layout.panel_at(app.page, point) else {
+        let Some(position) = panel.iter().position(|&index| index == sensor) else {
             return;
         };
-        let Some(panel) = app.board.panels.get(clicked) else {
-            return;
-        };
-        let (Some(menu), Some(targets)) = (Menu::new(), Menu::new()) else {
-            return;
-        };
-        let mut has_target = false;
-        for (index, target) in app.board.panels.iter().enumerate() {
-            if app.board.can_merge(index, clicked) {
-                targets.item(MERGE_FIRST + index, &panel_label(snapshot, target), false);
-                has_target = true;
-            }
-        }
-        if has_target {
-            menu.submenu(targets, "Mesclar com");
-        } else {
-            menu.label("Nenhum painel compatível para mesclar");
-        }
-        if panel.len() > 1 {
-            menu.item(SPLIT_PANEL, "Separar gráficos", false);
-            menu.separator();
-            menu.label("Curvas deste painel");
-            for &index in panel {
-                if let Some(metric) = snapshot.metrics.get(index) {
-                    menu.label(metric.name);
-                }
-            }
-        }
-        (menu, clicked)
+        (
+            app.series_color(sensor, position, panel.len()),
+            app.custom_colors,
+        )
     };
-    if let Some(choice) = pick_menu(hwnd, &menu, point, TPM_RIGHTBUTTON) {
+    let mut dialog = CHOOSECOLORW {
+        lStructSize: size_of::<CHOOSECOLORW>() as u32,
+        hwndOwner: hwnd,
+        rgbResult: initial,
+        lpCustColors: custom.as_mut_ptr(),
+        Flags: CC_RGBINIT | CC_FULLOPEN,
+        ..Default::default()
+    };
+    if unsafe { ChooseColorW(&mut dialog) } != 0 {
         edit_board(hwnd, state, |app| {
-            if choice == SPLIT_PANEL {
-                return app.board.split(clicked);
-            }
-            let Some(source) = choice.checked_sub(MERGE_FIRST) else {
-                return false;
-            };
-            if !app.board.merge(source, clicked) {
-                return false;
-            }
-            let merged = clicked - usize::from(source < clicked);
-            app.page = merged / app.slots();
-            true
+            app.custom_colors = custom;
+            app.board.set_color(sensor, Some(dialog.rgbResult))
         });
     }
+}
+
+fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window) -> bool) {
+    let Ok(mut app) = state.try_borrow_mut() else {
+        return;
+    };
+    let old_interval = app.board.refresh_ms;
+    if !edit(&mut app) {
+        return;
+    }
+    app.page = app.page.min(app.page_count() - 1);
+    let interval = app.board.refresh_ms;
+    if interval != old_interval {
+        app.monitor.set_interval_ms(interval);
+    }
+    app.save_failed = app.board.save().is_err();
+    drop(app);
+    if interval != old_interval {
+        unsafe { SetTimer(hwnd, TIMER, interval, None) };
+    }
+    invalidate(hwnd);
 }
 
 fn panel_label(snapshot: &Snapshot, metrics: &[usize]) -> String {
@@ -479,167 +731,64 @@ fn panel_label(snapshot: &Snapshot, metrics: &[usize]) -> String {
     label
 }
 
-fn pick_menu(hwnd: HWND, menu: &Menu, mut point: POINT, flags: u32) -> Option<usize> {
-    if unsafe { ClientToScreen(hwnd, &mut point) } == 0 {
-        return None;
-    }
-    // TrackPopupMenu despacha mensagens enquanto está aberto. Nenhum empréstimo do estado vive aqui.
-    let choice = unsafe {
-        TrackPopupMenu(
-            menu.0,
-            TPM_RETURNCMD | TPM_NONOTIFY | flags,
-            point.x,
-            point.y,
-            0,
-            hwnd,
-            std::ptr::null(),
-        )
-    } as usize;
-    (choice != 0).then_some(choice)
-}
-
-fn edit_board(
-    hwnd: HWND,
-    state: &std::cell::RefCell<Window>,
-    edit: impl FnOnce(&mut Window) -> bool,
-) {
-    let changed = state.try_borrow_mut().is_ok_and(|mut app| {
-        if !edit(&mut app) {
-            return false;
-        }
-        app.page = app.page.min(app.page_count() - 1);
-        app.save_failed = app.board.save().is_err();
-        true
-    });
-    if changed {
-        update_controls(state);
-        invalidate(hwnd);
-    }
-}
-
-fn make_button(hwnd: HWND, instance: *mut c_void, id: usize, label: &str) -> Result<HWND, String> {
-    let label = wide(label);
-    let button = unsafe {
-        CreateWindowExW(
-            0,
-            w!("BUTTON"),
-            label.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW as u32,
-            0,
-            0,
-            0,
-            0,
-            hwnd,
-            id as HMENU,
-            instance,
-            std::ptr::null(),
-        )
-    };
-    if button.is_null() {
-        Err(window_error("criar os controles"))
-    } else {
-        Ok(button)
-    }
-}
-
-fn resize(hwnd: HWND, state: &std::cell::RefCell<Window>) {
-    if let Ok(app) = state.try_borrow() {
-        let layout = app.layout(client(hwnd));
-        let buttons = app.buttons;
-        drop(app);
-        for (button, rect) in buttons.into_iter().zip(layout.buttons) {
-            if !button.is_null() {
-                unsafe { MoveWindow(button, rect.left, rect.top, width(rect), height(rect), 1) };
-            }
-        }
-    }
-    invalidate(hwnd);
-}
-
-fn update_controls(state: &std::cell::RefCell<Window>) {
-    let Ok(app) = state.try_borrow() else { return };
-    let buttons = app.buttons;
-    let labels = app.labels();
-    let pages = app.page_count();
-    let enabled = [app.page != 0, app.page + 1 < pages];
-    drop(app);
-    for (button, label) in buttons.into_iter().zip(labels) {
-        if !button.is_null() {
-            let label = wide(&label);
-            unsafe { SetWindowTextW(button, label.as_ptr()) };
-        }
-    }
-    for (button, enabled) in buttons[3..].iter().zip(enabled) {
-        if !button.is_null() {
-            unsafe {
-                EnableWindow(*button, i32::from(enabled));
-                ShowWindow(*button, if pages > 1 { SW_SHOWNA } else { SW_HIDE });
-            }
-        }
-    }
-}
-
 struct Window {
     monitor: Monitor,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
     restored: bool,
     save_failed: bool,
+    custom_colors: [COLORREF; 16],
     page: usize,
     wheel_remainder: i32,
+    drag: Option<PanelDrag>,
     dpi: u32,
-    fonts: Fonts,
+    chart_fonts: chart::ChartFonts,
     buffer: BackBuffer,
-    buttons: [HWND; BUTTONS.len()],
 }
 
 impl Window {
-    fn new(monitor: Monitor, dpi: u32) -> Self {
-        let restored_board = Board::load();
-        let restored = restored_board.is_some();
+    fn new(monitor: Monitor, board: Board, restored: bool, dpi: u32) -> Self {
         Self {
             monitor,
             snapshot: None,
-            board: restored_board.unwrap_or_else(|| Board::new(DEFAULT_METRICS)),
+            board,
             restored,
             save_failed: false,
+            custom_colors: SERIES,
             page: 0,
             wheel_remainder: 0,
+            drag: None,
             dpi,
-            fonts: Fonts::new(dpi),
+            chart_fonts: chart::ChartFonts::new(dpi),
             buffer: BackBuffer::default(),
-            buttons: [null_mut(); BUTTONS.len()],
         }
     }
 
     fn set_dpi(&mut self, dpi: u32) {
         if dpi != 0 && dpi != self.dpi {
             self.dpi = dpi;
-            self.fonts = Fonts::new(dpi);
+            self.chart_fonts = chart::ChartFonts::new(dpi);
         }
     }
 
-    fn refresh(&mut self) -> Option<bool> {
-        let next = self.monitor.snapshot()?;
+    fn refresh(&mut self) -> bool {
+        let Some(next) = self.monitor.snapshot() else {
+            return false;
+        };
         if self
             .snapshot
             .as_ref()
             .is_some_and(|last| Arc::ptr_eq(last, &next))
         {
-            return None;
+            return false;
         }
-        let previous_count = self.active_count();
         if self.snapshot.is_none() && !self.restored {
             self.board
                 .reset_selection(default_selection(&next).iter().copied());
             self.page = self.page.min(self.page_count() - 1);
         }
         self.snapshot = Some(next);
-        Some(self.active_count() != previous_count)
-    }
-
-    fn active_count(&self) -> usize {
-        self.board.panels.iter().map(Vec::len).sum()
+        true
     }
 
     fn slots(&self) -> usize {
@@ -650,7 +799,37 @@ impl Window {
         self.board.panels.len().div_ceil(self.slots()).max(1)
     }
 
-    fn apply_selection(&mut self, choice: usize) -> bool {
+    fn panel_is_occupied(&self, index: usize) -> bool {
+        self.board
+            .panels
+            .get(index)
+            .is_some_and(|panel| !panel.is_empty())
+    }
+
+    fn place_panel(&mut self, source: usize, target: usize) -> bool {
+        if !self.board.move_panel(source, target) {
+            return false;
+        }
+        self.page = target / self.slots();
+        true
+    }
+
+    fn snapshot_is_stale(&self, now: Instant) -> bool {
+        let limit = Duration::from_millis((u64::from(self.board.refresh_ms) * 5 / 2).max(750));
+        self.snapshot
+            .as_ref()
+            .is_some_and(|snapshot| now.saturating_duration_since(snapshot.at) >= limit)
+    }
+
+    fn apply_selection(&mut self, choice: usize, panel: Option<usize>) -> bool {
+        if let Some(&interval) = choice
+            .checked_sub(REFRESH_FIRST)
+            .and_then(|index| GUI_INTERVALS_MS.get(index))
+        {
+            let changed = interval != self.board.refresh_ms;
+            self.board.refresh_ms = interval;
+            return changed;
+        }
         if (PERIOD_FIRST..PERIOD_FIRST + PERIODS.len()).contains(&choice) {
             let period = choice - PERIOD_FIRST;
             let changed = self.board.period != period;
@@ -673,6 +852,45 @@ impl Window {
             self.page = first / self.slots();
             return true;
         }
+        if let Some(panel) = panel {
+            if let Some(target) = choice
+                .checked_sub(MOVE_PANEL_FIRST)
+                .filter(|&index| index < MAX_SLOTS)
+            {
+                return self.place_panel(panel, target);
+            }
+            if choice == SPLIT_PANEL {
+                return self.board.split(panel);
+            }
+            if choice == RESET_COLORS {
+                let Some(series) = self.board.panels.get(panel).cloned() else {
+                    return false;
+                };
+                let mut changed = false;
+                for index in series {
+                    changed |= self.board.set_color(index, None);
+                }
+                return changed;
+            }
+            if let Some(source) = choice.checked_sub(MERGE_FIRST)
+                && let Some(&sensor) = self
+                    .board
+                    .panels
+                    .get(panel)
+                    .and_then(|series| series.first())
+                && self.board.merge(source, panel)
+            {
+                if let Some(merged) = self
+                    .board
+                    .panels
+                    .iter()
+                    .position(|series| series.contains(&sensor))
+                {
+                    self.page = merged / self.slots();
+                }
+                return true;
+            }
+        }
         let Some(snapshot) = &self.snapshot else {
             return false;
         };
@@ -691,24 +909,142 @@ impl Window {
         false
     }
 
-    fn snapshot_is_stale(&self, now: Instant) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_some_and(|snapshot| now.saturating_duration_since(snapshot.at) >= STALE_AFTER)
+    fn period_menu(&self, menu: &Menu) {
+        for (index, (_, label)) in PERIODS.iter().enumerate() {
+            menu.item(PERIOD_FIRST + index, label, index == self.board.period);
+        }
     }
 
-    fn labels(&self) -> [String; BUTTONS.len()] {
-        [
-            format!("Histórico · {}", PERIODS[self.board.period].1),
-            format!("Sensores · {}", self.active_count()),
-            format!("Grade · {} × {}", self.board.columns, self.board.rows),
-            "Página anterior".into(),
-            "Próxima página".into(),
-        ]
+    fn grid_menu(&self, menu: &Menu) {
+        menu.label("Colunas");
+        for count in 1..=MAX_COLUMNS {
+            menu.item(
+                COLUMNS_FIRST + count - 1,
+                &count.to_string(),
+                count == self.board.columns,
+            );
+        }
+        menu.separator();
+        menu.label("Linhas");
+        for count in 1..=MAX_ROWS {
+            menu.item(
+                ROWS_FIRST + count - 1,
+                &count.to_string(),
+                count == self.board.rows,
+            );
+        }
+    }
+
+    fn sensor_menu(&self, menu: &Menu) {
+        let Some(snapshot) = &self.snapshot else {
+            menu.label("Aguardando a primeira coleta");
+            return;
+        };
+        let mut source = "";
+        for (index, metric) in snapshot.metrics.iter().enumerate() {
+            if metric.source != source {
+                source = metric.source;
+                if index != 0 {
+                    menu.separator();
+                }
+                menu.label(source);
+            }
+            menu.item(
+                SENSOR_FIRST + index,
+                metric.name,
+                self.board.contains(index),
+            );
+        }
+        menu.separator();
+        menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
+    }
+
+    fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize) {
+        menu.group("Mover painel para", |positions| {
+            if self.page_count() == 1 {
+                self.position_menu(positions, snapshot, panel, 0);
+            } else {
+                for page in 0..self.page_count() {
+                    positions.group(&format!("Página {}", page + 1), |items| {
+                        self.position_menu(items, snapshot, panel, page);
+                    });
+                }
+            }
+        });
+        let targets: Vec<_> = self
+            .board
+            .panels
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.board.can_merge(*index, panel))
+            .collect();
+        if !targets.is_empty() {
+            menu.group("Mesclar com", |items| {
+                for (index, target) in targets {
+                    items.item(MERGE_FIRST + index, &panel_label(snapshot, target), false);
+                }
+            });
+        }
+        let series = &self.board.panels[panel];
+        if series.len() > 1 {
+            menu.item(SPLIT_PANEL, "Separar gráficos", false);
+        }
+        menu.group("Cor da curva", |items| {
+            for &index in series {
+                if let Some(metric) = snapshot.metrics.get(index) {
+                    items.item(
+                        COLOR_FIRST + index,
+                        metric.name,
+                        self.board.color(index).is_some(),
+                    );
+                }
+            }
+        });
+        if series
+            .iter()
+            .any(|&index| self.board.color(index).is_some())
+        {
+            menu.item(RESET_COLORS, "Restaurar cores padrão", false);
+        }
+    }
+
+    fn position_menu(&self, menu: &Menu, snapshot: &Snapshot, source: usize, page: usize) {
+        let start = page * self.slots();
+        let end = (start + self.slots()).min(MAX_SLOTS);
+        for target in start..end {
+            let slot = target - start;
+            let row = slot / self.board.columns + 1;
+            let column = slot % self.board.columns + 1;
+            let description = if target == source {
+                "Painel atual".into()
+            } else if let Some(panel) = self
+                .board
+                .panels
+                .get(target)
+                .filter(|panel| !panel.is_empty())
+            {
+                panel_label(snapshot, panel)
+            } else {
+                "Espaço livre".into()
+            };
+            let title = format!("Linha {row}, coluna {column} · {description}");
+            if target == source {
+                menu.label(&title);
+            } else {
+                menu.item(MOVE_PANEL_FIRST + target, &title, false);
+            }
+        }
+    }
+
+    fn series_color(&self, sensor: usize, position: usize, series_count: usize) -> COLORREF {
+        let index = if series_count == 1 { sensor } else { position };
+        self.board
+            .color(sensor)
+            .unwrap_or(SERIES[index % SERIES.len()])
     }
 
     fn layout(&self, bounds: RECT) -> Layout {
-        Layout::new(bounds, self.dpi, self.board.columns, self.board.rows)
+        Layout::new(bounds, self.board.columns, self.board.rows)
     }
 
     fn paint(&mut self, front: HDC, bounds: RECT) {
@@ -716,18 +1052,83 @@ impl Window {
             return;
         }
         let dc = self.buffer.target(front, width(bounds), height(bounds));
-        fill(dc, bounds, BACKGROUND);
+        unsafe { FillRect(dc, &bounds, GetStockObject(BLACK_BRUSH)) };
         let layout = self.layout(bounds);
         let now = Instant::now();
-        let stale = self.snapshot_is_stale(now);
-        let chart_time = self
-            .snapshot
-            .as_ref()
-            .filter(|_| !stale)
-            .map_or(now, |snapshot| snapshot.at);
-        self.paint_header(dc, bounds, &layout, stale);
-        self.paint_charts(dc, &layout, chart_time);
-        self.paint_footer(dc, bounds, &layout);
+        if let Some(snapshot) = &self.snapshot
+            && !self.board.panels.is_empty()
+        {
+            let at = if self.snapshot_is_stale(now) {
+                now
+            } else {
+                snapshot.at
+            };
+            let period = Duration::from_secs(PERIODS[self.board.period].0);
+            let mut series = Vec::new();
+            for (slot, panel) in self
+                .board
+                .panels
+                .iter()
+                .skip(self.page * layout.slots())
+                .take(layout.slots())
+                .enumerate()
+            {
+                if panel.is_empty() {
+                    continue;
+                }
+                series.clear();
+                series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
+                    let metric = snapshot.metrics.get(sensor)?;
+                    Some((metric, self.series_color(sensor, position, panel.len())))
+                }));
+                chart::paint(
+                    dc,
+                    layout.card(slot),
+                    self.dpi,
+                    &series,
+                    at,
+                    period,
+                    &self.chart_fonts,
+                );
+            }
+        } else {
+            let hint = if self.snapshot.is_none() {
+                "Aguardando a primeira coleta…"
+            } else {
+                "Clique com o botão direito para escolher sensores."
+            };
+            draw_text(dc, hint, bounds);
+        }
+        if let Some(drag) = &self.drag
+            && drag.active
+        {
+            let first = self.page * layout.slots();
+            if let Some(source) = drag
+                .source
+                .checked_sub(first)
+                .filter(|&slot| slot < layout.slots())
+            {
+                drag_outline(
+                    dc,
+                    layout.card(source),
+                    scale(2, self.dpi),
+                    chart::rgb(255, 182, 103),
+                );
+            }
+            if let Some(target) = drag
+                .target
+                .filter(|&index| index != drag.source)
+                .and_then(|index| index.checked_sub(first))
+                .filter(|&slot| slot < layout.slots())
+            {
+                drag_outline(
+                    dc,
+                    layout.card(target),
+                    scale(3, self.dpi),
+                    chart::rgb(72, 215, 185),
+                );
+            }
+        }
         if dc != front {
             unsafe {
                 BitBlt(
@@ -742,240 +1143,6 @@ impl Window {
                     SRCCOPY,
                 )
             };
-        }
-    }
-
-    fn paint_header(&self, dc: HDC, bounds: RECT, layout: &Layout, stale: bool) {
-        let s = |dip| scale(dip, self.dpi);
-        let indicator = if stale { WARNING } else { ACCENT };
-        fill(dc, area(s(7), s(10), s(10), s(25)), indicator);
-        draw_text(
-            dc,
-            self.fonts.brand.0,
-            "ARGOS",
-            area(s(17), 0, s(82), s(35)),
-            chart::TEXT,
-            DT_LEFT,
-        );
-        let note = self
-            .snapshot
-            .as_ref()
-            .map_or("Aguardando a primeira coleta…", |snapshot| {
-                snapshot.notice.as_str()
-            });
-        let warning = stale.then(|| format!("Coleta atrasada · {note}"));
-        let status = warning.as_deref().unwrap_or(note);
-        draw_text(
-            dc,
-            self.fonts.small.0,
-            status,
-            area(s(84), 0, layout.buttons[0].left - s(6), s(35)),
-            if stale { WARNING } else { chart::MUTED },
-            DT_LEFT,
-        );
-        fill(
-            dc,
-            area(s(5), s(34), bounds.right - s(5), s(34) + 1),
-            chart::BORDER,
-        );
-    }
-
-    fn paint_charts(&self, dc: HDC, layout: &Layout, chart_time: Instant) {
-        let s = |dip| scale(dip, self.dpi);
-        let saved = unsafe { SaveDC(dc) };
-        if saved == 0 {
-            return;
-        }
-        unsafe {
-            IntersectClipRect(
-                dc,
-                layout.viewport.left,
-                layout.viewport.top,
-                layout.viewport.right,
-                layout.viewport.bottom,
-            )
-        };
-        match &self.snapshot {
-            Some(snapshot) if !self.board.panels.is_empty() => {
-                let period = Duration::from_secs(PERIODS[self.board.period].0);
-                let mut series = Vec::new();
-                for (slot, panel) in self
-                    .board
-                    .panels
-                    .iter()
-                    .skip(self.page * layout.slots())
-                    .take(layout.slots())
-                    .enumerate()
-                {
-                    series.clear();
-                    series.extend(panel.iter().enumerate().filter_map(|(position, &index)| {
-                        let metric = snapshot.metrics.get(index)?;
-                        let color = if panel.len() == 1 { index } else { position };
-                        Some((metric, SERIES[color % SERIES.len()]))
-                    }));
-                    chart::paint(dc, layout.card(slot), self.dpi, &series, chart_time, period);
-                }
-            }
-            _ => {
-                let waiting = self.snapshot.is_none();
-                let title = if waiting {
-                    "Preparando as leituras"
-                } else {
-                    "Escolha os sensores"
-                };
-                let subtitle = if waiting {
-                    "Os gráficos aparecem conforme as amostras chegam."
-                } else {
-                    "Use Sensores ou pressione F2 para mostrar os gráficos."
-                };
-                let card = area(
-                    layout.viewport.left,
-                    layout.viewport.top,
-                    layout.viewport.right,
-                    layout.viewport.top + s(134),
-                );
-                rounded(dc, card, s(10), chart::CARD, chart::BORDER);
-                draw_text(
-                    dc,
-                    self.fonts.brand.0,
-                    title,
-                    area(card.left, card.top + s(22), card.right, card.top + s(62)),
-                    chart::TEXT,
-                    DT_CENTER,
-                );
-                draw_text(
-                    dc,
-                    self.fonts.body.0,
-                    subtitle,
-                    area(
-                        card.left + s(12),
-                        card.top + s(62),
-                        card.right - s(12),
-                        card.top + s(96),
-                    ),
-                    chart::MUTED,
-                    DT_CENTER,
-                );
-            }
-        }
-        unsafe { RestoreDC(dc, saved) };
-    }
-
-    fn paint_footer(&self, dc: HDC, bounds: RECT, layout: &Layout) {
-        let s = |dip| scale(dip, self.dpi);
-        let top = bounds.bottom - s(23);
-        fill(
-            dc,
-            area(s(5), top, bounds.right - s(5), top + 1),
-            chart::BORDER,
-        );
-        let pages = self.page_count();
-        let (hint, color) = if self.save_failed {
-            ("Grade só nesta sessão", WARNING)
-        } else {
-            ("Botão direito no gráfico: mesclar ou separar", chart::MUTED)
-        };
-        draw_text(
-            dc,
-            self.fonts.small.0,
-            hint,
-            area(s(7), top, layout.buttons[3].left - s(5), bounds.bottom),
-            color,
-            DT_LEFT,
-        );
-        if pages > 1 {
-            let page = format!("Página {} / {pages}", self.page + 1);
-            draw_text(
-                dc,
-                self.fonts.small.0,
-                &page,
-                area(
-                    layout.buttons[3].right,
-                    top,
-                    layout.buttons[4].left,
-                    bounds.bottom,
-                ),
-                chart::MUTED,
-                DT_CENTER,
-            );
-        }
-    }
-
-    fn paint_button(&self, item: &DRAWITEMSTRUCT) {
-        let s = |dip| scale(dip, self.dpi);
-        let Some(index) = BUTTONS.iter().position(|&id| id == item.CtlID as usize) else {
-            return;
-        };
-        let mut bounds = item.rcItem;
-        fill(item.hDC, bounds, BACKGROUND);
-        bounds.right -= 1;
-        bounds.bottom -= 1;
-        let pressed = item.itemState & ODS_SELECTED != 0;
-        let focused = item.itemState & ODS_FOCUS != 0;
-        let background = if pressed {
-            chart::rgb(30, 54, 66)
-        } else {
-            chart::CARD
-        };
-        rounded(
-            item.hDC,
-            bounds,
-            s(8),
-            background,
-            if focused { ACCENT } else { chart::BORDER },
-        );
-        if index >= 3 {
-            let arrow = if index == 3 { "‹" } else { "›" };
-            let color = if item.itemState & ODS_DISABLED == 0 {
-                chart::TEXT
-            } else {
-                chart::BORDER
-            };
-            draw_text(
-                item.hDC,
-                self.fonts.brand.0,
-                arrow,
-                bounds,
-                color,
-                DT_CENTER,
-            );
-            return;
-        }
-        let labels = self.labels();
-        draw_text(
-            item.hDC,
-            self.fonts.body.0,
-            &labels[index],
-            area(
-                bounds.left + s(8),
-                bounds.top,
-                bounds.right - s(20),
-                bounds.bottom,
-            ),
-            chart::TEXT,
-            DT_LEFT,
-        );
-        let x = bounds.right - s(14);
-        let y = (bounds.top + bounds.bottom) / 2;
-        let chevron = [
-            POINT {
-                x: x - s(3),
-                y: y - s(1),
-            },
-            POINT { x, y: y + s(2) },
-            POINT {
-                x: x + s(3),
-                y: y - s(1),
-            },
-        ];
-        let pen = unsafe { CreatePen(PS_SOLID, 1, chart::MUTED) };
-        if !pen.is_null() {
-            unsafe {
-                let old = SelectObject(item.hDC, pen);
-                Polyline(item.hDC, chevron.as_ptr(), chevron.len() as i32);
-                SelectObject(item.hDC, old);
-                DeleteObject(pen);
-            }
         }
     }
 }
@@ -994,36 +1161,14 @@ fn default_selection(snapshot: &Snapshot) -> &'static [usize] {
 
 struct Layout {
     viewport: RECT,
-    buttons: [RECT; BUTTONS.len()],
-    gap: i32,
     columns: usize,
     rows: usize,
 }
 
 impl Layout {
-    fn new(bounds: RECT, dpi: u32, columns: usize, rows: usize) -> Self {
-        let s = |dip| scale(dip, dpi);
-        let right = bounds.right - s(6);
-        let grid = area(right - s(105), s(4), right, s(30));
-        let sensors = area(grid.left - s(107), s(4), grid.left - s(5), s(30));
-        let period = area(sensors.left - s(159), s(4), sensors.left - s(5), s(30));
-        let next = area(
-            right - s(25),
-            bounds.bottom - s(21),
-            right,
-            bounds.bottom - s(2),
-        );
-        let previous = area(next.left - s(105), next.top, next.left - s(80), next.bottom);
-        let viewport = area(
-            s(5),
-            s(39),
-            bounds.right - s(5),
-            (bounds.bottom - s(26)).max(s(39)),
-        );
+    fn new(bounds: RECT, columns: usize, rows: usize) -> Self {
         Self {
-            viewport,
-            buttons: [period, sensors, grid, previous, next],
-            gap: s(4),
+            viewport: bounds,
             columns,
             rows,
         }
@@ -1034,14 +1179,15 @@ impl Layout {
     }
 
     fn card(&self, slot: usize) -> RECT {
+        const GAP: i32 = 1;
         let column = (slot % self.columns) as i32;
         let row = (slot / self.columns) as i32;
         let columns = self.columns as i32;
         let rows = self.rows as i32;
-        let w = (width(self.viewport) - (columns - 1) * self.gap).max(0);
-        let h = (height(self.viewport) - (rows - 1) * self.gap).max(0);
-        let x = self.viewport.left + column * self.gap;
-        let y = self.viewport.top + row * self.gap;
+        let w = (width(self.viewport) - (columns - 1) * GAP).max(0);
+        let h = (height(self.viewport) - (rows - 1) * GAP).max(0);
+        let x = self.viewport.left + column * GAP;
+        let y = self.viewport.top + row * GAP;
         area(
             x + w * column / columns,
             y + h * row / rows,
@@ -1058,55 +1204,7 @@ impl Layout {
                     && (rect.top..rect.bottom).contains(&point.y)
             })
             .map(|slot| page * self.slots() + slot)
-    }
-}
-
-struct Fonts {
-    brand: Font,
-    body: Font,
-    small: Font,
-}
-
-impl Fonts {
-    fn new(dpi: u32) -> Self {
-        Self {
-            brand: Font::new(17, FW_BOLD, dpi),
-            body: Font::new(12, FW_SEMIBOLD, dpi),
-            small: Font::new(11, FW_SEMIBOLD, dpi),
-        }
-    }
-}
-
-struct Font(HFONT);
-
-impl Font {
-    fn new(size: i32, weight: u32, dpi: u32) -> Self {
-        Self(unsafe {
-            CreateFontW(
-                -scale(size, dpi),
-                0,
-                0,
-                0,
-                weight as i32,
-                0,
-                0,
-                0,
-                u32::from(DEFAULT_CHARSET),
-                0,
-                0,
-                u32::from(CLEARTYPE_QUALITY),
-                0,
-                w!("Segoe UI"),
-            )
-        })
-    }
-}
-
-impl Drop for Font {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { DeleteObject(self.0) };
-        }
+            .filter(|&index| index < MAX_SLOTS)
     }
 }
 
@@ -1191,7 +1289,9 @@ impl Menu {
         unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, std::ptr::null()) };
     }
 
-    fn submenu(&self, submenu: Self, label: &str) {
+    fn group(&self, label: &str, items: impl FnOnce(&Self)) {
+        let Some(submenu) = Self::new() else { return };
+        items(&submenu);
         let label = wide(label);
         // Uma inclusão bem-sucedida transfere o submenu para o menu pai.
         if unsafe { AppendMenuW(self.0, MF_POPUP, submenu.0 as usize, label.as_ptr()) } != 0 {
@@ -1311,65 +1411,39 @@ fn invalidate(hwnd: HWND) {
     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
-fn draw_text(dc: HDC, font: HFONT, text: &str, mut bounds: RECT, color: COLORREF, align: u32) {
-    if width(bounds) <= 0 {
-        return;
-    }
+fn draw_text(dc: HDC, text: &str, mut bounds: RECT) {
     let text = wide(text);
     unsafe {
-        let font = if font.is_null() {
-            GetStockObject(DEFAULT_GUI_FONT)
-        } else {
-            font
-        };
-        let previous = SelectObject(dc, font);
+        let previous = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
         SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, color);
+        SetTextColor(dc, chart::MUTED);
         DrawTextW(
             dc,
             text.as_ptr(),
             -1,
             &mut bounds,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | DT_CENTER,
         );
         SelectObject(dc, previous);
     }
 }
 
-fn fill(dc: HDC, bounds: RECT, color: COLORREF) {
+fn drag_outline(dc: HDC, rect: RECT, thickness: i32, color: COLORREF) {
     let brush = unsafe { CreateSolidBrush(color) };
-    if !brush.is_null() {
-        unsafe {
-            FillRect(dc, &bounds, brush);
-            DeleteObject(brush);
-        }
+    if brush.is_null() {
+        return;
     }
-}
-
-fn rounded(dc: HDC, rect: RECT, radius: i32, fill: COLORREF, border: COLORREF) {
-    let brush = unsafe { CreateSolidBrush(fill) };
-    let pen = unsafe { CreatePen(PS_SOLID, 1, border) };
-    if !brush.is_null() && !pen.is_null() {
-        unsafe {
-            let old_brush = SelectObject(dc, brush);
-            let old_pen = SelectObject(dc, pen);
-            RoundRect(
-                dc,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                radius,
-                radius,
-            );
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-        }
+    let thickness = thickness.min(width(rect) / 2).min(height(rect) / 2);
+    for inset in 0..thickness {
+        let border = area(
+            rect.left + inset,
+            rect.top + inset,
+            rect.right - inset,
+            rect.bottom - inset,
+        );
+        unsafe { FrameRect(dc, &border, brush) };
     }
-    unsafe {
-        DeleteObject(pen);
-        DeleteObject(brush);
-    }
+    unsafe { DeleteObject(brush) };
 }
 
 fn area(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
@@ -1402,20 +1476,21 @@ mod tests {
 
     #[test]
     fn explicit_grid_keeps_its_capacity_at_different_sizes() {
-        for (width, height, dpi) in [(510, 380, 96), (1719, 409, 120), (2573, 709, 144)] {
-            let layout = Layout::new(area(0, 0, width, height), dpi, 6, 2);
+        for (width, height) in [(510, 380), (1719, 409), (2573, 709)] {
+            let layout = Layout::new(area(0, 0, width, height), 6, 2);
             assert_eq!(layout.slots(), 12);
             assert_eq!(layout.card(0).left, layout.viewport.left);
             assert_eq!(layout.card(11).right, layout.viewport.right);
             assert_eq!(layout.card(11).bottom, layout.viewport.bottom);
             assert!(layout.card(5).right > layout.card(5).left);
+            assert_eq!(layout.card(1).left - layout.card(0).right, 1);
         }
-        assert_eq!(Layout::new(area(0, 0, 800, 480), 96, 6, 4).slots(), 24);
+        assert_eq!(Layout::new(area(0, 0, 800, 480), 6, 4).slots(), 24);
     }
 
     #[test]
     fn panel_hit_uses_page_offset_and_skips_grid_gaps() {
-        let layout = Layout::new(area(0, 0, 1118, 419), 96, 3, 2);
+        let layout = Layout::new(area(0, 0, 1118, 419), 3, 2);
         let card = layout.card(4);
         let center = POINT {
             x: (card.left + card.right) / 2,
@@ -1428,5 +1503,62 @@ mod tests {
             y: center.y,
         };
         assert_eq!(layout.panel_at(2, gap), None);
+    }
+
+    #[test]
+    fn drag_ignores_a_click_and_clears_the_target_outside_the_grid() {
+        let mut drag = PanelDrag {
+            source: 2,
+            origin: POINT { x: 40, y: 50 },
+            target: Some(2),
+            active: false,
+        };
+        assert!(!drag.update(POINT { x: 41, y: 51 }, Some(3), 4));
+        assert!(!drag.active);
+        assert!(drag.update(POINT { x: 45, y: 51 }, Some(3), 4));
+        assert!(drag.active);
+        assert!(drag.update(POINT { x: -1, y: 51 }, None, 4));
+        assert_eq!(drag.target, None);
+    }
+
+    #[test]
+    fn last_partial_page_has_no_targets_past_the_board_limit() {
+        let layout = Layout::new(area(0, 0, 1118, 419), 3, 2);
+        let page = (MAX_SLOTS - 1) / layout.slots();
+        let last_slot = (MAX_SLOTS - 1) % layout.slots();
+        let last = layout.card(last_slot);
+        let invalid = layout.card(last_slot + 1);
+        assert_eq!(
+            layout.panel_at(
+                page,
+                POINT {
+                    x: last.left,
+                    y: last.top
+                }
+            ),
+            Some(MAX_SLOTS - 1)
+        );
+        assert_eq!(
+            layout.panel_at(
+                page,
+                POINT {
+                    x: invalid.left,
+                    y: invalid.top
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn native_resize_hit_supports_negative_monitor_coordinates() {
+        let bounds = area(-1366, -30, 0, 738);
+        assert_eq!(resize_hit(bounds, POINT { x: -1364, y: -29 }, 5), HTTOPLEFT);
+        assert_eq!(
+            resize_hit(bounds, POINT { x: -2, y: 736 }, 5),
+            HTBOTTOMRIGHT
+        );
+        assert_eq!(resize_hit(bounds, POINT { x: -3, y: 500 }, 5), HTRIGHT);
+        assert_eq!(resize_hit(bounds, POINT { x: -680, y: 400 }, 5), HTCLIENT);
     }
 }

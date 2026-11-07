@@ -3,21 +3,21 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, DC_BRUSH, DC_PEN,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, Ellipse, FW_NORMAL,
-    FW_SEMIBOLD, FillRect, GetStockObject, GetTextExtentPoint32W, HDC, HGDIOBJ, IntersectClipRect,
-    OUT_DEFAULT_PRECIS, PS_SOLID, Polyline, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode,
-    SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, Ellipse, FW_NORMAL, FW_SEMIBOLD,
+    FillRect, GetStockObject, GetTextExtentPoint32W, HDC, HGDIOBJ, IntersectClipRect,
+    OUT_DEFAULT_PRECIS, PS_SOLID, PolyPolyline, Polyline, RestoreDC, RoundRect, SaveDC,
+    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
 };
 
-use crate::watch::{MetricSnapshot, Reading};
+use crate::watch::{MetricPoint, MetricSnapshot, Reading};
 
-pub(super) const CARD: COLORREF = rgb(19, 27, 41);
+pub(super) const CARD: COLORREF = rgb(0, 0, 0);
 pub(super) const BORDER: COLORREF = rgb(42, 56, 78);
 pub(super) const TEXT: COLORREF = rgb(230, 239, 250);
 pub(super) const MUTED: COLORREF = rgb(151, 169, 191);
-const PLOT: COLORREF = rgb(14, 21, 33);
-const GRID: COLORREF = rgb(37, 49, 68);
+const PLOT: COLORREF = CARD;
+const GRID: COLORREF = rgb(34, 34, 34);
 
 pub(super) const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
@@ -30,6 +30,7 @@ pub(super) fn paint(
     series: &[(&MetricSnapshot, COLORREF)],
     at: Instant,
     window: Duration,
+    fonts: &ChartFonts,
 ) {
     let Some(&(first, _)) = series.first() else {
         return;
@@ -62,10 +63,8 @@ pub(super) fn paint(
             }
         })
         .collect();
-    let scale = common_scale(unit, views.iter().filter_map(|view| view.stats.as_ref()));
-    let legend_font = Object::font(px(11), FW_SEMIBOLD);
-    let detail_font = Object::font(px(10), FW_NORMAL);
-    // Restore the device context before releasing the selected fonts.
+    let scale = Scale::fixed(series.iter().map(|(metric, _)| metric.axis_max));
+    // Restaurar o contexto evita que uma fonte continue selecionada após o desenho.
     let Some(_state) = SavedDc::new(dc) else {
         return;
     };
@@ -84,17 +83,17 @@ pub(super) fn paint(
             rect.top,
             rect.right,
             rect.bottom,
-            px(6),
-            px(6),
+            px(3),
+            px(3),
         );
     }
 
-    let left = rect.left + px(6);
-    let right = rect.right - px(6);
+    let left = rect.left + px(3);
+    let right = rect.right - px(3);
     let columns = ((right - left) / px(135).max(1)).clamp(1, views.len() as i32);
     let rows = legend_rows(views.len(), columns, height >= px(68));
     let legend_row = px(if height < px(100) { 12 } else { 15 });
-    let legend_top = rect.top + px(3);
+    let legend_top = rect.top + px(2);
     let legend_bottom = legend_top + rows * legend_row;
     let stat_row = px(12);
     let stats_width = px(if views.len() == 1 { 185 } else { 240 });
@@ -106,16 +105,17 @@ pub(super) fn paint(
     } else {
         0
     };
-    let time_height = px(13);
-    let bottom = rect.bottom - px(3);
+    let bottom = rect.bottom - px(2);
+    fonts.detail.select(dc);
+    let gutter = (text_width(dc, &axis_text(scale.high)) + px(5)).min(width / 2);
     let plot = RECT {
-        left: left + px(if width >= px(150) { 39 } else { 33 }),
-        top: legend_bottom + px(3),
+        left: left + gutter,
+        top: legend_bottom + px(1),
         right,
-        bottom: bottom - time_height - stats_height,
+        bottom: bottom - stats_height,
     };
 
-    legend_font.select(dc);
+    fonts.legend.select(dc);
     paint_legend(
         dc,
         RECT {
@@ -128,40 +128,18 @@ pub(super) fn paint(
         columns,
         rows,
         px(5),
-        px(125),
+        scale,
     );
     if plot.right <= plot.left || plot.bottom - plot.top < px(5) {
         return;
     }
 
-    detail_font.select(dc);
-    draw_grid(dc, plot);
-    if let Some(scale) = scale {
-        draw_ticks(dc, plot, left, px(5), scale);
-        let weight = px(if width < px(160) { 1 } else { 2 }).max(1);
-        for view in &views {
-            draw_trace(dc, plot, view.color, scale, view.timeline, weight);
-        }
-    }
-
-    let time_top = plot.bottom;
-    let time_bottom = time_top + time_height;
-    let range = if window.as_secs() >= 60 && window.as_secs().is_multiple_of(60) {
-        format!("−{} min", window.as_secs() / 60)
-    } else {
-        format!("−{} s", window.as_secs())
-    };
-    let time_axis = (plot.left, time_top, right, time_bottom);
-    let plot_width = right - plot.left;
-    if plot_width >= px(100) {
-        text(dc, time_axis, &range, MUTED, DT_LEFT);
-        text(dc, time_axis, unit, MUTED, DT_CENTER);
-        text(dc, time_axis, "Agora", MUTED, DT_RIGHT);
-    } else {
-        if plot_width >= px(58) {
-            text(dc, time_axis, &range, MUTED, DT_LEFT);
-        }
-        text(dc, time_axis, unit, MUTED, DT_RIGHT);
+    fonts.detail.select(dc);
+    draw_grid(dc, plot, px(12).max(1) as usize);
+    draw_ticks(dc, plot, left, px(3), px(10), scale);
+    let weight = px(1).max(1);
+    for view in &views {
+        draw_trace(dc, plot, view.color, scale, view.timeline, weight);
     }
 
     if show_stats {
@@ -169,7 +147,7 @@ pub(super) fn paint(
             dc,
             RECT {
                 left,
-                top: time_bottom,
+                top: plot.bottom,
                 right,
                 bottom,
             },
@@ -198,7 +176,7 @@ fn paint_legend(
     columns: i32,
     rows: i32,
     marker: i32,
-    compact_width: i32,
+    scale: Scale,
 ) {
     let column_width = (bounds.right - bounds.left) / columns;
     let row_height = (bounds.bottom - bounds.top) / rows;
@@ -228,10 +206,10 @@ fn paint_legend(
             view.color,
         );
 
-        let compact = column_width < compact_width;
-        let current = current_label(view, compact, views.len() == 1);
-        let value_width = (text_width(dc, &current) + 1).min(column_width / 2);
         let label_left = left + marker + marker / 2;
+        let compact = column_width < marker * 25;
+        let current = current_label(view, compact, scale);
+        let value_width = (text_width(dc, &current) + 1).min((right - label_left).max(0));
         let label_right = right - value_width - marker / 2;
         let name = if compact || text_width(dc, view.metric.name) > label_right - label_left {
             compact_name(view.metric.name)
@@ -264,7 +242,7 @@ fn paint_legend(
     }
 }
 
-fn current_label(view: &SeriesView<'_>, compact: bool, single: bool) -> String {
+fn current_label(view: &SeriesView<'_>, compact: bool, scale: Scale) -> String {
     let Timeline {
         points,
         at,
@@ -274,8 +252,12 @@ fn current_label(view: &SeriesView<'_>, compact: bool, single: bool) -> String {
     match current_reading(points, at, interval) {
         Some(Reading::Value(value)) if value.is_finite() => {
             let mut display = value_text(value);
-            if (single && !compact) || view.metric.unit.trim() == "%" {
-                display.push_str(view.metric.unit);
+            display.push_str(view.metric.unit);
+            if value > scale.high {
+                display.push_str(" ↑");
+            }
+            if value < scale.low {
+                display.push_str(" ↓");
             }
             display
         }
@@ -331,28 +313,24 @@ fn paint_statistics(dc: HDC, bounds: RECT, views: &[SeriesView<'_>], label_width
     }
 }
 
-fn visible_points(
-    points: &[(Instant, Reading)],
-    at: Instant,
-    window: Duration,
-) -> &[(Instant, Reading)] {
-    let start = points.partition_point(|(time, _)| at.saturating_duration_since(*time) > window);
-    let end = points.partition_point(|(time, _)| *time <= at);
+fn visible_points(points: &[MetricPoint], at: Instant, window: Duration) -> &[MetricPoint] {
+    let start = points.partition_point(|point| at.saturating_duration_since(point.at) > window);
+    let end = points.partition_point(|point| point.at <= at);
     &points[start..end]
 }
 
-fn current_reading(
-    points: &[(Instant, Reading)],
-    at: Instant,
-    interval: Duration,
-) -> Option<Reading> {
+fn current_reading(points: &[MetricPoint], at: Instant, interval: Duration) -> Option<Reading> {
     points
         .last()
-        .and_then(|&(time, reading)| close_in_time(time, at, interval).then_some(reading))
+        .and_then(|point| close_in_time(point.at, at, interval).then_some(point.reading))
 }
 
 fn close_in_time(previous: Instant, next: Instant, interval: Duration) -> bool {
     next.saturating_duration_since(previous) <= interval.saturating_add(interval / 2)
+}
+
+fn consecutive(previous: &MetricPoint, next: &MetricPoint) -> bool {
+    close_in_time(previous.at, next.at, previous.interval.max(next.interval))
 }
 
 fn measured(reading: Reading) -> Option<f64> {
@@ -369,8 +347,8 @@ struct Statistics {
 }
 
 impl Statistics {
-    fn from_points(points: &[(Instant, Reading)]) -> Option<Self> {
-        let mut values = points.iter().filter_map(|&(_, reading)| measured(reading));
+    fn from_points(points: &[MetricPoint]) -> Option<Self> {
+        let mut values = points.iter().filter_map(|point| measured(point.reading));
         let first = values.next()?;
         let (min, max, sum, count) =
             values.fold((first, first, first, 1), |(min, max, sum, count), value| {
@@ -390,61 +368,23 @@ struct Scale {
     high: f64,
 }
 
-fn common_scale<'a>(unit: &str, stats: impl Iterator<Item = &'a Statistics>) -> Option<Scale> {
-    let limits = stats
-        .map(|stats| (stats.min, stats.max))
-        .reduce(|(low, high), (min, max)| (low.min(min), high.max(max)));
-    Scale::for_metric(unit, limits)
-}
-
 impl Scale {
-    fn for_metric(unit: &str, limits: Option<(f64, f64)>) -> Option<Self> {
-        let minimum_span = match unit.trim() {
-            "%" => {
-                return Some(Self {
-                    low: 0.0,
-                    high: 100.0,
-                });
-            }
-            "°C" | "W" => 8.0,
-            "MHz" => 200.0,
-            "MiB" => 128.0,
-            _ => 1.0,
-        };
-        let (min, max) = limits?;
-        let spread = max - min;
-        let padding = (spread * 0.12).max((minimum_span - spread) / 2.0);
-        let mut low = min - padding;
-        if min >= 0.0 {
-            low = low.max(0.0);
-        }
-        let high = max + padding;
-        let step = nice_step((high - low) / 2.0);
-        Some(Self {
-            low: (low / step).floor() * step,
-            high: (high / step).ceil() * step,
-        })
+    fn fixed(limits: impl Iterator<Item = f64>) -> Self {
+        let high = limits
+            .filter(|limit| limit.is_finite() && *limit > 0.0)
+            .reduce(f64::max)
+            .unwrap_or(1.0);
+        Self { low: 0.0, high }
+    }
+
+    fn contains(self, value: f64) -> bool {
+        (self.low..=self.high).contains(&value)
     }
 
     fn ordinate(self, rect: RECT, value: f64) -> i32 {
-        let fraction = ((value - self.low) / (self.high - self.low)).clamp(0.0, 1.0);
+        let fraction = (value - self.low) / (self.high - self.low);
         rect.bottom - 1 - (f64::from(rect.bottom - rect.top - 1) * fraction).round() as i32
     }
-}
-
-fn nice_step(step: f64) -> f64 {
-    let power = 10.0_f64.powf(step.log10().floor());
-    let scaled = step / power;
-    let rounded = if scaled <= 1.0 {
-        1.0
-    } else if scaled <= 2.0 {
-        2.0
-    } else if scaled <= 5.0 {
-        5.0
-    } else {
-        10.0
-    };
-    power * rounded
 }
 
 fn value_text(value: f64) -> String {
@@ -470,7 +410,11 @@ fn axis_text(value: f64) -> String {
         .replace('.', ",")
 }
 
-fn draw_grid(dc: HDC, plot: RECT) {
+fn grid_offsets(length: i32, step: usize) -> impl Iterator<Item = i32> {
+    (0..length).step_by(step).chain(std::iter::once(length))
+}
+
+fn draw_grid(dc: HDC, plot: RECT, step: usize) {
     fill(dc, plot, PLOT);
     unsafe {
         SelectObject(dc, GetStockObject(DC_PEN));
@@ -478,41 +422,54 @@ fn draw_grid(dc: HDC, plot: RECT) {
     }
     let width = plot.right - plot.left - 1;
     let height = plot.bottom - plot.top - 1;
-    let rows = if height >= 100 { 4 } else { 2 };
-    let columns = if width >= 180 { 8 } else { 4 };
-    for division in 0..=rows {
-        let y = plot.top + height * division / rows;
-        line(dc, (plot.left, y), (plot.right - 1, y));
-    }
-    for division in 0..=columns {
-        let x = plot.left + width * division / columns;
-        line(dc, (x, plot.top), (x, plot.bottom - 1));
-    }
+    let horizontal = grid_offsets(height, step).flat_map(|offset| {
+        let y = plot.top + offset;
+        [
+            POINT { x: plot.left, y },
+            POINT {
+                x: plot.right - 1,
+                y,
+            },
+        ]
+    });
+    let vertical = grid_offsets(width, step).flat_map(|offset| {
+        let x = plot.left + offset;
+        [
+            POINT { x, y: plot.top },
+            POINT {
+                x,
+                y: plot.bottom - 1,
+            },
+        ]
+    });
+    let points: Vec<_> = horizontal.chain(vertical).collect();
+    let lengths = vec![2_u32; points.len() / 2];
+    // SAFETY: cada trecho aponta para dois pontos válidos no vetor contíguo.
+    unsafe { PolyPolyline(dc, points.as_ptr(), lengths.as_ptr(), lengths.len() as u32) };
 }
 
-fn draw_ticks(dc: HDC, plot: RECT, left: i32, margin: i32, scale: Scale) {
-    let step = (scale.high - scale.low) / 2.0;
-    let ticks = [scale.low, scale.high, scale.low + step];
-    let count = if plot.bottom - plot.top >= 4 * margin + 2 {
-        3
-    } else {
-        2
-    };
-    for value in ticks.into_iter().take(count) {
-        let y = scale.ordinate(plot, value);
-        text(
-            dc,
-            (left, y - margin, plot.left - margin, y + margin),
-            &axis_text(value),
-            MUTED,
-            DT_RIGHT,
-        );
-    }
+fn draw_ticks(dc: HDC, plot: RECT, left: i32, margin: i32, label_height: i32, scale: Scale) {
+    let right = plot.left - margin;
+    let label_height = label_height.min((plot.bottom - plot.top) / 2);
+    text(
+        dc,
+        (left, plot.top, right, plot.top + label_height),
+        &axis_text(scale.high),
+        MUTED,
+        DT_RIGHT,
+    );
+    text(
+        dc,
+        (left, plot.bottom - label_height, right, plot.bottom),
+        &axis_text(scale.low),
+        MUTED,
+        DT_RIGHT,
+    );
 }
 
 #[derive(Clone, Copy)]
 struct Timeline<'a> {
-    points: &'a [(Instant, Reading)],
+    points: &'a [MetricPoint],
     at: Instant,
     window: Duration,
     interval: Duration,
@@ -527,12 +484,9 @@ fn draw_trace(
     weight: i32,
 ) {
     let Timeline {
-        points,
-        at,
-        window,
-        interval,
+        points, at, window, ..
     } = timeline;
-    let pen = Object::pen(weight, color);
+    let pen = (weight > 1).then(|| Object::pen(weight, color));
     let Some(_state) = SavedDc::new(dc) else {
         return;
     };
@@ -540,20 +494,19 @@ fn draw_trace(
         IntersectClipRect(dc, plot.left, plot.top, plot.right, plot.bottom);
         SelectObject(dc, GetStockObject(DC_BRUSH));
         SetDCBrushColor(dc, color);
-        if pen.0.is_null() {
-            SetDCPenColor(dc, color);
-        } else {
+        if let Some(pen) = pen.as_ref().filter(|pen| !pen.0.is_null()) {
             SelectObject(dc, pen.0);
+        } else {
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SetDCPenColor(dc, color);
         }
     }
 
     let mut segment = Vec::with_capacity(points.len());
     let mut previous = None;
-    for &(time, reading) in points {
-        let value = measured(reading);
-        if value.is_none()
-            || previous.is_some_and(|previous| !close_in_time(previous, time, interval))
-        {
+    for point in points {
+        let value = measured(point.reading).filter(|&value| scale.contains(value));
+        if value.is_none() || previous.is_some_and(|previous| !consecutive(previous, point)) {
             draw_segment(dc, &segment, weight);
             segment.clear();
         }
@@ -561,7 +514,7 @@ fn draw_trace(
             let fraction = if window.is_zero() {
                 1.0
             } else {
-                1.0 - at.saturating_duration_since(time).as_secs_f64() / window.as_secs_f64()
+                1.0 - at.saturating_duration_since(point.at).as_secs_f64() / window.as_secs_f64()
             };
             let x = plot.left
                 + (f64::from(plot.right - plot.left - 1) * fraction.clamp(0.0, 1.0)).round() as i32;
@@ -569,7 +522,7 @@ fn draw_trace(
                 x,
                 y: scale.ordinate(plot, value),
             });
-            time
+            point
         });
     }
     draw_segment(dc, &segment, weight);
@@ -593,17 +546,6 @@ fn draw_segment(dc: HDC, segment: &[POINT], radius: i32) {
             }
         }
     }
-}
-
-fn line(dc: HDC, start: (i32, i32), end: (i32, i32)) {
-    let points = [
-        POINT {
-            x: start.0,
-            y: start.1,
-        },
-        POINT { x: end.0, y: end.1 },
-    ];
-    unsafe { Polyline(dc, points.as_ptr(), 2) };
 }
 
 fn fill(dc: HDC, bounds: RECT, color: COLORREF) {
@@ -682,6 +624,21 @@ impl Drop for SavedDc {
 
 struct Object(HGDIOBJ);
 
+pub(super) struct ChartFonts {
+    legend: Object,
+    detail: Object,
+}
+
+impl ChartFonts {
+    pub(super) fn new(dpi: u32) -> Self {
+        let px = |dips: i32| (dips * dpi as i32 + 48) / 96;
+        Self {
+            legend: Object::font(px(11), FW_SEMIBOLD),
+            detail: Object::font(px(10), FW_NORMAL),
+        }
+    }
+}
+
 impl Object {
     fn font(height: i32, weight: u32) -> Self {
         let name: [u16; 9] = [83, 101, 103, 111, 101, 32, 85, 73, 0]; // Segoe UI
@@ -733,18 +690,26 @@ impl Drop for Object {
 mod tests {
     use super::*;
 
+    fn point(at: Instant, reading: Reading) -> MetricPoint {
+        MetricPoint {
+            at,
+            reading,
+            interval: Duration::from_secs(1),
+        }
+    }
+
     #[test]
     fn statistics_only_include_measured_values_inside_the_window() {
         let start = Instant::now();
         let at = start + Duration::from_secs(5);
         let points = [
-            (start, Reading::Value(900.0)),
-            (start + Duration::from_secs(1), Reading::Value(0.0)),
-            (start + Duration::from_secs(2), Reading::Pending),
-            (start + Duration::from_secs(3), Reading::Value(12.0)),
-            (start + Duration::from_secs(4), Reading::Failed),
-            (at, Reading::Unavailable),
-            (at + Duration::from_secs(1), Reading::Value(900.0)),
+            point(start, Reading::Value(900.0)),
+            point(start + Duration::from_secs(1), Reading::Value(0.0)),
+            point(start + Duration::from_secs(2), Reading::Pending),
+            point(start + Duration::from_secs(3), Reading::Value(12.0)),
+            point(start + Duration::from_secs(4), Reading::Failed),
+            point(at, Reading::Unavailable),
+            point(at + Duration::from_secs(1), Reading::Value(900.0)),
         ];
         let visible = visible_points(&points, at, Duration::from_secs(4));
         let stats = Statistics::from_points(visible).unwrap();
@@ -766,38 +731,63 @@ mod tests {
         ));
         assert!(!close_in_time(at, at + 2 * interval, interval));
         assert!(
-            current_reading(&[(at, Reading::Value(25.0))], at + 2 * interval, interval).is_none()
+            current_reading(
+                &[point(at, Reading::Value(25.0))],
+                at + 2 * interval,
+                interval
+            )
+            .is_none()
         );
     }
 
     #[test]
-    fn percentage_scale_is_fixed_and_flat_values_keep_a_visible_axis_range() {
-        let stats = Statistics {
-            min: 62.0,
-            max: 62.0,
-            mean: 62.0,
+    fn existing_curves_keep_their_cadence_when_the_update_interval_changes() {
+        let start = Instant::now();
+        let slow = point(start, Reading::Value(25.0));
+        let fast = MetricPoint {
+            at: start + Duration::from_secs(1),
+            reading: Reading::Value(26.0),
+            interval: Duration::from_millis(100),
         };
-        let percentage = common_scale("%", [&stats].into_iter()).unwrap();
-        assert_eq!((percentage.low, percentage.high), (0.0, 100.0));
-        let adaptive = common_scale(" °C", [&stats].into_iter()).unwrap();
-        assert!(adaptive.low < 62.0 && adaptive.high > 62.0);
+        let gap = MetricPoint {
+            at: fast.at + Duration::from_millis(300),
+            ..fast
+        };
+        assert!(consecutive(&slow, &fast));
+        assert!(!consecutive(&fast, &gap));
+    }
+
+    #[test]
+    fn fixed_scale_places_readings_at_the_same_height() {
+        let scale = Scale::fixed([100.0].into_iter());
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 101,
+            bottom: 101,
+        };
+        assert_eq!((scale.low, scale.high), (0.0, 100.0));
+        assert_eq!(scale.ordinate(rect, 60.0), 40);
+        assert_eq!(scale.ordinate(rect, 0.0), 100);
+        assert_eq!(scale.ordinate(rect, 100.0), 0);
         assert_eq!(axis_text(2.5), "2,5");
         assert_eq!(axis_text(16_311.0), "16311");
     }
 
     #[test]
-    fn merged_adaptive_axis_covers_both_series_including_a_measured_zero() {
-        let at = Instant::now();
-        let first =
-            Statistics::from_points(&[(at, Reading::Value(0.0)), (at, Reading::Pending)]).unwrap();
-        let second =
-            Statistics::from_points(&[(at, Reading::Failed), (at, Reading::Value(8.25))]).unwrap();
-        let scale = common_scale(" W", [&first, &second].into_iter()).unwrap();
-        assert_eq!(scale.low, 0.0);
-        assert!(scale.high >= 8.25);
-        assert!(common_scale(" W", std::iter::empty()).is_none());
-        let percent = common_scale(" %", std::iter::empty()).unwrap();
-        assert_eq!((percent.low, percent.high), (0.0, 100.0));
+    fn merged_scale_uses_fixed_sensor_limits_and_detects_outliers() {
+        let scale = Scale::fixed([3_600.0, 14_000.0, f64::NAN, -20.0].into_iter());
+        assert_eq!((scale.low, scale.high), (0.0, 14_000.0));
+        assert!(scale.contains(0.0));
+        assert!(scale.contains(14_000.0));
+        assert!(!scale.contains(14_001.0));
+        assert!(!scale.contains(-1.0));
+    }
+
+    #[test]
+    fn grid_has_small_square_cells_with_the_plot_boundaries() {
+        assert!(grid_offsets(35, 12).eq([0, 12, 24, 35]));
+        assert!(grid_offsets(24, 12).eq([0, 12, 24]));
     }
 
     #[test]

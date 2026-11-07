@@ -19,15 +19,20 @@ O comando padrão consulta todas as GPUs NVIDIA enumeradas pela NVML. Cada GPU r
 
 ## Janela de monitoramento
 
-Abra com `gui`. A janela começa em um monitor secundário, quando disponível, e pode ser movida ou redimensionada. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
+Abra com `gui`. A janela sem barra de título começa em um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
 
+- **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 - **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
 - **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
 - **Histórico** (`F3`) alterna entre 30 segundos, 1 minuto, 2 minutos e 5 minutos.
+- Arraste um gráfico para posicioná-lo em um espaço livre ou para trocar de lugar com outro. O menu **Mover painel para** também permite escolher uma posição em outra página.
+- Ao clicar em um gráfico, o menu também permite escolher ou restaurar a cor de cada curva, inclusive em gráficos mesclados.
 
-O traçado ocupa a maior parte de cada painel. Escala, legenda e valores ficam compactos nas bordas. Mínimo, máximo e média simples usam as leituras válidas do período selecionado. Leituras ausentes aparecem como lacunas, e a janela indica quando a coleta está atrasada. A coleta segue em segundo plano enquanto a janela está minimizada.
+O traçado ocupa a maior parte do painel, com fundo preto, quadriculado fino e unidade ao lado do valor atual. A escala vertical fica fixa durante a sessão. Percentuais e temperatura vão de 0 a 100. Memória usa a capacidade detectada, e potência e clocks usam limites informados pelo driver quando disponíveis. Uma leitura atual fora da escala mantém seu valor e recebe uma seta. [Consultas de dispositivos da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)
 
-O ARGOS salva a grade, os sensores, as mesclagens e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`. O arquivo guarda as preferências do painel.
+Mínimo, máximo e média simples usam as leituras válidas do período selecionado. Leituras ausentes aparecem como lacunas, e a janela indica quando a coleta está atrasada. A coleta segue em segundo plano enquanto a janela está minimizada.
+
+O ARGOS salva a grade, as posições, os sensores, as mesclagens, as cores, a frequência e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`. O arquivo guarda as preferências do painel.
 
 ## Coleta contínua
 

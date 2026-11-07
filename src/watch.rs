@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
@@ -11,36 +11,134 @@ use crate::system::{self, SystemSampler};
 use crate::telemetry::{Cadence, History};
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(300);
-const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const GUI_INTERVALS_MS: [u32; 4] = [100, 200, 500, 1000];
+const FASTEST_GUI_INTERVAL: Duration = Duration::from_millis(GUI_INTERVALS_MS[0] as u64);
+const GPM_MIN_INTERVAL: Duration = Duration::from_millis(101);
+const SNAPSHOT_INTERVAL: Duration = FASTEST_GUI_INTERVAL;
+const BYTES_PER_MIB: f64 = 1_048_576.0;
+const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+const PERCENT_AXIS: Axis = Axis::Fixed(100.0);
 const GPU_SENSORS: [Sensor; 11] = [
-    ("gpu-temperature", "Temperatura", " °C"),
-    ("gpu-power", "Potência", " W"),
-    ("vram-used", "VRAM usada", " MiB"),
-    ("vram-total", "VRAM total", " MiB"),
-    ("vram-free", "VRAM livre", " MiB"),
-    ("gpu-activity", "Atividade GPU", "%"),
-    ("gpu-memory-activity", "Atividade de memória", "%"),
-    ("gpu-graphics-clock", "Clock gráfico", " MHz"),
-    ("gpu-memory-clock", "Clock de memória", " MHz"),
-    ("gpu-nvenc", "NVENC", "%"),
-    ("gpu-nvdec", "NVDEC", "%"),
+    ("gpu-temperature", "Temperatura", " °C", Axis::Fixed(100.0)),
+    ("gpu-power", "Potência", " W", Axis::Power),
+    ("vram-used", "VRAM usada", " MiB", Axis::Vram),
+    ("vram-total", "VRAM total", " MiB", Axis::Vram),
+    ("vram-free", "VRAM livre", " MiB", Axis::Vram),
+    ("gpu-activity", "Atividade GPU", "%", PERCENT_AXIS),
+    (
+        "gpu-memory-activity",
+        "Atividade de memória",
+        "%",
+        PERCENT_AXIS,
+    ),
+    (
+        "gpu-graphics-clock",
+        "Clock gráfico",
+        " MHz",
+        Axis::GraphicsClock,
+    ),
+    (
+        "gpu-memory-clock",
+        "Clock de memória",
+        " MHz",
+        Axis::MemoryClock,
+    ),
+    ("gpu-nvenc", "NVENC", "%", PERCENT_AXIS),
+    ("gpu-nvdec", "NVDEC", "%", PERCENT_AXIS),
 ];
 const SYSTEM_SENSORS: [Sensor; 3] = [
-    ("cpu-usage", "Uso de CPU", "%"),
-    ("ram-used", "RAM usada", " GiB"),
-    ("ram-total", "RAM total", " GiB"),
+    ("cpu-usage", "Uso de CPU", "%", PERCENT_AXIS),
+    ("ram-used", "RAM usada", " GiB", Axis::Ram),
+    ("ram-total", "RAM total", " GiB", Axis::Ram),
 ];
 const GPM_COUNT: usize = GPM_METRICS.len();
 const GPU: &str = "GPU / NVML";
 const GPM: &str = "GPM / NVML";
 const SYSTEM: &str = "Sistema / Windows";
 // A chave persistida independe da tradução e da ordem de exibição do sensor.
-type Sensor = (&'static str, &'static str, &'static str);
+type Sensor = (&'static str, &'static str, &'static str, Axis);
+
+#[derive(Clone, Copy)]
+enum Axis {
+    Fixed(f64),
+    Power,
+    Vram,
+    Ram,
+    GraphicsClock,
+    MemoryClock,
+}
+
+struct AxisLimits {
+    power: f64,
+    vram: f64,
+    ram: f64,
+    graphics_clock: f64,
+    memory_clock: f64,
+}
+
+const FALLBACK_AXES: AxisLimits = AxisLimits {
+    power: 1_000.0,
+    vram: 131_072.0,
+    ram: 128.0,
+    graphics_clock: 4_000.0,
+    memory_clock: 20_000.0,
+};
+
+impl AxisLimits {
+    fn detect(device: Option<&Device<'_>>) -> Self {
+        let mut limits = FALLBACK_AXES;
+        let ram = system::memory_usage()
+            .ok()
+            .map(|memory| memory.total as f64 / BYTES_PER_GIB);
+        limits.ram = axis_limit(ram, limits.ram);
+
+        if let Some(device) = device {
+            let vram = device
+                .memory()
+                .ok()
+                .map(|memory| memory.total as f64 / BYTES_PER_MIB);
+            let power = device
+                .max_power_milliwatts()
+                .ok()
+                .map(|value| f64::from(value.div_ceil(25_000)) * 25.0);
+            let graphics_clock = device
+                .max_graphics_clock_mhz()
+                .ok()
+                .map(|value| f64::from(value.div_ceil(100)) * 100.0);
+            let memory_clock = device
+                .max_memory_clock_mhz()
+                .ok()
+                .map(|value| f64::from(value.div_ceil(100)) * 100.0);
+            limits.vram = axis_limit(vram, limits.vram);
+            limits.power = axis_limit(power, limits.power);
+            limits.graphics_clock = axis_limit(graphics_clock, limits.graphics_clock);
+            limits.memory_clock = axis_limit(memory_clock, limits.memory_clock);
+        }
+        limits
+    }
+
+    fn max_for(&self, axis: Axis) -> f64 {
+        match axis {
+            Axis::Fixed(value) => value,
+            Axis::Power => self.power,
+            Axis::Vram => self.vram,
+            Axis::Ram => self.ram,
+            Axis::GraphicsClock => self.graphics_clock,
+            Axis::MemoryClock => self.memory_clock,
+        }
+    }
+}
+
+fn axis_limit(value: Option<f64>, fallback: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(fallback)
+}
 
 fn gpm_sensors() -> [Sensor; GPM_COUNT] {
     GPM_METRICS
         .each_ref()
-        .map(|metric| (metric.key, metric.name, "%"))
+        .map(|metric| (metric.key, metric.name, "%", PERCENT_AXIS))
 }
 
 pub(crate) fn sensor_catalog() -> impl Iterator<Item = (&'static str, &'static str)> {
@@ -48,7 +146,7 @@ pub(crate) fn sensor_catalog() -> impl Iterator<Item = (&'static str, &'static s
         .into_iter()
         .chain(gpm_sensors())
         .chain(SYSTEM_SENSORS)
-        .map(|(key, _, unit)| (key, unit))
+        .map(|(key, _, unit, _)| (key, unit))
 }
 
 #[derive(Clone, Copy)]
@@ -64,7 +162,15 @@ pub(crate) struct MetricSnapshot {
     pub(crate) unit: &'static str,
     pub(crate) source: &'static str,
     pub(crate) interval: Duration,
-    pub(crate) points: Vec<(Instant, Reading)>,
+    pub(crate) axis_max: f64,
+    pub(crate) points: Vec<MetricPoint>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MetricPoint {
+    pub(crate) at: Instant,
+    pub(crate) reading: Reading,
+    pub(crate) interval: Duration,
 }
 
 pub(crate) struct Snapshot {
@@ -73,43 +179,72 @@ pub(crate) struct Snapshot {
     pub(crate) metrics: Vec<MetricSnapshot>,
 }
 
-type LatestSnapshot = Arc<Mutex<Option<Arc<Snapshot>>>>;
+struct WindowFeed {
+    latest: Mutex<Option<Arc<Snapshot>>>,
+    requested: AtomicBool,
+    interval_ms: AtomicU32,
+}
 
 pub(crate) struct Monitor {
-    latest: LatestSnapshot,
+    feed: Arc<WindowFeed>,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Monitor {
-    pub(crate) fn start(gpu: Option<u32>) -> Result<Self, String> {
-        let latest = Arc::new(Mutex::new(None));
+    pub(crate) fn start(gpu: Option<u32>, interval_ms: u32) -> Result<Self, String> {
+        if !GUI_INTERVALS_MS.contains(&interval_ms) {
+            return Err(format!("intervalo de coleta inválido: {interval_ms} ms"));
+        }
+        let feed = Arc::new(WindowFeed {
+            latest: Mutex::new(None),
+            requested: AtomicBool::new(true),
+            interval_ms: AtomicU32::new(interval_ms),
+        });
         let stopped = Arc::new(AtomicBool::new(false));
-        let feed = Arc::clone(&latest);
+        let worker_feed = Arc::clone(&feed);
         let stop = Arc::clone(&stopped);
-        let interval = Duration::from_secs(1);
+        let interval = Duration::from_millis(u64::from(interval_ms));
         let options = WatchOptions {
             gpu,
             gpu_interval: interval,
-            gpm_interval: interval,
+            gpm_interval: interval.max(GPM_MIN_INTERVAL),
             system_interval: interval,
             duration: None,
         };
         let worker = thread::Builder::new()
             .name("argos-coleta".into())
             .spawn(move || {
-                let _ = collect(options, Sink::Window(feed), &stop);
+                let _ = collect(options, Sink::Window(worker_feed), &stop);
             })
             .map_err(|error| format!("falha ao iniciar a coleta ({error})"))?;
         Ok(Self {
-            latest,
+            feed,
             stopped,
             worker: Some(worker),
         })
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<Snapshot>> {
-        self.latest.lock().ok()?.clone()
+        let current = self.feed.latest.lock().ok()?.clone();
+        if !self.feed.requested.swap(true, Ordering::Relaxed) {
+            self.wake();
+        }
+        current
+    }
+
+    pub(crate) fn set_interval_ms(&self, interval_ms: u32) {
+        if GUI_INTERVALS_MS.contains(&interval_ms)
+            && self.feed.interval_ms.swap(interval_ms, Ordering::Relaxed) != interval_ms
+        {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
     }
 }
 
@@ -150,13 +285,18 @@ impl<const N: usize> From<[Reading; N]> for Frame<N> {
 
 struct Group<const N: usize> {
     cadence: Cadence,
-    history: History<Frame<N>>,
+    history: History<StoredFrame<N>>,
     capacity: usize,
 }
 
+struct StoredFrame<const N: usize> {
+    frame: Frame<N>,
+    interval: Duration,
+}
+
 impl<const N: usize> Group<N> {
-    fn new(start: Instant, interval: Duration) -> Self {
-        let capacity = HISTORY_WINDOW.as_millis().div_ceil(interval.as_millis()) as usize;
+    fn new(start: Instant, interval: Duration, fastest: Duration) -> Self {
+        let capacity = HISTORY_WINDOW.as_millis().div_ceil(fastest.as_millis()) as usize;
         Self {
             cadence: Cadence::new(start, interval),
             history: History::new(HISTORY_WINDOW, capacity),
@@ -175,7 +315,13 @@ impl<const N: usize> Group<N> {
         let frame = collect();
         let captured = Instant::now();
         self.cadence.complete(captured);
-        self.history.push(captured, frame);
+        self.history.push(
+            captured,
+            StoredFrame {
+                frame,
+                interval: self.cadence.interval(),
+            },
+        );
         Some((captured - start, frame))
     }
 
@@ -189,8 +335,9 @@ impl<const N: usize> Group<N> {
         let gaps = self
             .history
             .iter()
-            .filter(|(_, frame)| {
-                frame
+            .filter(|(_, sample)| {
+                sample
+                    .frame
                     .values
                     .iter()
                     .any(|value| !matches!(value, Reading::Value(_)))
@@ -228,7 +375,7 @@ enum Update {
 
 enum Sink {
     Console(SyncSender<Update>),
-    Window(LatestSnapshot),
+    Window(Arc<WindowFeed>),
 }
 
 pub(crate) fn run(options: WatchOptions) -> Result<(), String> {
@@ -256,7 +403,7 @@ pub(crate) fn run(options: WatchOptions) -> Result<(), String> {
     })
 }
 
-fn collect(options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<(), String> {
+fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<(), String> {
     let (console, window) = match &sink {
         Sink::Console(sender) => (Some(sender), None),
         Sink::Window(latest) => (None, Some(latest)),
@@ -279,23 +426,56 @@ fn collect(options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<()
     } else {
         notice
     };
+    let window = window.map(|feed| (feed, AxisLimits::detect(device.as_ref())));
 
     let start = Instant::now();
     let end = options.duration.map(|duration| start + duration);
-    let mut system = Group::new(start, options.system_interval);
+    let fastest = |interval| {
+        if window.is_some() {
+            FASTEST_GUI_INTERVAL
+        } else {
+            interval
+        }
+    };
+    let mut system = Group::new(
+        start,
+        options.system_interval,
+        fastest(options.system_interval),
+    );
     let mut system_source = SystemSampler::default();
     let mut gpu = device
         .as_ref()
-        .map(|_| Group::new(start, options.gpu_interval));
-    let mut gpm = device
-        .as_ref()
-        .map(|_| Group::new(start, options.gpm_interval));
+        .map(|_| Group::new(start, options.gpu_interval, fastest(options.gpu_interval)));
+    let mut gpm = device.as_ref().map(|_| {
+        Group::new(
+            start,
+            options.gpm_interval,
+            fastest(options.gpm_interval).max(GPM_MIN_INTERVAL),
+        )
+    });
     let mut gpm_source = GpmSource::Discover;
     let mut skipped_updates = 0;
     let mut snapshot_due = start;
     let mut snapshot_pending = true;
 
     while !stopped.load(Ordering::Relaxed) && end.is_none_or(|end| Instant::now() < end) {
+        if let Some((feed, _)) = &window {
+            let interval =
+                Duration::from_millis(u64::from(feed.interval_ms.load(Ordering::Relaxed)));
+            if interval != options.gpu_interval {
+                options.gpu_interval = interval;
+                options.system_interval = interval;
+                options.gpm_interval = interval.max(GPM_MIN_INTERVAL);
+                system.cadence.set_interval(interval);
+                if let Some(gpu) = &mut gpu {
+                    gpu.cadence.set_interval(interval);
+                }
+                if let Some(gpm) = &mut gpm {
+                    gpm.cadence.set_interval(options.gpm_interval);
+                }
+                snapshot_pending = true;
+            }
+        }
         if let Some((elapsed, frame)) =
             system.capture(start, || read_system(&mut system_source).into())
         {
@@ -331,13 +511,25 @@ fn collect(options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<()
         if let Some(end) = end {
             next = next.min(end);
         }
-        if let Some(latest) = window.filter(|_| snapshot_pending) {
+        if let Some((feed, axis_limits)) = window
+            .as_ref()
+            .filter(|(feed, _)| snapshot_pending && feed.requested.load(Ordering::Relaxed))
+        {
             let now = Instant::now();
             if now >= snapshot_due {
-                let snapshot =
-                    build_snapshot(now, &notice, &options, &system, gpu.as_ref(), gpm.as_ref());
+                feed.requested.store(false, Ordering::Relaxed);
+                let snapshot = build_snapshot(
+                    now,
+                    &notice,
+                    &options,
+                    &system,
+                    gpu.as_ref(),
+                    gpm.as_ref(),
+                    axis_limits,
+                );
                 // O custo de copiar as séries e descartar a cópia anterior fica fora da trava.
-                let previous = latest
+                let previous = feed
+                    .latest
                     .try_lock()
                     .ok()
                     .map(|mut published| published.replace(snapshot));
@@ -345,6 +537,7 @@ fn collect(options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<()
                 drop(previous);
                 snapshot_due = now + SNAPSHOT_INTERVAL;
                 if snapshot_pending {
+                    feed.requested.store(true, Ordering::Relaxed);
                     next = next.min(snapshot_due);
                 }
             } else {
@@ -376,6 +569,7 @@ fn build_snapshot(
     system: &Group<{ SYSTEM_SENSORS.len() }>,
     gpu: Option<&Group<{ GPU_SENSORS.len() }>>,
     gpm: Option<&Group<GPM_COUNT>>,
+    axis_limits: &AxisLimits,
 ) -> Arc<Snapshot> {
     let mut metrics = Vec::with_capacity(GPU_SENSORS.len() + GPM_COUNT + SYSTEM_SENSORS.len());
     append_metrics(
@@ -385,6 +579,7 @@ fn build_snapshot(
         &GPU_SENSORS,
         GPU,
         options.gpu_interval,
+        axis_limits,
     );
     append_metrics(
         &mut metrics,
@@ -393,6 +588,7 @@ fn build_snapshot(
         &gpm_sensors(),
         GPM,
         options.gpm_interval,
+        axis_limits,
     );
     append_metrics(
         &mut metrics,
@@ -401,6 +597,7 @@ fn build_snapshot(
         &SYSTEM_SENSORS,
         SYSTEM,
         options.system_interval,
+        axis_limits,
     );
     Arc::new(Snapshot {
         at,
@@ -416,21 +613,27 @@ fn append_metrics<const N: usize>(
     sensors: &[Sensor; N],
     source: &'static str,
     interval: Duration,
+    axis_limits: &AxisLimits,
 ) {
     let start = metrics.len();
     let capacity = group.map_or(0, |group| group.history.len());
-    metrics.extend(sensors.iter().map(|&(_, name, unit)| MetricSnapshot {
+    metrics.extend(sensors.iter().map(|&(_, name, unit, axis)| MetricSnapshot {
         name,
         unit,
         source,
         interval,
+        axis_max: axis_limits.max_for(axis),
         points: Vec::with_capacity(capacity),
     }));
     if let Some(group) = group {
-        for (at, frame) in group.history.iter() {
+        for (at, sample) in group.history.iter() {
             if now.saturating_duration_since(at) < HISTORY_WINDOW {
-                for (metric, reading) in metrics[start..].iter_mut().zip(frame.values) {
-                    metric.points.push((at, reading));
+                for (metric, reading) in metrics[start..].iter_mut().zip(sample.frame.values) {
+                    metric.points.push(MetricPoint {
+                        at,
+                        reading,
+                        interval: sample.interval,
+                    });
                 }
             }
         }
@@ -456,11 +659,10 @@ fn publish(sender: &SyncSender<Update>, update: Update, skipped_updates: &mut u6
 
 fn read_gpu(device: &Device<'_>) -> [Reading; GPU_SENSORS.len()] {
     let [used, total, free] = nvml_values(device.memory(), |memory| {
-        const MIB: f64 = 1_048_576.0;
         [
-            memory.used as f64 / MIB,
-            memory.total as f64 / MIB,
-            memory.free as f64 / MIB,
+            memory.used as f64 / BYTES_PER_MIB,
+            memory.total as f64 / BYTES_PER_MIB,
+            memory.free as f64 / BYTES_PER_MIB,
         ]
     });
     let [gpu, memory] = nvml_values(device.utilization(), |usage| {
@@ -557,13 +759,10 @@ fn read_system(sampler: &mut SystemSampler) -> [Reading; SYSTEM_SENSORS.len()] {
         Err(_) => Reading::Failed,
     };
     let [used, total] = match system::memory_usage() {
-        Ok(memory) => {
-            const GIB: f64 = 1_073_741_824.0;
-            [
-                Reading::Value(memory.used as f64 / GIB),
-                Reading::Value(memory.total as f64 / GIB),
-            ]
-        }
+        Ok(memory) => [
+            Reading::Value(memory.used as f64 / BYTES_PER_GIB),
+            Reading::Value(memory.total as f64 / BYTES_PER_GIB),
+        ],
         Err(_) => [Reading::Failed; 2],
     };
     [cpu, used, total]
@@ -622,7 +821,7 @@ fn report_frame<const N: usize>(
     if let Some(window) = frame.window {
         write!(out, " ({:.1} ms)", window.as_secs_f64() * 1_000.0)?;
     }
-    for ((_, label, unit), value) in sensors.iter().zip(frame.values) {
+    for ((_, label, unit, _), value) in sensors.iter().zip(frame.values) {
         write!(out, " | {label}: ")?;
         match value {
             Reading::Value(value) => write!(out, "{value:.2}{unit}")?,
@@ -685,7 +884,8 @@ mod tests {
     #[test]
     fn collection_keeps_a_failure_and_recovers_at_the_next_interval() {
         let start = Instant::now();
-        let mut group = Group::new(start, Duration::from_millis(1));
+        let interval = Duration::from_millis(1);
+        let mut group = Group::new(start, interval, interval);
         let mut source = [Reading::Failed, Reading::Value(0.0)].into_iter();
 
         let first = group.capture(start, || [source.next().unwrap()].into());
@@ -710,6 +910,7 @@ mod tests {
         let start = Instant::now();
         let now = start + HISTORY_WINDOW;
         let interval = Duration::from_secs(1);
+        let prior_interval = Duration::from_millis(200);
         let options = WatchOptions {
             gpu: None,
             gpu_interval: interval,
@@ -717,14 +918,28 @@ mod tests {
             system_interval: interval,
             duration: None,
         };
-        let mut system = Group::new(start, interval);
-        system.history.push(start, [Reading::Value(12.0); 3].into());
+        let mut system = Group::new(start, interval, FASTEST_GUI_INTERVAL);
+        system.history.push(
+            start,
+            StoredFrame {
+                frame: [Reading::Value(12.0); 3].into(),
+                interval,
+            },
+        );
         system.history.push(
             start + interval,
-            [Reading::Value(0.0), Reading::Failed, Reading::Value(32.0)].into(),
+            StoredFrame {
+                frame: [Reading::Value(0.0), Reading::Failed, Reading::Value(32.0)].into(),
+                interval: prior_interval,
+            },
         );
 
-        let snapshot = build_snapshot(now, "Sem GPU", &options, &system, None, None);
+        let limits = AxisLimits {
+            vram: 16_384.0,
+            ram: 31.5,
+            ..FALLBACK_AXES
+        };
+        let snapshot = build_snapshot(now, "Sem GPU", &options, &system, None, None, &limits);
         let gpu_and_gpm = GPU_SENSORS.len() + GPM_COUNT;
         assert_eq!(snapshot.metrics.len(), gpu_and_gpm + SYSTEM_SENSORS.len());
         let mut keys = std::collections::HashSet::new();
@@ -743,11 +958,58 @@ mod tests {
         );
         assert!(matches!(
             snapshot.metrics[gpu_and_gpm].points.as_slice(),
-            [(_, Reading::Value(0.0))]
+            [MetricPoint { at, reading: Reading::Value(0.0), interval: sample_interval }]
+                if *at == start + interval && *sample_interval == prior_interval
         ));
         assert!(matches!(
             snapshot.metrics[gpu_and_gpm + 1].points.as_slice(),
-            [(_, Reading::Failed)]
+            [MetricPoint {
+                reading: Reading::Failed,
+                ..
+            }]
         ));
+        assert_eq!(snapshot.metrics[gpu_and_gpm].interval, interval);
+        assert_eq!(system.capacity, 3000);
+        assert_eq!(snapshot.metrics[0].axis_max, 100.0);
+        assert!(
+            snapshot.metrics[2..5]
+                .iter()
+                .all(|metric| metric.axis_max == limits.vram)
+        );
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .filter(|metric| metric.unit == "%")
+                .all(|metric| metric.axis_max == 100.0)
+        );
+        assert!(
+            snapshot.metrics[gpu_and_gpm + 1..]
+                .iter()
+                .all(|metric| metric.axis_max == limits.ram)
+        );
+        assert!(
+            snapshot
+                .metrics
+                .iter()
+                .all(|metric| metric.axis_max.is_finite() && metric.axis_max > 0.0)
+        );
+    }
+
+    #[test]
+    fn invalid_hardware_limit_uses_fixed_fallback() {
+        for invalid in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            assert_eq!(
+                axis_limit(invalid, FALLBACK_AXES.power),
+                FALLBACK_AXES.power
+            );
+        }
+        assert_eq!(axis_limit(Some(175.0), FALLBACK_AXES.power), 175.0);
     }
 }

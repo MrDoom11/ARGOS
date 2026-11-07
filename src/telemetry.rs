@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct Cadence {
     deadline: Instant,
     interval: Duration,
+    last_completion: Option<Instant>,
 }
 
 impl Cadence {
@@ -15,6 +16,7 @@ impl Cadence {
         Self {
             deadline: now,
             interval,
+            last_completion: None,
         }
     }
 
@@ -23,7 +25,23 @@ impl Cadence {
     }
 
     pub(crate) fn complete(&mut self, at: Instant) {
+        self.last_completion = Some(at);
         self.deadline = at + self.interval;
+    }
+
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub(crate) fn set_interval(&mut self, interval: Duration) {
+        assert!(
+            !interval.is_zero(),
+            "o intervalo de coleta deve ser positivo"
+        );
+        self.interval = interval;
+        if let Some(last) = self.last_completion {
+            self.deadline = last + interval;
+        }
     }
 }
 
@@ -93,6 +111,25 @@ mod tests {
         let completion = start + Duration::from_secs(5);
         cadence.complete(completion);
         assert_eq!(cadence.deadline(), completion + interval);
+    }
+
+    #[test]
+    fn new_period_applies_from_the_last_completed_sample() {
+        let start = Instant::now();
+        let initial = Duration::from_secs(1);
+        let fast = Duration::from_millis(101);
+        let slow = Duration::from_millis(500);
+        let mut cadence = Cadence::new(start, initial);
+        cadence.set_interval(fast);
+        assert_eq!(cadence.deadline(), start);
+
+        let completion = start + initial;
+        cadence.complete(completion);
+        cadence.set_interval(slow);
+        assert_eq!(cadence.deadline(), completion + slow);
+        cadence.set_interval(fast);
+        assert_eq!(cadence.interval(), fast);
+        assert_eq!(cadence.deadline(), completion + fast);
     }
 
     #[test]
