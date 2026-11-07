@@ -1,8 +1,8 @@
 use std::io::{self, Write};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::thread::{self, Thread};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::cli::WatchOptions;
@@ -11,36 +11,116 @@ use crate::system::{self, SystemSampler};
 use crate::telemetry::{Cadence, History};
 
 const HISTORY_WINDOW: Duration = Duration::from_secs(300);
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const GPU_SENSORS: [Sensor; 11] = [
-    ("Temperatura", " °C"),
-    ("Potência", " W"),
-    ("VRAM usada", " MiB"),
-    ("VRAM total", " MiB"),
-    ("VRAM livre", " MiB"),
-    ("Atividade GPU", "%"),
-    ("Atividade de memória", "%"),
-    ("Clock gráfico", " MHz"),
-    ("Clock de memória", " MHz"),
-    ("NVENC", "%"),
-    ("NVDEC", "%"),
+    ("gpu-temperature", "Temperatura", " °C"),
+    ("gpu-power", "Potência", " W"),
+    ("vram-used", "VRAM usada", " MiB"),
+    ("vram-total", "VRAM total", " MiB"),
+    ("vram-free", "VRAM livre", " MiB"),
+    ("gpu-activity", "Atividade GPU", "%"),
+    ("gpu-memory-activity", "Atividade de memória", "%"),
+    ("gpu-graphics-clock", "Clock gráfico", " MHz"),
+    ("gpu-memory-clock", "Clock de memória", " MHz"),
+    ("gpu-nvenc", "NVENC", "%"),
+    ("gpu-nvdec", "NVDEC", "%"),
 ];
 const SYSTEM_SENSORS: [Sensor; 3] = [
-    ("Uso de CPU", "%"),
-    ("RAM usada", " GiB"),
-    ("RAM total", " GiB"),
+    ("cpu-usage", "Uso de CPU", "%"),
+    ("ram-used", "RAM usada", " GiB"),
+    ("ram-total", "RAM total", " GiB"),
 ];
 const GPM_COUNT: usize = GPM_METRICS.len();
 const GPU: &str = "GPU / NVML";
 const GPM: &str = "GPM / NVML";
 const SYSTEM: &str = "Sistema / Windows";
-type Sensor = (&'static str, &'static str);
+// A chave persistida independe da tradução e da ordem de exibição do sensor.
+type Sensor = (&'static str, &'static str, &'static str);
+
+fn gpm_sensors() -> [Sensor; GPM_COUNT] {
+    GPM_METRICS
+        .each_ref()
+        .map(|metric| (metric.key, metric.name, "%"))
+}
+
+pub(crate) fn sensor_catalog() -> impl Iterator<Item = (&'static str, &'static str)> {
+    GPU_SENSORS
+        .into_iter()
+        .chain(gpm_sensors())
+        .chain(SYSTEM_SENSORS)
+        .map(|(key, _, unit)| (key, unit))
+}
 
 #[derive(Clone, Copy)]
-enum Reading {
+pub(crate) enum Reading {
     Value(f64),
     Pending,
     Unavailable,
     Failed,
+}
+
+pub(crate) struct MetricSnapshot {
+    pub(crate) name: &'static str,
+    pub(crate) unit: &'static str,
+    pub(crate) source: &'static str,
+    pub(crate) interval: Duration,
+    pub(crate) points: Vec<(Instant, Reading)>,
+}
+
+pub(crate) struct Snapshot {
+    pub(crate) at: Instant,
+    pub(crate) notice: String,
+    pub(crate) metrics: Vec<MetricSnapshot>,
+}
+
+type LatestSnapshot = Arc<Mutex<Option<Arc<Snapshot>>>>;
+
+pub(crate) struct Monitor {
+    latest: LatestSnapshot,
+    stopped: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Monitor {
+    pub(crate) fn start(gpu: Option<u32>) -> Result<Self, String> {
+        let latest = Arc::new(Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let feed = Arc::clone(&latest);
+        let stop = Arc::clone(&stopped);
+        let interval = Duration::from_secs(1);
+        let options = WatchOptions {
+            gpu,
+            gpu_interval: interval,
+            gpm_interval: interval,
+            system_interval: interval,
+            duration: None,
+        };
+        let worker = thread::Builder::new()
+            .name("argos-coleta".into())
+            .spawn(move || {
+                let _ = collect(options, Sink::Window(feed), &stop);
+            })
+            .map_err(|error| format!("falha ao iniciar a coleta ({error})"))?;
+        Ok(Self {
+            latest,
+            stopped,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.latest.lock().ok()?.clone()
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Reading {
@@ -146,12 +226,20 @@ enum Update {
     },
 }
 
+enum Sink {
+    Console(SyncSender<Update>),
+    Window(LatestSnapshot),
+}
+
 pub(crate) fn run(options: WatchOptions) -> Result<(), String> {
     let _control = ConsoleControl::install()
         .map_err(|error| format!("falha ao habilitar o encerramento com Ctrl+C ({error})"))?;
     thread::scope(|scope| {
         let (sender, receiver) = mpsc::sync_channel(8);
-        let worker = scope.spawn(move || collect(options, sender));
+        let worker = scope.spawn(move || {
+            let _ = COLLECTOR.set(thread::current());
+            collect(options, Sink::Console(sender), &STOPPED)
+        });
         let output = report_updates(&receiver);
         drop(receiver);
         if output.is_err() {
@@ -168,27 +256,28 @@ pub(crate) fn run(options: WatchOptions) -> Result<(), String> {
     })
 }
 
-fn collect(options: WatchOptions, sender: SyncSender<Update>) -> Result<(), String> {
-    let _ = COLLECTOR.set(thread::current());
+fn collect(options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Result<(), String> {
+    let (console, window) = match &sink {
+        Sink::Console(sender) => (Some(sender), None),
+        Sink::Window(latest) => (None, Some(latest)),
+    };
     let nvml = Nvml::load();
-    let device = match select_gpu(&nvml, options.gpu.unwrap_or(0)) {
+    let index = options.gpu.unwrap_or(0);
+    let (device, notice) = match select_gpu(&nvml, index) {
         Ok(device) => {
             let name = device
                 .name()
                 .unwrap_or_else(|_| "modelo indisponível".into());
-            let _ = sender.send(Update::Notice(format!(
-                "GPU NVIDIA {} · {name}",
-                options.gpu.unwrap_or(0)
-            )));
-            Some(device)
+            (Some(device), format!("GPU NVIDIA {index} · {name}"))
         }
-        Err(error) if options.gpu.is_some() => return Err(error),
-        Err(error) => {
-            let _ = sender.send(Update::Notice(format!(
-                "Coleta NVIDIA indisponível ({error})."
-            )));
-            None
-        }
+        Err(error) if options.gpu.is_some() && console.is_some() => return Err(error),
+        Err(error) => (None, format!("Coleta NVIDIA indisponível ({error}).")),
+    };
+    let notice = if let Some(sender) = console {
+        let _ = sender.send(Update::Notice(notice));
+        String::new()
+    } else {
+        notice
     };
 
     let start = Instant::now();
@@ -203,25 +292,35 @@ fn collect(options: WatchOptions, sender: SyncSender<Update>) -> Result<(), Stri
         .map(|_| Group::new(start, options.gpm_interval));
     let mut gpm_source = GpmSource::Discover;
     let mut skipped_updates = 0;
+    let mut snapshot_due = start;
+    let mut snapshot_pending = true;
 
-    while !STOPPED.load(Ordering::Relaxed) && end.is_none_or(|end| Instant::now() < end) {
+    while !stopped.load(Ordering::Relaxed) && end.is_none_or(|end| Instant::now() < end) {
         if let Some((elapsed, frame)) =
             system.capture(start, || read_system(&mut system_source).into())
         {
-            publish(
-                &sender,
-                Update::System(elapsed, frame),
-                &mut skipped_updates,
-            );
+            if let Some(sender) = console {
+                publish(sender, Update::System(elapsed, frame), &mut skipped_updates);
+            } else {
+                snapshot_pending = true;
+            }
         }
         if let (Some(device), Some(gpu), Some(gpm)) = (&device, &mut gpu, &mut gpm) {
             if let Some((elapsed, frame)) = gpu.capture(start, || read_gpu(device).into()) {
-                publish(&sender, Update::Gpu(elapsed, frame), &mut skipped_updates);
+                if let Some(sender) = console {
+                    publish(sender, Update::Gpu(elapsed, frame), &mut skipped_updates);
+                } else {
+                    snapshot_pending = true;
+                }
             }
             if let Some((elapsed, frame)) =
                 gpm.capture(start, || gpm_source.read(device, options.gpm_interval))
             {
-                publish(&sender, Update::Gpm(elapsed, frame), &mut skipped_updates);
+                if let Some(sender) = console {
+                    publish(sender, Update::Gpm(elapsed, frame), &mut skipped_updates);
+                } else {
+                    snapshot_pending = true;
+                }
             }
         }
 
@@ -232,20 +331,110 @@ fn collect(options: WatchOptions, sender: SyncSender<Update>) -> Result<(), Stri
         if let Some(end) = end {
             next = next.min(end);
         }
+        if let Some(latest) = window.filter(|_| snapshot_pending) {
+            let now = Instant::now();
+            if now >= snapshot_due {
+                let snapshot =
+                    build_snapshot(now, &notice, &options, &system, gpu.as_ref(), gpm.as_ref());
+                // O custo de copiar as séries e descartar a cópia anterior fica fora da trava.
+                let previous = latest
+                    .try_lock()
+                    .ok()
+                    .map(|mut published| published.replace(snapshot));
+                snapshot_pending = previous.is_none();
+                drop(previous);
+                snapshot_due = now + SNAPSHOT_INTERVAL;
+                if snapshot_pending {
+                    next = next.min(snapshot_due);
+                }
+            } else {
+                next = next.min(snapshot_due);
+            }
+        }
         thread::park_timeout(next.saturating_duration_since(Instant::now()));
     }
 
-    let finished = Instant::now();
-    let _ = sender.send(Update::Finished {
-        elapsed: finished - start,
-        groups: [
-            gpu.map(|mut group| group.summary(finished, GPU)),
-            gpm.map(|mut group| group.summary(finished, GPM)),
-            Some(system.summary(finished, SYSTEM)),
-        ],
-        skipped_updates,
-    });
+    if let Some(sender) = console {
+        let finished = Instant::now();
+        let _ = sender.send(Update::Finished {
+            elapsed: finished - start,
+            groups: [
+                gpu.map(|mut group| group.summary(finished, GPU)),
+                gpm.map(|mut group| group.summary(finished, GPM)),
+                Some(system.summary(finished, SYSTEM)),
+            ],
+            skipped_updates,
+        });
+    }
     Ok(())
+}
+
+fn build_snapshot(
+    at: Instant,
+    notice: &str,
+    options: &WatchOptions,
+    system: &Group<{ SYSTEM_SENSORS.len() }>,
+    gpu: Option<&Group<{ GPU_SENSORS.len() }>>,
+    gpm: Option<&Group<GPM_COUNT>>,
+) -> Arc<Snapshot> {
+    let mut metrics = Vec::with_capacity(GPU_SENSORS.len() + GPM_COUNT + SYSTEM_SENSORS.len());
+    append_metrics(
+        &mut metrics,
+        at,
+        gpu,
+        &GPU_SENSORS,
+        GPU,
+        options.gpu_interval,
+    );
+    append_metrics(
+        &mut metrics,
+        at,
+        gpm,
+        &gpm_sensors(),
+        GPM,
+        options.gpm_interval,
+    );
+    append_metrics(
+        &mut metrics,
+        at,
+        Some(system),
+        &SYSTEM_SENSORS,
+        SYSTEM,
+        options.system_interval,
+    );
+    Arc::new(Snapshot {
+        at,
+        notice: notice.into(),
+        metrics,
+    })
+}
+
+fn append_metrics<const N: usize>(
+    metrics: &mut Vec<MetricSnapshot>,
+    now: Instant,
+    group: Option<&Group<N>>,
+    sensors: &[Sensor; N],
+    source: &'static str,
+    interval: Duration,
+) {
+    let start = metrics.len();
+    let capacity = group.map_or(0, |group| group.history.len());
+    metrics.extend(sensors.iter().map(|&(_, name, unit)| MetricSnapshot {
+        name,
+        unit,
+        source,
+        interval,
+        points: Vec::with_capacity(capacity),
+    }));
+    if let Some(group) = group {
+        for (at, frame) in group.history.iter() {
+            if now.saturating_duration_since(at) < HISTORY_WINDOW {
+                for (metric, reading) in metrics[start..].iter_mut().zip(frame.values) {
+                    metric.points.push((at, reading));
+                }
+            }
+        }
+    }
 }
 
 fn select_gpu(nvml: &Result<Nvml, NvmlError>, index: u32) -> Result<Device<'_>, String> {
@@ -383,7 +572,7 @@ fn read_system(sampler: &mut SystemSampler) -> [Reading; SYSTEM_SENSORS.len()] {
 fn report_updates(receiver: &Receiver<Update>) -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "ARGOS — coleta contínua (Ctrl+C para encerrar)")?;
-    let gpm_sensors = GPM_METRICS.each_ref().map(|metric| (metric.name, "%"));
+    let gpm_sensors = gpm_sensors();
     for update in receiver {
         match update {
             Update::Notice(message) => writeln!(out, "{message}")?,
@@ -433,7 +622,7 @@ fn report_frame<const N: usize>(
     if let Some(window) = frame.window {
         write!(out, " ({:.1} ms)", window.as_secs_f64() * 1_000.0)?;
     }
-    for ((label, unit), value) in sensors.iter().zip(frame.values) {
+    for ((_, label, unit), value) in sensors.iter().zip(frame.values) {
         write!(out, " | {label}: ")?;
         match value {
             Reading::Value(value) => write!(out, "{value:.2}{unit}")?,
@@ -514,5 +703,51 @@ mod tests {
         let summary = group.summary(Instant::now(), "teste");
         assert_eq!(summary.count, 2);
         assert_eq!(summary.gaps, 1);
+    }
+
+    #[test]
+    fn snapshot_keeps_sensor_order_and_preserves_only_the_live_history() {
+        let start = Instant::now();
+        let now = start + HISTORY_WINDOW;
+        let interval = Duration::from_secs(1);
+        let options = WatchOptions {
+            gpu: None,
+            gpu_interval: interval,
+            gpm_interval: interval,
+            system_interval: interval,
+            duration: None,
+        };
+        let mut system = Group::new(start, interval);
+        system.history.push(start, [Reading::Value(12.0); 3].into());
+        system.history.push(
+            start + interval,
+            [Reading::Value(0.0), Reading::Failed, Reading::Value(32.0)].into(),
+        );
+
+        let snapshot = build_snapshot(now, "Sem GPU", &options, &system, None, None);
+        let gpu_and_gpm = GPU_SENSORS.len() + GPM_COUNT;
+        assert_eq!(snapshot.metrics.len(), gpu_and_gpm + SYSTEM_SENSORS.len());
+        let mut keys = std::collections::HashSet::new();
+        assert_eq!(sensor_catalog().count(), snapshot.metrics.len());
+        assert!(
+            sensor_catalog()
+                .zip(&snapshot.metrics)
+                .all(|((key, unit), metric)| { keys.insert(key) && unit == metric.unit })
+        );
+        assert_eq!(snapshot.metrics[0].source, GPU);
+        assert_eq!(snapshot.metrics[GPU_SENSORS.len()].source, GPM);
+        assert!(
+            snapshot.metrics[..gpu_and_gpm]
+                .iter()
+                .all(|metric| metric.points.is_empty())
+        );
+        assert!(matches!(
+            snapshot.metrics[gpu_and_gpm].points.as_slice(),
+            [(_, Reading::Value(0.0))]
+        ));
+        assert!(matches!(
+            snapshot.metrics[gpu_and_gpm + 1].points.as_slice(),
+            [(_, Reading::Failed)]
+        ));
     }
 }

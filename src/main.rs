@@ -3,6 +3,8 @@ use std::process::ExitCode;
 #[cfg(windows)]
 mod cli;
 #[cfg(windows)]
+mod gui;
+#[cfg(windows)]
 mod nvml;
 #[cfg(windows)]
 mod probe;
@@ -26,12 +28,17 @@ fn main() -> ExitCode {
             print!("{}", cli::WATCH_HELP);
             ExitCode::SUCCESS
         }
+        Ok(Command::GuiHelp) => {
+            print!("{}", cli::GUI_HELP);
+            ExitCode::SUCCESS
+        }
         Ok(Command::Version) => {
             println!("ARGOS {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Ok(Command::Probe(options)) => report_result(probe::run(options)),
         Ok(Command::Watch(options)) => report_result(watch::run(options)),
+        Ok(Command::Gui(gpu)) => report_result(gui::run(gpu)),
         Err(error) => {
             eprintln!("ARGOS: {error}\nConsulte argos --help.");
             ExitCode::from(2)
