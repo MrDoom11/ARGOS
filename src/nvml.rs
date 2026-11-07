@@ -317,7 +317,9 @@ pub struct Nvml {
     utilization: Symbol<DeviceValue<Utilization>>,
     temperature: Symbol<DeviceSelectorValue>,
     power: Symbol<DeviceValue<u32>>,
+    power_constraints: Symbol<DevicePair>,
     clock: Symbol<DeviceSelectorValue>,
+    max_clock: Symbol<DeviceSelectorValue>,
     encoder: Symbol<DevicePair>,
     decoder: Symbol<DevicePair>,
     gpm_support: Symbol<DeviceValue<GpmSupport>>,
@@ -358,7 +360,9 @@ impl Nvml {
                 utilization: library.symbol(c"nvmlDeviceGetUtilizationRates"),
                 temperature: library.symbol(c"nvmlDeviceGetTemperature"),
                 power: library.symbol(c"nvmlDeviceGetPowerUsage"),
+                power_constraints: library.symbol(c"nvmlDeviceGetPowerManagementLimitConstraints"),
                 clock: library.symbol(c"nvmlDeviceGetClockInfo"),
+                max_clock: library.symbol(c"nvmlDeviceGetMaxClockInfo"),
                 encoder: library.symbol(c"nvmlDeviceGetEncoderUtilization"),
                 decoder: library.symbol(c"nvmlDeviceGetDecoderUtilization"),
                 gpm_support: library.symbol(c"nvmlGpmQueryDeviceSupport"),
@@ -494,12 +498,33 @@ impl<'a> Device<'a> {
         Self::available(value)
     }
 
+    pub(crate) fn max_power_milliwatts(&self) -> Result<u32, Error> {
+        let query = self.nvml.power_constraints;
+        let (mut min, mut max) = (u32::MAX, u32::MAX);
+        // The handle belongs to a live session and both outputs point to live u32 values.
+        query.check(unsafe { query.get()?(self.handle, &mut min, &mut max) })?;
+        if min > max {
+            return Err(Error::InvalidData(
+                "limites de potência inconsistentes na NVML",
+            ));
+        }
+        Self::available(max)
+    }
+
     pub fn graphics_clock_mhz(&self) -> Result<u32, Error> {
         self.selector_value(self.nvml.clock, CLOCK_GRAPHICS)
     }
 
     pub fn memory_clock_mhz(&self) -> Result<u32, Error> {
         self.selector_value(self.nvml.clock, CLOCK_MEMORY)
+    }
+
+    pub(crate) fn max_graphics_clock_mhz(&self) -> Result<u32, Error> {
+        self.selector_value(self.nvml.max_clock, CLOCK_GRAPHICS)
+    }
+
+    pub(crate) fn max_memory_clock_mhz(&self) -> Result<u32, Error> {
+        self.selector_value(self.nvml.max_clock, CLOCK_MEMORY)
     }
 
     pub fn encoder_utilization(&self) -> Result<MediaUtilization, Error> {
