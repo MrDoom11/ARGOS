@@ -23,7 +23,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-use crate::watch::{GUI_INTERVALS_MS, Monitor, Snapshot};
+use crate::frames::{Process, SENSOR_COUNT, visible_processes};
+use crate::watch::{
+    CPU_TEMPERATURE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS, Monitor, Snapshot,
+};
 
 mod board;
 mod chart;
@@ -50,6 +53,9 @@ const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 2000;
 const COLOR_FIRST: usize = 3000;
 const MOVE_PANEL_FIRST: usize = 4000;
+const FRAME_TARGET_OFF: usize = 5000;
+const FRAME_TARGET_FIRST: usize = 5001;
+const FRAME_SENSORS: std::ops::Range<usize> = FRAME_SENSOR_START..FRAME_SENSOR_START + SENSOR_COUNT;
 const PERIODS: [(u64, &str); 4] = [(30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")];
 const DEFAULT_METRICS: [usize; 12] = [0, 1, 2, 5, 6, 7, 11, 12, 13, 14, 16, 17];
 const SERIES: [COLORREF; 16] = [
@@ -530,6 +536,11 @@ enum MenuSection {
 }
 
 fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: MenuSection) {
+    let processes = if matches!(section, MenuSection::All) {
+        visible_processes()
+    } else {
+        Vec::new()
+    };
     let (menu, panel) = {
         let Ok(app) = state.try_borrow() else { return };
         let Some(menu) = Menu::new() else { return };
@@ -556,6 +567,7 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
                 });
                 menu.group("Histórico", |items| app.period_menu(items));
                 menu.group("Sensores", |items| app.sensor_menu(items));
+                menu.group("Quadros do jogo", |items| app.frame_menu(items, &processes));
                 menu.group("Grade", |items| app.grid_menu(items));
                 if app.page_count() > 1 {
                     menu.group("Página", |items| {
@@ -658,6 +670,19 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             if let Some(panel) = panel {
                 choose_series_color(hwnd, state, panel, choice - COLOR_FIRST);
             }
+        }
+        choice if choice >= FRAME_TARGET_OFF => {
+            let pid = if choice == FRAME_TARGET_OFF {
+                0
+            } else if let Some(process) = processes.get(choice - FRAME_TARGET_FIRST) {
+                process.pid
+            } else {
+                return;
+            };
+            if let Ok(mut app) = state.try_borrow_mut() {
+                app.select_frame_target(pid);
+            }
+            invalidate(hwnd);
         }
         choice => edit_board(hwnd, state, |app| app.apply_selection(choice, panel)),
     }
@@ -821,6 +846,22 @@ impl Window {
             .is_some_and(|snapshot| now.saturating_duration_since(snapshot.at) >= limit)
     }
 
+    fn select_frame_target(&mut self, pid: u32) {
+        if self.monitor.frame_target() == pid {
+            return;
+        }
+        self.monitor.set_frame_target(pid);
+        if pid != 0
+            && let Some(panel) = self
+                .board
+                .panels
+                .iter()
+                .position(|panel| panel.iter().any(|sensor| FRAME_SENSORS.contains(sensor)))
+        {
+            self.page = panel / self.slots();
+        }
+    }
+
     fn apply_selection(&mut self, choice: usize, panel: Option<usize>) -> bool {
         if let Some(&interval) = choice
             .checked_sub(REFRESH_FIRST)
@@ -904,6 +945,15 @@ impl Window {
             && snapshot.metrics.get(index).is_some()
         {
             self.board.toggle(index);
+            if (FRAME_SENSORS.contains(&index) || index == CPU_TEMPERATURE_INDEX)
+                && let Some(panel) = self
+                    .board
+                    .panels
+                    .iter()
+                    .position(|panel| panel.contains(&index))
+            {
+                self.page = panel / self.slots();
+            }
             return true;
         }
         false
@@ -957,6 +1007,47 @@ impl Window {
         }
         menu.separator();
         menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
+    }
+
+    fn frame_menu(&self, menu: &Menu, processes: &[Process]) {
+        let target = self.monitor.frame_target();
+        let status = if target == 0 {
+            "Captura desativada"
+        } else {
+            self.snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.frame_target == target)
+                .and_then(|snapshot| snapshot.frame_status)
+                .unwrap_or("Aguardando a coleta de quadros")
+        };
+        menu.label(status);
+        if let Some(snapshot) = &self.snapshot {
+            menu.separator();
+            menu.label("Gráficos exibidos");
+            for index in FRAME_SENSORS {
+                if let Some(metric) = snapshot.metrics.get(index) {
+                    menu.item(
+                        SENSOR_FIRST + index,
+                        metric.name,
+                        self.board.contains(index),
+                    );
+                }
+            }
+        }
+        menu.separator();
+        menu.label("Captura por aplicativo");
+        menu.item(FRAME_TARGET_OFF, "Desativado", target == 0);
+        if processes.is_empty() {
+            menu.label("Nenhum aplicativo visível");
+        }
+        for (index, process) in processes.iter().enumerate() {
+            let name = process.name.replace('&', "&&");
+            menu.item(
+                FRAME_TARGET_FIRST + index,
+                &format!("{name} (PID {})", process.pid),
+                process.pid == target,
+            );
+        }
     }
 
     fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize) {
@@ -1064,6 +1155,7 @@ impl Window {
                 snapshot.at
             };
             let period = Duration::from_secs(PERIODS[self.board.period].0);
+            let frames_current = snapshot.frame_target == self.monitor.frame_target();
             let mut series = Vec::new();
             for (slot, panel) in self
                 .board
@@ -1078,6 +1170,9 @@ impl Window {
                 }
                 series.clear();
                 series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
+                    if !frames_current && FRAME_SENSORS.contains(&sensor) {
+                        return None;
+                    }
                     let metric = snapshot.metrics.get(sensor)?;
                     Some((metric, self.series_color(sensor, position, panel.len())))
                 }));

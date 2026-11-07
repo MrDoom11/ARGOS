@@ -6,6 +6,8 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::cli::WatchOptions;
+use crate::cpu_temperature::CpuTemperature;
+use crate::frames::{self, FrameSampler};
 use crate::nvml::{Device, Error as NvmlError, GPM_METRICS, GpmSampler, Nvml};
 use crate::system::{self, SystemSampler};
 use crate::telemetry::{Cadence, History};
@@ -14,23 +16,24 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(300);
 pub(crate) const GUI_INTERVALS_MS: [u32; 4] = [100, 200, 500, 1000];
 const FASTEST_GUI_INTERVAL: Duration = Duration::from_millis(GUI_INTERVALS_MS[0] as u64);
 const GPM_MIN_INTERVAL: Duration = Duration::from_millis(101);
+const CPU_TEMPERATURE_INTERVAL: Duration = Duration::from_secs(1);
 const SNAPSHOT_INTERVAL: Duration = FASTEST_GUI_INTERVAL;
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
 const PERCENT_AXIS: Axis = Axis::Fixed(100.0);
 const GPU_SENSORS: [Sensor; 11] = [
-    ("gpu-temperature", "Temperatura", " °C", Axis::Fixed(100.0)),
+    (
+        "gpu-temperature",
+        "Temperatura da GPU",
+        " °C",
+        Axis::Fixed(100.0),
+    ),
     ("gpu-power", "Potência", " W", Axis::Power),
     ("vram-used", "VRAM usada", " MiB", Axis::Vram),
     ("vram-total", "VRAM total", " MiB", Axis::Vram),
     ("vram-free", "VRAM livre", " MiB", Axis::Vram),
     ("gpu-activity", "Atividade GPU", "%", PERCENT_AXIS),
-    (
-        "gpu-memory-activity",
-        "Atividade de memória",
-        "%",
-        PERCENT_AXIS,
-    ),
+    ("gpu-memory-activity", "VRAM · atividade", "%", PERCENT_AXIS),
     (
         "gpu-graphics-clock",
         "Clock gráfico",
@@ -39,7 +42,7 @@ const GPU_SENSORS: [Sensor; 11] = [
     ),
     (
         "gpu-memory-clock",
-        "Clock de memória",
+        "VRAM · clock",
         " MHz",
         Axis::MemoryClock,
     ),
@@ -51,10 +54,35 @@ const SYSTEM_SENSORS: [Sensor; 3] = [
     ("ram-used", "RAM usada", " GiB", Axis::Ram),
     ("ram-total", "RAM total", " GiB", Axis::Ram),
 ];
+const FRAME_SENSORS: [Sensor; frames::SENSOR_COUNT] = [
+    ("present-fps", "FPS apresentado", " FPS", Axis::Fixed(360.0)),
+    (
+        "present-frametime",
+        "Frametime (pico 1 s)",
+        " ms",
+        Axis::Fixed(100.0),
+    ),
+    (
+        "present-cpu-wait",
+        "Espera CPU (pico 1 s)",
+        " ms",
+        Axis::Fixed(100.0),
+    ),
+];
+const CPU_TEMPERATURE_SENSORS: [Sensor; 1] = [(
+    "cpu-temperature",
+    "Temperatura da CPU",
+    " °C",
+    Axis::Fixed(100.0),
+)];
 const GPM_COUNT: usize = GPM_METRICS.len();
+pub(crate) const FRAME_SENSOR_START: usize = GPU_SENSORS.len() + GPM_COUNT + SYSTEM_SENSORS.len();
+pub(crate) const CPU_TEMPERATURE_INDEX: usize = FRAME_SENSOR_START + FRAME_SENSORS.len();
 const GPU: &str = "GPU / NVML";
 const GPM: &str = "GPM / NVML";
 const SYSTEM: &str = "Sistema / Windows";
+const FRAMES: &str = "Quadros / DirectX";
+const CPU_TEMPERATURE: &str = "CPU / PawnIO";
 // A chave persistida independe da tradução e da ordem de exibição do sensor.
 type Sensor = (&'static str, &'static str, &'static str, Axis);
 
@@ -146,6 +174,8 @@ pub(crate) fn sensor_catalog() -> impl Iterator<Item = (&'static str, &'static s
         .into_iter()
         .chain(gpm_sensors())
         .chain(SYSTEM_SENSORS)
+        .chain(FRAME_SENSORS)
+        .chain(CPU_TEMPERATURE_SENSORS)
         .map(|(key, _, unit, _)| (key, unit))
 }
 
@@ -177,12 +207,15 @@ pub(crate) struct Snapshot {
     pub(crate) at: Instant,
     pub(crate) notice: String,
     pub(crate) metrics: Vec<MetricSnapshot>,
+    pub(crate) frame_target: u32,
+    pub(crate) frame_status: Option<&'static str>,
 }
 
 struct WindowFeed {
     latest: Mutex<Option<Arc<Snapshot>>>,
     requested: AtomicBool,
     interval_ms: AtomicU32,
+    frame_target: AtomicU32,
 }
 
 pub(crate) struct Monitor {
@@ -200,6 +233,7 @@ impl Monitor {
             latest: Mutex::new(None),
             requested: AtomicBool::new(true),
             interval_ms: AtomicU32::new(interval_ms),
+            frame_target: AtomicU32::new(0),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_feed = Arc::clone(&feed);
@@ -239,6 +273,16 @@ impl Monitor {
         {
             self.wake();
         }
+    }
+
+    pub(crate) fn frame_target(&self) -> u32 {
+        self.feed.frame_target.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_frame_target(&self, pid: u32) {
+        self.feed.frame_target.store(pid, Ordering::Relaxed);
+        self.feed.requested.store(true, Ordering::Relaxed);
+        self.wake();
     }
 
     fn wake(&self) {
@@ -361,6 +405,48 @@ struct HistorySummary {
     span: Duration,
 }
 
+struct FrameMonitor {
+    pid: u32,
+    sampler: FrameSampler,
+    group: Group<{ FRAME_SENSORS.len() }>,
+    status: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct DashboardReadings {
+    frames: Option<FrameMonitor>,
+    cpu_temperature: Option<(CpuTemperature, Group<1>)>,
+}
+
+impl FrameMonitor {
+    fn new(pid: u32, interval: Duration) -> Self {
+        let sampler = FrameSampler::start(pid);
+        Self {
+            pid,
+            sampler,
+            group: Group::new(Instant::now(), interval, FASTEST_GUI_INTERVAL),
+            status: None,
+        }
+    }
+
+    fn collect(&mut self, start: Instant) -> bool {
+        self.group
+            .capture(start, || {
+                let sample = self.sampler.sample();
+                self.status = Some(sample.status());
+                match sample {
+                    frames::Sample::Measured(values) => {
+                        values.map(|value| value.map_or(Reading::Pending, Reading::Value))
+                    }
+                    frames::Sample::Waiting(_) => [Reading::Pending; FRAME_SENSORS.len()],
+                    frames::Sample::Unavailable(_) => [Reading::Unavailable; FRAME_SENSORS.len()],
+                }
+                .into()
+            })
+            .is_some()
+    }
+}
+
 enum Update {
     Notice(String),
     Gpu(Duration, Frame<{ GPU_SENSORS.len() }>),
@@ -454,6 +540,13 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
         )
     });
     let mut gpm_source = GpmSource::Discover;
+    let mut dashboard = DashboardReadings::default();
+    if window.is_some() {
+        dashboard.cpu_temperature = CpuTemperature::open().ok().map(|source| {
+            let interval = CPU_TEMPERATURE_INTERVAL;
+            (source, Group::new(start, interval, interval))
+        });
+    }
     let mut skipped_updates = 0;
     let mut snapshot_due = start;
     let mut snapshot_pending = true;
@@ -473,7 +566,20 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 if let Some(gpm) = &mut gpm {
                     gpm.cadence.set_interval(options.gpm_interval);
                 }
+                if let Some(frames) = &mut dashboard.frames {
+                    frames.group.cadence.set_interval(interval);
+                }
                 snapshot_pending = true;
+            }
+            let pid = feed.frame_target.load(Ordering::Relaxed);
+            if pid != dashboard.frames.as_ref().map_or(0, |frames| frames.pid) {
+                // Drop the previous session before starting a capture for the new process.
+                drop(dashboard.frames.take());
+                dashboard.frames = (pid != 0).then(|| FrameMonitor::new(pid, interval));
+                snapshot_pending = true;
+            }
+            if let Some(frames) = &mut dashboard.frames {
+                snapshot_pending |= frames.collect(start);
             }
         }
         if let Some((elapsed, frame)) =
@@ -504,9 +610,20 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             }
         }
 
+        if let Some((source, group)) = &mut dashboard.cpu_temperature {
+            snapshot_pending |= group
+                .capture(start, || [read_cpu_temperature(source)].into())
+                .is_some();
+        }
         let mut next = system.cadence.deadline();
         if let (Some(gpu), Some(gpm)) = (&gpu, &gpm) {
             next = next.min(gpu.cadence.deadline()).min(gpm.cadence.deadline());
+        }
+        if let Some(frames) = &dashboard.frames {
+            next = next.min(frames.group.cadence.deadline());
+        }
+        if let Some((_, group)) = &dashboard.cpu_temperature {
+            next = next.min(group.cadence.deadline());
         }
         if let Some(end) = end {
             next = next.min(end);
@@ -521,10 +638,10 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 let snapshot = build_snapshot(
                     now,
                     &notice,
-                    &options,
                     &system,
                     gpu.as_ref(),
                     gpm.as_ref(),
+                    &dashboard,
                     axis_limits,
                 );
                 // O custo de copiar as séries e descartar a cópia anterior fica fora da trava.
@@ -565,20 +682,21 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
 fn build_snapshot(
     at: Instant,
     notice: &str,
-    options: &WatchOptions,
     system: &Group<{ SYSTEM_SENSORS.len() }>,
     gpu: Option<&Group<{ GPU_SENSORS.len() }>>,
     gpm: Option<&Group<GPM_COUNT>>,
+    dashboard: &DashboardReadings,
     axis_limits: &AxisLimits,
 ) -> Arc<Snapshot> {
-    let mut metrics = Vec::with_capacity(GPU_SENSORS.len() + GPM_COUNT + SYSTEM_SENSORS.len());
+    let interval = system.cadence.interval();
+    let mut metrics = Vec::with_capacity(CPU_TEMPERATURE_INDEX + CPU_TEMPERATURE_SENSORS.len());
     append_metrics(
         &mut metrics,
         at,
         gpu,
         &GPU_SENSORS,
         GPU,
-        options.gpu_interval,
+        interval,
         axis_limits,
     );
     append_metrics(
@@ -587,7 +705,7 @@ fn build_snapshot(
         gpm,
         &gpm_sensors(),
         GPM,
-        options.gpm_interval,
+        interval.max(GPM_MIN_INTERVAL),
         axis_limits,
     );
     append_metrics(
@@ -596,13 +714,42 @@ fn build_snapshot(
         Some(system),
         &SYSTEM_SENSORS,
         SYSTEM,
-        options.system_interval,
+        interval,
         axis_limits,
     );
+    let frames = dashboard.frames.as_ref();
+    append_metrics(
+        &mut metrics,
+        at,
+        frames.map(|frames| &frames.group),
+        &FRAME_SENSORS,
+        FRAMES,
+        interval,
+        axis_limits,
+    );
+    let temperature = dashboard.cpu_temperature.as_ref().map(|(_, group)| group);
+    append_metrics(
+        &mut metrics,
+        at,
+        temperature,
+        &CPU_TEMPERATURE_SENSORS,
+        CPU_TEMPERATURE,
+        CPU_TEMPERATURE_INTERVAL,
+        axis_limits,
+    );
+    if temperature.is_none() {
+        metrics[CPU_TEMPERATURE_INDEX].points.push(MetricPoint {
+            at,
+            reading: Reading::Unavailable,
+            interval: CPU_TEMPERATURE_INTERVAL,
+        });
+    }
     Arc::new(Snapshot {
         at,
         notice: notice.into(),
         metrics,
+        frame_target: frames.map_or(0, |frames| frames.pid),
+        frame_status: frames.and_then(|frames| frames.status),
     })
 }
 
@@ -768,6 +915,15 @@ fn read_system(sampler: &mut SystemSampler) -> [Reading; SYSTEM_SENSORS.len()] {
     [cpu, used, total]
 }
 
+fn read_cpu_temperature(source: &CpuTemperature) -> Reading {
+    match source.celsius() {
+        Ok(Some(value)) => Reading::Value(value),
+        Ok(None) => Reading::Pending,
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Reading::Unavailable,
+        Err(_) => Reading::Failed,
+    }
+}
+
 fn report_updates(receiver: &Receiver<Update>) -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "ARGOS — coleta contínua (Ctrl+C para encerrar)")?;
@@ -911,13 +1067,6 @@ mod tests {
         let now = start + HISTORY_WINDOW;
         let interval = Duration::from_secs(1);
         let prior_interval = Duration::from_millis(200);
-        let options = WatchOptions {
-            gpu: None,
-            gpu_interval: interval,
-            gpm_interval: interval,
-            system_interval: interval,
-            duration: None,
-        };
         let mut system = Group::new(start, interval, FASTEST_GUI_INTERVAL);
         system.history.push(
             start,
@@ -939,9 +1088,36 @@ mod tests {
             ram: 31.5,
             ..FALLBACK_AXES
         };
-        let snapshot = build_snapshot(now, "Sem GPU", &options, &system, None, None, &limits);
+        let snapshot = build_snapshot(
+            now,
+            "Sem GPU",
+            &system,
+            None,
+            None,
+            &DashboardReadings::default(),
+            &limits,
+        );
         let gpu_and_gpm = GPU_SENSORS.len() + GPM_COUNT;
-        assert_eq!(snapshot.metrics.len(), gpu_and_gpm + SYSTEM_SENSORS.len());
+        assert_eq!(
+            snapshot.metrics.len(),
+            CPU_TEMPERATURE_INDEX + CPU_TEMPERATURE_SENSORS.len()
+        );
+        assert_eq!(snapshot.frame_target, 0);
+        assert_eq!(snapshot.frame_status, None);
+        assert!(
+            snapshot.metrics[FRAME_SENSOR_START..CPU_TEMPERATURE_INDEX]
+                .iter()
+                .all(|metric| { metric.points.is_empty() && metric.source == FRAMES })
+        );
+        let temperature = &snapshot.metrics[CPU_TEMPERATURE_INDEX];
+        assert_eq!(temperature.interval, CPU_TEMPERATURE_INTERVAL);
+        assert!(matches!(
+            temperature.points.as_slice(),
+            [MetricPoint {
+                reading: Reading::Unavailable,
+                ..
+            }]
+        ));
         let mut keys = std::collections::HashSet::new();
         assert_eq!(sensor_catalog().count(), snapshot.metrics.len());
         assert!(
@@ -984,7 +1160,7 @@ mod tests {
                 .all(|metric| metric.axis_max == 100.0)
         );
         assert!(
-            snapshot.metrics[gpu_and_gpm + 1..]
+            snapshot.metrics[gpu_and_gpm + 1..FRAME_SENSOR_START]
                 .iter()
                 .all(|metric| metric.axis_max == limits.ram)
         );

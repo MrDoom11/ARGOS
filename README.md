@@ -24,6 +24,7 @@ Abra com `gui`. A janela sem barra de título começa em um monitor secundário,
 - **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 - **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
 - **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
+- **Quadros do jogo** seleciona o executável de um aplicativo aberto e mostra o estado da captura. Na seção **Gráficos exibidos**, marque separadamente o FPS, o frametime e a espera da CPU. Use **Desativado** para encerrar a captura de quadros.
 - **Histórico** (`F3`) alterna entre 30 segundos, 1 minuto, 2 minutos e 5 minutos.
 - Arraste um gráfico para posicioná-lo em um espaço livre ou para trocar de lugar com outro. O menu **Mover painel para** também permite escolher uma posição em outra página.
 - Ao clicar em um gráfico, o menu também permite escolher ou restaurar a cor de cada curva, inclusive em gráficos mesclados.
@@ -33,6 +34,22 @@ O traçado ocupa a maior parte do painel, com fundo preto, quadriculado fino e u
 Mínimo, máximo e média simples usam as leituras válidas do período selecionado. Leituras ausentes aparecem como lacunas, e a janela indica quando a coleta está atrasada. A coleta segue em segundo plano enquanto a janela está minimizada.
 
 O ARGOS salva a grade, as posições, os sensores, as mesclagens, as cores, a frequência e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`. O arquivo guarda as preferências do painel.
+
+### Quadros do jogo
+
+Abra o jogo e selecione seu executável em **Quadros do jogo**. O ARGOS começa com a captura desativada e mantém a seleção do processo em memória. A escolha do jogo e a visibilidade dos gráficos são independentes. A captura usa eventos do Windows para chamadas `Present()` do DXGI e do Direct3D 9. O Windows exige execução como administrador ou uma conta no grupo **Performance Log Users** para essa sessão. O menu mostra quando a captura está indisponível. [Permissões do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew#return-value)
+
+| Sensor | Medição |
+| --- | --- |
+| FPS apresentado | Taxa calculada a partir dos intervalos entre apresentações bem-sucedidas na cadeia de apresentação mais ativa do processo. |
+| Frametime (pico 1 s) | Maior intervalo entre inícios de chamadas `Present()` na janela de eventos mais recente. |
+| Espera CPU (pico 1 s) | Maior tempo que a thread passou dentro de `Present()` na janela de eventos mais recente. |
+
+Os três sensores usam uma janela de até 1 s de eventos. As medições se referem a apresentações do aplicativo. Quadros efetivamente exibidos, quadros gerados pelo driver e espera da GPU exigem outras fontes de eventos. O Windows pode entregar eventos em lotes, mesmo com o painel configurado para atualizar a cada 100 ms. Os tempos são calculados a partir dos relógios dos próprios eventos. [Entrega de buffers do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties) · [Cálculo da espera no PresentMon](https://github.com/GameTechDev/PresentMon/blob/main/IntelPresentMon/CommonUtilities/mc/MetricsCalculatorCpuGpu.cpp#L35-L49)
+
+### Temperatura da CPU
+
+Em **Sensores**, marque **Temperatura da CPU**. O painel usa a temperatura interna de controle (`Tctl`) da CPU AMD família `19h`, modelo `75h`, a cada 1 s. Essa leitura requer a edição oficial assinada do PawnIO e o módulo oficial `AMDFamily17.bin` na mesma pasta de `argos.exe`. A configuração padrão do driver exige que o ARGOS seja executado como administrador. O gráfico mostra **N/D** quando a fonte estiver indisponível. [Driver PawnIO](https://pawnio.eu/) · [Módulos oficiais](https://github.com/namazso/PawnIO.Modules/releases)
 
 ## Coleta contínua
 
@@ -52,7 +69,7 @@ Na sessão de validação de 30 min e 5 s, com intervalo de 1 s por grupo e saí
 ## Como interpretar as leituras
 
 - O inventário usa as APIs do Windows para identificar o sistema, a CPU, os processadores lógicos ativos e a RAM utilizável.
-- A NVML fornece o modelo da GPU, as versões do driver e da biblioteca, o modo do driver, a VRAM, a atividade geral da GPU e da memória, a temperatura, a potência, os clocks e a atividade de NVENC e NVDEC. Cada API tem sua própria janela de medição. Por exemplo, o driver retorna a potência média de 1 s na GPU de referência. [Consultas de dispositivos da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)
+- A NVML fornece o modelo da GPU, as versões do driver e da biblioteca, o modo do driver, a VRAM, a atividade da GPU e da VRAM, a temperatura, a potência, os clocks e a atividade de NVENC e NVDEC. Cada API tem sua própria janela de medição. Por exemplo, o driver retorna a potência média de 1 s na GPU de referência. [Consultas de dispositivos da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)
 - A consulta de suporte GPM é feita por GPU. Quando há suporte, duas amostras alimentam o cálculo dos cinco contadores percentuais abaixo. Uma leitura válida de `0%` é exibida como valor. A sonda de diagnóstico mostra o motivo disponível quando a consulta, a coleta ou um contador individual falha. [Definições dos contadores GPM](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmEnums.html)
 
 | ID GPM | Métrica | O que o driver mede |
@@ -60,7 +77,7 @@ Na sessão de validação de 30 min e 5 s, com intervalo de 1 s por grupo e saí
 | 2 | Atividade dos SMs | Percentual de SMs ocupados |
 | 3 | Ocupação dos SMs | Warps ativos em relação ao máximo teórico |
 | 5 | Atividade Tensor | Fração do tempo em que os SMs executaram operações Tensor |
-| 10 | Largura de banda da DRAM | Fração da largura de banda teórica utilizada |
+| 10 | VRAM · largura de banda | Fração da largura de banda teórica da VRAM utilizada |
 | 12 | Atividade FP32 | Fração do tempo em que os SMs executaram operações FP32 fora das unidades Tensor |
 
 ## Validação inicial
@@ -75,7 +92,7 @@ Na janela de 1 s, o driver reportou 11,81% de atividade FP32, 0,31% de atividade
 2. Repita durante uma carga conhecida. Para validar a resposta dos contadores, mantenha a carga estável por vários intervalos e use cargas que exercitem operações FP32 e Tensor em execuções separadas.
 3. Se quiser comparar com a ferramenta da NVIDIA, faça uma execução separada com `nvidia-smi dmon -i 0 -c 5 -d 1 --gpm-metrics 2,3,5,10,12 --gpm-options d`, nos drivers que aceitam essa opção. O `nvidia-smi` é opcional para a comparação. [Referência do NVIDIA System Management Interface](https://docs.nvidia.com/deploy/nvidia-smi/index.html)
 
-RT Cores, cache L2, FPS e frametime seguem em investigação. A medição de impacto nos tempos de quadro pertence a uma etapa posterior.
+RT Cores, cache L2 e os tempos de GPU por quadro seguem em investigação. A captura de apresentações ainda precisa ser validada durante um jogo e medida quanto ao impacto nos tempos de quadro.
 
 ## Licença
 

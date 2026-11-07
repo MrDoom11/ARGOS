@@ -3,6 +3,10 @@ use std::process::ExitCode;
 #[cfg(windows)]
 mod cli;
 #[cfg(windows)]
+mod cpu_temperature;
+#[cfg(windows)]
+mod frames;
+#[cfg(windows)]
 mod gui;
 #[cfg(windows)]
 mod nvml;

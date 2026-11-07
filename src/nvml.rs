@@ -130,7 +130,7 @@ pub(crate) static GPM_METRICS: [GpmMetric; 5] = [
     },
     GpmMetric {
         id: 10,
-        name: "Largura de banda da DRAM",
+        name: "VRAM · largura de banda",
         key: "gpm-dram-bandwidth",
     },
 ];
