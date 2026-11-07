@@ -11,6 +11,8 @@ mod frames;
 #[cfg(windows)]
 mod gui;
 #[cfg(windows)]
+mod instance;
+#[cfg(windows)]
 mod nvml;
 #[cfg(windows)]
 mod probe;
@@ -45,10 +47,27 @@ fn main() -> ExitCode {
         Ok(Command::Probe(options)) => report_result(probe::run(options)),
         Ok(Command::Watch(options)) => report_result(watch::run(options)),
         Ok(Command::Gui(gpu)) => report_result(gui::run(gpu)),
+        Ok(Command::PrepareInstall {
+            silent,
+            installed_version,
+        }) => prepare_install(silent, installed_version),
         Err(error) => {
             eprintln!("ARGOS: {error}\nConsulte argos --help.");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(windows)]
+fn prepare_install(silent: bool, installed_version: Option<semver::Version>) -> ExitCode {
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).expect("versão Cargo válida");
+    if installed_version.is_some_and(|installed| current.cmp_precedence(&installed).is_lt()) {
+        return ExitCode::from(3);
+    }
+    match instance::prepare_install(silent) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(2),
+        Err(error) => report_result(Err(error)),
     }
 }
 

@@ -8,11 +8,14 @@ publish = false
 default-run = "argos"
 
 [target.'cfg(windows)'.dependencies]
+semver = "1.0.28"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
@@ -23,5 +26,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

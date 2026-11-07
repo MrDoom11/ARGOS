@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
+use semver::Version;
+
 const DEFAULT_INTERVAL_MS: u32 = 1000;
 const MIN_INTERVAL_MS: u32 = 101;
 const MIN_WATCH_INTERVAL_MS: u32 = 100;
@@ -66,6 +68,10 @@ pub(crate) enum Command {
     Probe(Options),
     Watch(WatchOptions),
     Gui(Option<u32>),
+    PrepareInstall {
+        silent: bool,
+        installed_version: Option<Version>,
+    },
     WatchHelp,
     GuiHelp,
     Help,
@@ -81,6 +87,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     if args.peek().is_some_and(|arg| arg == "gui") {
         args.next();
         return parse_gui(args);
+    }
+    if args.peek().is_some_and(|arg| arg == "prepare-install") {
+        args.next();
+        return parse_prepare_install(args);
     }
 
     let mut gpu = None;
@@ -124,6 +134,28 @@ fn parse_gui(mut args: impl Iterator<Item = OsString>) -> Result<Command, String
         }
     }
     Ok(Command::Gui(gpu))
+}
+
+fn parse_prepare_install(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let mut silent = false;
+    let mut installed_version = None;
+    while let Some(flag) = args.next() {
+        match flag.to_str() {
+            Some("--silent") if !silent => silent = true,
+            Some("--installed-version") if installed_version.is_none() => {
+                installed_version = Some(
+                    args.next()
+                        .and_then(|version| Version::parse(version.to_str()?).ok())
+                        .ok_or("versão instalada inválida")?,
+                );
+            }
+            _ => return Err("argumento de instalação desconhecido ou repetido".into()),
+        }
+    }
+    Ok(Command::PrepareInstall {
+        silent,
+        installed_version,
+    })
 }
 
 fn parse_watch(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
@@ -191,6 +223,30 @@ fn interval(value: Option<u32>, flag: &str, minimum: u32) -> Result<Duration, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_installer_options_and_rejects_invalid_versions() {
+        let args = [
+            "prepare-install",
+            "--silent",
+            "--installed-version",
+            "1.2.3-rc.1",
+        ];
+        assert_eq!(
+            parse(args.map(OsString::from)),
+            Ok(Command::PrepareInstall {
+                silent: true,
+                installed_version: Some(Version::parse("1.2.3-rc.1").unwrap()),
+            })
+        );
+        for args in [
+            &["prepare-install", "--installed-version"][..],
+            &["prepare-install", "--installed-version", "1.2"][..],
+            &["prepare-install", "--silent", "--silent"][..],
+        ] {
+            assert!(parse(args.iter().map(OsString::from)).is_err());
+        }
+    }
 
     #[test]
     fn defaults_to_all_gpus_and_one_gpm_interval() {
