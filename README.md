@@ -4,6 +4,17 @@ Monitor de hardware em desenvolvimento para Windows 11, escrito em Rust. O ARGOS
 
 As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.md).
 
+## Distribuição para Windows
+
+Abra `ARGOS-Setup.exe` no Windows 11 x64 e escolha uma opção.
+
+- **Somente executar** abre o painel a partir de uma pasta temporária. Os arquivos extraídos são removidos ao fechar o painel.
+- **Instalar** adiciona o ARGOS à conta atual e cria um atalho no menu Iniciar. Para desinstalar, abra **Configurações → Aplicativos → Aplicativos instalados**.
+
+As duas opções usam as preferências do mesmo perfil do Windows.
+
+![Tela inicial do instalador do ARGOS com as opções Somente executar e Instalar](docs/screenshots/instalador.jpg)
+
 ## Compilar e executar
 
 Use o Rust estável com o alvo `x86_64-pc-windows-msvc` e as ferramentas de compilação C++ da Microsoft. O executável incorpora o runtime C e, para as leituras de GPU, carrega a NVML fornecida pelo driver NVIDIA. A janela usa Win32 e GDI por meio das declarações da biblioteca `windows-sys`. Em execução, ela usa as bibliotecas do Windows. [Rust for Windows](https://github.com/microsoft/windows-rs)
@@ -17,9 +28,21 @@ cargo build --release --locked
 
 O comando padrão consulta todas as GPUs NVIDIA enumeradas pela NVML. Cada GPU recebe uma leitura dos sensores básicos e uma tentativa de leitura dos contadores GPM, com 1 s entre as coletas. `--samples` aumenta o número de intervalos GPM por GPU. `--interval-ms` aceita a partir de 101 ms, pois a NVIDIA exige mais de 100 ms entre amostras. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 
+### Gerar o instalador
+
+Instale o Inno Setup 6.7 ou mais recente e execute o comando abaixo na raiz do projeto. Se `ISCC.exe` estiver no PATH, omita `-InnoCompiler`. [Inno Setup](https://jrsoftware.org/isdl.php)
+
+```powershell
+.\packaging\build.ps1 -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+```
+
+O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
+
 ## Janela de monitoramento
 
-Abra com `gui`. A janela sem barra de título começa em um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
+![Painel do ARGOS com gráficos de temperatura, potência, atividade da GPU, VRAM, CPU e RAM](docs/screenshots/painel.jpg)
+
+Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. A janela sem barra de título começa em um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
 
 - **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 - **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
