@@ -8,10 +8,10 @@ As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.m
 
 Abra `ARGOS-Setup.exe` no Windows 11 x64 e escolha uma opção.
 
-- **Somente executar** abre o painel a partir de uma pasta temporária. Os arquivos extraídos são removidos ao fechar o painel.
+- **Somente executar** abre o painel a partir de uma pasta temporária. Se o painel estiver fechado e houver uma instalação, você pode escolher entre a versão instalada e a versão do pacote, inclusive quando o pacote for mais antigo. Os arquivos extraídos são removidos ao fechar o painel.
 - **Instalar** adiciona o ARGOS à conta atual e cria um atalho no menu Iniciar. Para desinstalar, abra **Configurações → Aplicativos → Aplicativos instalados**.
 
-As duas opções usam as preferências do mesmo perfil do Windows.
+O painel mantém uma janela por conta do Windows. Se já houver uma janela aberta, pedir para executar uma versão igual ou mais antiga mostra o painel atual. Uma versão mais nova oferece a opção de trocar após fechar o painel. Ao instalar com o painel aberto, o instalador pede para fechá-lo e bloqueia a substituição de uma instalação por uma versão mais antiga. As duas opções usam as preferências do mesmo perfil do Windows.
 
 ![Tela inicial do instalador do ARGOS com as opções Somente executar e Instalar](docs/screenshots/instalador.jpg)
 
