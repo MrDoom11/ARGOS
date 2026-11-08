@@ -5,11 +5,20 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::watch::{GUI_INTERVALS_MS, sensor_catalog};
+use crate::watch::{
+    CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX,
+    sensor_catalog,
+};
 
 pub(super) const MAX_COLUMNS: usize = 6;
 pub(super) const MAX_ROWS: usize = 4;
 pub(super) const MAX_SLOTS: usize = 64;
+pub(super) const INITIAL_SENSORS: [usize; 4] = [
+    CPU_USAGE_INDEX,
+    CPU_TEMPERATURE_INDEX,
+    RAM_USED_INDEX,
+    FRAME_SENSOR_START,
+];
 
 const VERSION: &str = "version=1";
 const MAX_CONFIG_BYTES: u64 = 8192;
@@ -25,17 +34,19 @@ pub(super) struct Board {
     pub(super) period: usize,
     pub(super) refresh_ms: u32,
     pub(super) panels: Vec<Vec<usize>>,
+    pub(super) window_bounds: Option<[i32; 4]>,
     colors: Vec<Option<u32>>,
 }
 
 impl Board {
     pub(super) fn new(active: impl IntoIterator<Item = usize>) -> Self {
         let mut board = Self {
-            columns: MAX_COLUMNS,
-            rows: 2,
+            columns: INITIAL_SENSORS.len(),
+            rows: 1,
             period: 1,
             refresh_ms: DEFAULT_REFRESH_MS,
             panels: Vec::new(),
+            window_bounds: None,
             colors: vec![None; sensor_catalog().count()],
         };
         board.reset_selection(active);
@@ -197,6 +208,9 @@ impl Board {
             "{VERSION}\ncolumns={}\nrows={}\nperiod={}\nrefresh_ms={}\n",
             self.columns, self.rows, PERIOD_SECONDS[self.period], self.refresh_ms,
         );
+        if let Some([left, top, right, bottom]) = self.window_bounds {
+            let _ = writeln!(text, "window={left},{top},{right},{bottom}");
+        }
         for panel in &self.panels {
             let keys: Vec<_> = panel.iter().map(|&sensor| catalog[sensor].0).collect();
             let _ = writeln!(text, "panel={}", keys.join(","));
@@ -242,6 +256,11 @@ impl Board {
                         board.refresh_ms = refresh_ms;
                     }
                 }
+                "window" => {
+                    if let Some(bounds) = parse_window_bounds(value) {
+                        board.window_bounds = Some(bounds);
+                    }
+                }
                 "panel" => {
                     if board.panels.len() >= MAX_SLOTS {
                         continue;
@@ -283,6 +302,17 @@ impl Board {
     }
 }
 
+fn parse_window_bounds(value: &str) -> Option<[i32; 4]> {
+    let mut parts = value.split(',');
+    let mut bounds = [0_i32; 4];
+    for edge in &mut bounds {
+        *edge = parts.next()?.trim().parse().ok()?;
+    }
+    let [left, top, right, bottom] = bounds;
+    (parts.next().is_none() && right.checked_sub(left)? > 0 && bottom.checked_sub(top)? > 0)
+        .then_some(bounds)
+}
+
 fn parse_color(value: &str) -> Option<u32> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -306,13 +336,13 @@ fn bounded(text: &str, max: usize) -> Option<usize> {
     text.parse().ok().filter(|value| (1..=max).contains(value))
 }
 
-fn config_path() -> Option<PathBuf> {
+pub(super) fn config_path() -> Option<PathBuf> {
     let root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     root.is_absolute()
         .then(|| root.join("ARGOS").join("dashboard.cfg"))
 }
 
-fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let directory = path
         .parent()
         .ok_or_else(|| io::Error::other("diretório de configuração indisponível"))?;
@@ -339,7 +369,21 @@ fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::FRAME_SENSOR_START;
+
+    #[test]
+    fn initial_dashboard_has_four_requested_sensors_on_one_row() {
+        let board = Board::new(INITIAL_SENSORS);
+        let keys: Vec<_> = board
+            .panels
+            .iter()
+            .map(|panel| sensor_catalog().nth(panel[0]).unwrap().0)
+            .collect();
+        assert_eq!((board.columns, board.rows), (4, 1));
+        assert_eq!(
+            keys,
+            ["cpu-usage", "cpu-temperature", "ram-used", "present-fps"]
+        );
+    }
 
     #[test]
     fn merges_compatible_panels_in_place_and_splits_the_result() {
@@ -364,6 +408,20 @@ mod tests {
         assert_eq!(Board::decode(&board.encode()), Some(board));
         let empty = Board::new([]);
         assert_eq!(Board::decode(&empty.encode()), Some(empty));
+    }
+
+    #[test]
+    fn window_bounds_are_optional_and_support_negative_monitor_coordinates() {
+        let mut board = Board::new([0]);
+        let legacy = board.encode();
+        assert_eq!(Board::decode(&legacy).unwrap().window_bounds, None);
+
+        board.window_bounds = Some([-1366, -60, -566, 260]);
+        assert_eq!(Board::decode(&board.encode()), Some(board));
+        for invalid in ["1,2,3", "1,2,3,4,5", "1,2,0,4", "-2147483648,1,1,2"] {
+            let text = format!("{legacy}window={invalid}\n");
+            assert_eq!(Board::decode(&text).unwrap().window_bounds, None);
+        }
     }
 
     #[test]
@@ -512,7 +570,7 @@ mod tests {
             "{VERSION}\ncolumns=0\nrows=999\nperiod=13\npanel={temperature},{activity},unknown,{memory_activity},{activity}\npanel={temperature}\n"
         );
         let board = Board::decode(&text).unwrap();
-        assert_eq!((board.columns, board.rows, board.period), (6, 2, 1));
+        assert_eq!((board.columns, board.rows, board.period), (4, 1, 1));
         assert_eq!(board.panels, [vec![0], vec![5, 6]]);
         assert!(Board::decode("version=2\n").is_none());
         assert!(Board::decode("version=1\npanel=unknown\n").is_none());

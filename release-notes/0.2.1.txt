@@ -1,0 +1,5 @@
+• Na primeira abertura, uma linha reúne os gráficos de uso da CPU, temperatura da CPU, uso da RAM e FPS.
+• Em CPUs compatíveis, o instalador prepara o sensor de temperatura com uma confirmação de administrador do Windows. A coleta segue o intervalo configurado no painel.
+• O FPS acompanha por padrão o aplicativo em foco. Você ainda pode selecionar um processo pelo menu.
+• O ARGOS reabre na última posição da janela. Para redimensionar, arraste uma borda.
+• A primeira abertura inclui um guia rápido com os principais controles do painel.

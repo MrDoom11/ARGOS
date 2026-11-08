@@ -1,0 +1,13 @@
+Os módulos assinados AMDFamily17.bin e IntelMSR.bin são do PawnIO Modules 0.2.11.
+Copyright (C) 2025 namazso <admin@namazso.eu>.
+Eles são distribuídos sob a licença LGPL 2.1 ou posterior. Consulte o arquivo COPYING.
+
+O arquivo PawnIO.Modules-0.2.11-source.zip acompanha os binários e contém os fontes
+correspondentes, os cabeçalhos e o procedimento de compilação do projeto.
+O repositório original também oferece a ferramenta Pawn usada pelo procedimento.
+
+Binários oficiais
+https://github.com/namazso/PawnIO.Modules/releases/tag/0.2.11
+
+Código-fonte original
+https://github.com/namazso/PawnIO.Modules/tree/0.2.11

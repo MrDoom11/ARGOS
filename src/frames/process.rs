@@ -8,7 +8,7 @@ use windows_sys::Win32::System::Threading::{
     QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible,
 };
 
 const MAX_PROCESSES: usize = 32;
@@ -29,6 +29,16 @@ impl Target {
     pub(super) fn is_running(&self) -> bool {
         (unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) }) == WAIT_TIMEOUT
     }
+}
+
+pub(crate) fn foreground_pid() -> Option<u32> {
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    (thread != 0 && pid != 0 && pid != std::process::id()).then_some(pid)
 }
 
 pub(crate) fn visible_processes() -> Vec<Process> {
