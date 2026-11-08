@@ -44,11 +44,16 @@ const CLOSE_TIMEOUT_MS: u32 = 10_000;
 pub(crate) struct Instance {
     _panel: File,
     launch: Option<File>,
+    previous_version: Option<Version>,
 }
 
 impl Instance {
     pub(crate) fn ready(&mut self) {
         self.launch = None;
+    }
+
+    pub(crate) fn previous_version(&self) -> Option<&Version> {
+        self.previous_version.as_ref()
     }
 }
 
@@ -99,6 +104,7 @@ pub(crate) fn enter() -> Result<Option<Instance>, String> {
         return Ok(None);
     }
 
+    let previous_version = read_owner(&path).map(|owner| owner.version);
     let owner = Owner {
         pid: std::process::id(),
         created: creation_time(unsafe { GetCurrentProcess() })
@@ -113,6 +119,7 @@ pub(crate) fn enter() -> Result<Option<Instance>, String> {
     Ok(Some(Instance {
         _panel: panel,
         launch: Some(launch),
+        previous_version,
     }))
 }
 
@@ -452,6 +459,7 @@ mod tests {
         let mut instance = Instance {
             _panel: panel,
             launch: try_lock(&launch_path, 0).unwrap(),
+            previous_version: None,
         };
         assert!(try_lock(&launch_path, 0).unwrap().is_none());
         assert!(try_lock(&panel_path, FILE_SHARE_READ).unwrap().is_none());

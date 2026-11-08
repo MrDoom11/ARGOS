@@ -3,6 +3,8 @@ use std::process::ExitCode;
 #[cfg(windows)]
 mod cli;
 #[cfg(windows)]
+mod cpu_sensor;
+#[cfg(windows)]
 mod cpu_temperature;
 #[cfg(windows)]
 mod desktop;
@@ -33,6 +35,17 @@ fn main() -> ExitCode {
     if args.peek().is_some_and(|arg| arg == "apply-update") {
         args.next();
         return report_result(update::run_worker(args));
+    }
+    if args
+        .peek()
+        .is_some_and(|arg| arg == "cpu-temperature-supported")
+    {
+        args.next();
+        return if args.next().is_none() && cpu_temperature::supported() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
     }
     if args
         .peek()

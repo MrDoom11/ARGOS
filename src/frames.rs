@@ -9,7 +9,7 @@ use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 
 use self::etw::{Capture, PresentEvent, PresentKind, Runtime};
 use self::process::Target;
-pub(crate) use self::process::{Process, visible_processes};
+pub(crate) use self::process::{Process, foreground_pid, visible_processes};
 
 pub(crate) const SENSOR_COUNT: usize = 3;
 const MAX_PENDING: usize = 64;
@@ -20,6 +20,29 @@ const ACTIVE: &str = "Capturando apresentações DirectX";
 const WAITING: &str = "Aguardando apresentações DirectX do processo";
 const ACCESS_DENIED: &str = "Captura requer administrador ou Performance Log Users";
 const CAPTURE_ENDED: &str = "Captura interrompida. Desative e selecione o processo novamente";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FrameTarget {
+    Off,
+    #[default]
+    Foreground,
+    Process(u32),
+}
+
+impl FrameTarget {
+    pub(crate) fn resolve(
+        self,
+        previous_foreground: Option<u32>,
+        foreground: impl FnOnce() -> Option<u32>,
+    ) -> Option<u32> {
+        match self {
+            Self::Off => None,
+            // Keep the last external app while ARGOS has focus or Windows transfers it.
+            Self::Foreground => foreground().or(previous_foreground),
+            Self::Process(pid) => Some(pid),
+        }
+    }
+}
 
 pub(crate) enum Sample {
     Measured([Option<f64>; SENSOR_COUNT]),
@@ -258,6 +281,21 @@ impl Presents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_target_follows_focus_without_overriding_manual_modes() {
+        assert_eq!(FrameTarget::Foreground.resolve(None, || None), None);
+        assert_eq!(
+            FrameTarget::Foreground.resolve(Some(10), || Some(20)),
+            Some(20)
+        );
+        assert_eq!(FrameTarget::Foreground.resolve(Some(20), || None), Some(20));
+        assert_eq!(
+            FrameTarget::Process(30).resolve(Some(20), || unreachable!()),
+            Some(30)
+        );
+        assert_eq!(FrameTarget::Off.resolve(Some(20), || unreachable!()), None);
+    }
 
     fn present(presents: &mut Presents, thread: u32, chain: u64, at: u64, wait: u64) {
         pair(presents, Runtime::Dxgi, thread, chain, at, wait, (0, 0));

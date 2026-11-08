@@ -6,8 +6,8 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::cli::WatchOptions;
-use crate::cpu_temperature::CpuTemperature;
-use crate::frames::{self, FrameSampler};
+use crate::cpu_sensor::CpuSensor;
+use crate::frames::{self, FrameSampler, FrameTarget};
 use crate::nvml::{Device, Error as NvmlError, GPM_METRICS, GpmSampler, Nvml};
 use crate::system::{self, SystemSampler};
 use crate::telemetry::{Cadence, History};
@@ -16,7 +16,7 @@ const HISTORY_WINDOW: Duration = Duration::from_secs(300);
 pub(crate) const GUI_INTERVALS_MS: [u32; 4] = [100, 200, 500, 1000];
 const FASTEST_GUI_INTERVAL: Duration = Duration::from_millis(GUI_INTERVALS_MS[0] as u64);
 const GPM_MIN_INTERVAL: Duration = Duration::from_millis(101);
-const CPU_TEMPERATURE_INTERVAL: Duration = Duration::from_secs(1);
+const CPU_TEMPERATURE_RETRY: Duration = Duration::from_secs(5);
 const SNAPSHOT_INTERVAL: Duration = FASTEST_GUI_INTERVAL;
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
@@ -76,7 +76,9 @@ const CPU_TEMPERATURE_SENSORS: [Sensor; 1] = [(
     Axis::Fixed(100.0),
 )];
 const GPM_COUNT: usize = GPM_METRICS.len();
-pub(crate) const FRAME_SENSOR_START: usize = GPU_SENSORS.len() + GPM_COUNT + SYSTEM_SENSORS.len();
+pub(crate) const CPU_USAGE_INDEX: usize = GPU_SENSORS.len() + GPM_COUNT;
+pub(crate) const RAM_USED_INDEX: usize = CPU_USAGE_INDEX + 1;
+pub(crate) const FRAME_SENSOR_START: usize = CPU_USAGE_INDEX + SYSTEM_SENSORS.len();
 pub(crate) const CPU_TEMPERATURE_INDEX: usize = FRAME_SENSOR_START + FRAME_SENSORS.len();
 const GPU: &str = "GPU / NVML";
 const GPM: &str = "GPM / NVML";
@@ -207,15 +209,25 @@ pub(crate) struct Snapshot {
     pub(crate) at: Instant,
     pub(crate) notice: String,
     pub(crate) metrics: Vec<MetricSnapshot>,
-    pub(crate) frame_target: u32,
+    pub(crate) frame_target: FrameTarget,
     pub(crate) frame_status: Option<&'static str>,
+    pub(crate) cpu_temperature_status: Option<String>,
 }
 
 struct WindowFeed {
     latest: Mutex<Option<Arc<Snapshot>>>,
     requested: AtomicBool,
     interval_ms: AtomicU32,
-    frame_target: AtomicU32,
+    frame_target: Mutex<FrameTarget>,
+    cpu_temperature_enabled: AtomicBool,
+}
+
+impl WindowFeed {
+    fn frame_target(&self) -> FrameTarget {
+        self.frame_target
+            .lock()
+            .map_or(FrameTarget::Off, |target| *target)
+    }
 }
 
 pub(crate) struct Monitor {
@@ -225,7 +237,11 @@ pub(crate) struct Monitor {
 }
 
 impl Monitor {
-    pub(crate) fn start(gpu: Option<u32>, interval_ms: u32) -> Result<Self, String> {
+    pub(crate) fn start(
+        gpu: Option<u32>,
+        interval_ms: u32,
+        cpu_temperature_enabled: bool,
+    ) -> Result<Self, String> {
         if !GUI_INTERVALS_MS.contains(&interval_ms) {
             return Err(format!("intervalo de coleta inválido: {interval_ms} ms"));
         }
@@ -233,7 +249,8 @@ impl Monitor {
             latest: Mutex::new(None),
             requested: AtomicBool::new(true),
             interval_ms: AtomicU32::new(interval_ms),
-            frame_target: AtomicU32::new(0),
+            frame_target: Mutex::default(),
+            cpu_temperature_enabled: AtomicBool::new(cpu_temperature_enabled),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_feed = Arc::clone(&feed);
@@ -275,12 +292,25 @@ impl Monitor {
         }
     }
 
-    pub(crate) fn frame_target(&self) -> u32 {
-        self.feed.frame_target.load(Ordering::Relaxed)
+    pub(crate) fn set_cpu_temperature_enabled(&self, enabled: bool) {
+        if self
+            .feed
+            .cpu_temperature_enabled
+            .swap(enabled, Ordering::Relaxed)
+            != enabled
+        {
+            self.wake();
+        }
     }
 
-    pub(crate) fn set_frame_target(&self, pid: u32) {
-        self.feed.frame_target.store(pid, Ordering::Relaxed);
+    pub(crate) fn frame_target(&self) -> FrameTarget {
+        self.feed.frame_target()
+    }
+
+    pub(crate) fn set_frame_target(&self, target: FrameTarget) {
+        if let Ok(mut current) = self.feed.frame_target.lock() {
+            *current = target;
+        }
         self.feed.requested.store(true, Ordering::Relaxed);
         self.wake();
     }
@@ -415,7 +445,45 @@ struct FrameMonitor {
 #[derive(Default)]
 struct DashboardReadings {
     frames: Option<FrameMonitor>,
-    cpu_temperature: Option<(CpuTemperature, Group<1>)>,
+    frame_target: FrameTarget,
+    cpu_temperature: Option<TemperatureMonitor>,
+}
+
+struct TemperatureMonitor {
+    source: Option<CpuSensor>,
+    group: Group<1>,
+    retry_at: Instant,
+    status: Option<String>,
+}
+
+impl TemperatureMonitor {
+    fn new(start: Instant, interval: Duration) -> Self {
+        Self {
+            source: None,
+            group: Group::new(start, interval, FASTEST_GUI_INTERVAL),
+            retry_at: start,
+            status: None,
+        }
+    }
+
+    fn collect(&mut self, start: Instant) -> bool {
+        self.group
+            .capture(start, || {
+                let now = Instant::now();
+                if self.source.is_none() && now >= self.retry_at {
+                    self.retry_at = now + CPU_TEMPERATURE_RETRY;
+                    match CpuSensor::open() {
+                        Ok(source) => self.source = Some(source),
+                        Err(error) => self.status = Some(cpu_temperature_error(&error)),
+                    }
+                }
+                let reading = self.source.as_mut().map_or(Reading::Unavailable, |source| {
+                    read_cpu_temperature(source, &mut self.status)
+                });
+                [reading].into()
+            })
+            .is_some()
+    }
 }
 
 impl FrameMonitor {
@@ -540,13 +608,12 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
         )
     });
     let mut gpm_source = GpmSource::Discover;
-    let mut dashboard = DashboardReadings::default();
-    if window.is_some() {
-        dashboard.cpu_temperature = CpuTemperature::open().ok().map(|source| {
-            let interval = CPU_TEMPERATURE_INTERVAL;
-            (source, Group::new(start, interval, interval))
-        });
-    }
+    let mut dashboard = DashboardReadings {
+        cpu_temperature: window
+            .as_ref()
+            .map(|_| TemperatureMonitor::new(start, options.system_interval)),
+        ..Default::default()
+    };
     let mut skipped_updates = 0;
     let mut snapshot_due = start;
     let mut snapshot_pending = true;
@@ -569,13 +636,21 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 if let Some(frames) = &mut dashboard.frames {
                     frames.group.cadence.set_interval(interval);
                 }
+                if let Some(temperature) = &mut dashboard.cpu_temperature {
+                    temperature.group.cadence.set_interval(interval);
+                }
                 snapshot_pending = true;
             }
-            let pid = feed.frame_target.load(Ordering::Relaxed);
-            if pid != dashboard.frames.as_ref().map_or(0, |frames| frames.pid) {
+            let target = feed.frame_target();
+            let previous_pid = dashboard.frames.as_ref().map(|frames| frames.pid);
+            let previous_foreground =
+                previous_pid.filter(|_| dashboard.frame_target == FrameTarget::Foreground);
+            let pid = target.resolve(previous_foreground, frames::foreground_pid);
+            if target != dashboard.frame_target || pid != previous_pid {
                 // Drop the previous session before starting a capture for the new process.
                 drop(dashboard.frames.take());
-                dashboard.frames = (pid != 0).then(|| FrameMonitor::new(pid, interval));
+                dashboard.frames = pid.map(|pid| FrameMonitor::new(pid, interval));
+                dashboard.frame_target = target;
                 snapshot_pending = true;
             }
             if let Some(frames) = &mut dashboard.frames {
@@ -610,10 +685,15 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             }
         }
 
-        if let Some((source, group)) = &mut dashboard.cpu_temperature {
-            snapshot_pending |= group
-                .capture(start, || [read_cpu_temperature(source)].into())
-                .is_some();
+        let temperature_enabled = window
+            .as_ref()
+            .is_some_and(|(feed, _)| feed.cpu_temperature_enabled.load(Ordering::Relaxed));
+        if let Some(temperature) = &mut dashboard.cpu_temperature {
+            if temperature_enabled {
+                snapshot_pending |= temperature.collect(start);
+            } else {
+                temperature.source = None;
+            }
         }
         let mut next = system.cadence.deadline();
         if let (Some(gpu), Some(gpm)) = (&gpu, &gpm) {
@@ -622,8 +702,8 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
         if let Some(frames) = &dashboard.frames {
             next = next.min(frames.group.cadence.deadline());
         }
-        if let Some((_, group)) = &dashboard.cpu_temperature {
-            next = next.min(group.cadence.deadline());
+        if temperature_enabled && let Some(temperature) = &dashboard.cpu_temperature {
+            next = next.min(temperature.group.cadence.deadline());
         }
         if let Some(end) = end {
             next = next.min(end);
@@ -727,29 +807,33 @@ fn build_snapshot(
         interval,
         axis_limits,
     );
-    let temperature = dashboard.cpu_temperature.as_ref().map(|(_, group)| group);
+    let temperature = dashboard.cpu_temperature.as_ref();
     append_metrics(
         &mut metrics,
         at,
-        temperature,
+        temperature.map(|monitor| &monitor.group),
         &CPU_TEMPERATURE_SENSORS,
         CPU_TEMPERATURE,
-        CPU_TEMPERATURE_INTERVAL,
+        interval,
         axis_limits,
     );
     if temperature.is_none() {
         metrics[CPU_TEMPERATURE_INDEX].points.push(MetricPoint {
             at,
             reading: Reading::Unavailable,
-            interval: CPU_TEMPERATURE_INTERVAL,
+            interval,
         });
     }
     Arc::new(Snapshot {
         at,
         notice: notice.into(),
         metrics,
-        frame_target: frames.map_or(0, |frames| frames.pid),
-        frame_status: frames.and_then(|frames| frames.status),
+        frame_target: dashboard.frame_target,
+        frame_status: frames.and_then(|frames| frames.status).or_else(|| {
+            (frames.is_none() && dashboard.frame_target == FrameTarget::Foreground)
+                .then_some("Aguardando um aplicativo em foco")
+        }),
+        cpu_temperature_status: temperature.and_then(|monitor| monitor.status.clone()),
     })
 }
 
@@ -915,12 +999,30 @@ fn read_system(sampler: &mut SystemSampler) -> [Reading; SYSTEM_SENSORS.len()] {
     [cpu, used, total]
 }
 
-fn read_cpu_temperature(source: &CpuTemperature) -> Reading {
-    match source.celsius() {
-        Ok(Some(value)) => Reading::Value(value),
+fn read_cpu_temperature(source: &mut CpuSensor, status: &mut Option<String>) -> Reading {
+    let result = source.celsius();
+    match result {
+        Ok(Some(value)) => {
+            *status = None;
+            Reading::Value(value)
+        }
         Ok(None) => Reading::Pending,
-        Err(error) if error.kind() == io::ErrorKind::Unsupported => Reading::Unavailable,
-        Err(_) => Reading::Failed,
+        Err(error) => {
+            *status = Some(cpu_temperature_error(&error));
+            if error.kind() == io::ErrorKind::Unsupported {
+                Reading::Unavailable
+            } else {
+                Reading::Failed
+            }
+        }
+    }
+}
+
+fn cpu_temperature_error(error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        "Acesso à leitura do PawnIO negado".into()
+    } else {
+        error.to_string()
     }
 }
 
@@ -1062,6 +1164,42 @@ mod tests {
     }
 
     #[test]
+    fn temperature_keeps_prior_sample_interval_after_refresh_change() {
+        let start = Instant::now();
+        let initial = Duration::from_millis(500);
+        let refresh = Duration::from_millis(100);
+        let mut temperature = TemperatureMonitor::new(start, initial);
+        assert!(
+            temperature
+                .group
+                .capture(start, || [Reading::Value(56.875)].into())
+                .is_some()
+        );
+        temperature.group.cadence.set_interval(refresh);
+        let dashboard = DashboardReadings {
+            cpu_temperature: Some(temperature),
+            ..Default::default()
+        };
+        let system = Group::new(start, refresh, FASTEST_GUI_INTERVAL);
+        let snapshot = build_snapshot(
+            Instant::now(),
+            "",
+            &system,
+            None,
+            None,
+            &dashboard,
+            &FALLBACK_AXES,
+        );
+        let metric = &snapshot.metrics[CPU_TEMPERATURE_INDEX];
+        assert_eq!(metric.interval, refresh);
+        let [point] = metric.points.as_slice() else {
+            panic!("o histórico da temperatura foi perdido");
+        };
+        assert_eq!(point.interval, initial);
+        assert!(matches!(point.reading, Reading::Value(56.875)));
+    }
+
+    #[test]
     fn snapshot_keeps_sensor_order_and_preserves_only_the_live_history() {
         let start = Instant::now();
         let now = start + HISTORY_WINDOW;
@@ -1102,15 +1240,18 @@ mod tests {
             snapshot.metrics.len(),
             CPU_TEMPERATURE_INDEX + CPU_TEMPERATURE_SENSORS.len()
         );
-        assert_eq!(snapshot.frame_target, 0);
-        assert_eq!(snapshot.frame_status, None);
+        assert_eq!(snapshot.frame_target, FrameTarget::Foreground);
+        assert_eq!(
+            snapshot.frame_status,
+            Some("Aguardando um aplicativo em foco")
+        );
         assert!(
             snapshot.metrics[FRAME_SENSOR_START..CPU_TEMPERATURE_INDEX]
                 .iter()
                 .all(|metric| { metric.points.is_empty() && metric.source == FRAMES })
         );
         let temperature = &snapshot.metrics[CPU_TEMPERATURE_INDEX];
-        assert_eq!(temperature.interval, CPU_TEMPERATURE_INTERVAL);
+        assert_eq!(temperature.interval, interval);
         assert!(matches!(
             temperature.points.as_slice(),
             [MetricPoint {

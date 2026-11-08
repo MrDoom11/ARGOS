@@ -2,6 +2,10 @@
   #error Compile com packaging/build.ps1 para definir a versão do ARGOS.
 #endif
 
+#if !defined(SensorInstaller) || !defined(SensorSha256)
+  #error Compile com packaging/build.ps1 para incluir o sensor de temperatura.
+#endif
+
 #define ArgosAppId "{618CF44B-59D7-424F-89F7-6B2714DF1BD8}"
 
 [Setup]
@@ -24,8 +28,14 @@ OutputBaseFilename=ARGOS-Setup
 Name: "ptbr"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
 
 [Files]
+Source: "{#SensorInstaller}"; DestName: "ARGOS-Sensor-Setup.exe"; Flags: dontcopy noencryption
 Source: "..\target\x86_64-pc-windows-msvc\release\argos.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\x86_64-pc-windows-msvc\release\argos-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "pawnio\AMDFamily17.bin"; DestDir: "{app}"; Flags: ignoreversion
+Source: "pawnio\IntelMSR.bin"; DestDir: "{app}"; Flags: ignoreversion
+Source: "pawnio\COPYING"; DestDir: "{app}\pawnio"
+Source: "pawnio\NOTICE.txt"; DestDir: "{app}\pawnio"
+Source: "pawnio\PawnIO.Modules-0.2.11-source.zip"; DestDir: "{app}\pawnio"
 Source: "..\LICENSE"; DestDir: "{app}"
 
 [Icons]
@@ -37,6 +47,9 @@ Filename: "{app}\argos-gui.exe"; WorkingDir: "{app}"; Description: "Abrir o pain
 [Code]
 const
   ArgosUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#ArgosAppId}_is1';
+  SensorKey = 'Software\ARGOS\CpuSensor';
+  SensorServiceKey = 'SYSTEM\CurrentControlSet\Services\ArgosCpuSensor';
+  PawnIoServiceKey = 'SYSTEM\CurrentControlSet\Services\PawnIO';
   AccessReadWrite = $C0000000;
   OpenExisting = 3;
   OpenAlways = 4;
@@ -197,7 +210,11 @@ begin
     end;
 
     if ArgosExe = '' then
+    begin
       ArgosExe := PackageArgos;
+      ExtractTemporaryFiles('{app}\*.bin');
+      ExtractTemporaryFiles('{app}\pawnio\*');
+    end;
     if not ExecAndCaptureOutput(ArgosExe, Params, ExtractFileDir(ArgosExe), SW_SHOWNORMAL,
       ewWaitUntilTerminated, ResultCode, Output) then
       ReportRunError('Falha ao abrir o ARGOS. ' + SysErrorMessage(ResultCode), FromUpdater)
@@ -297,10 +314,48 @@ begin
     ReleaseLaunchLock;
 end;
 
+procedure ProvisionCpuSensor;
+var
+  Protocol: Cardinal;
+  Code: Integer;
+  Component: String;
+  Guard: TFileStream;
+begin
+  if RegQueryDWordValue(HKLM64, SensorKey, 'Protocol', Protocol) and (Protocol = 1) and
+    RegKeyExists(HKLM, SensorServiceKey) and RegKeyExists(HKLM, PawnIoServiceKey) and
+    FileExists(ExpandConstant('{commonpf64}\ARGOS Sensor\argos-sensor.exe')) then
+    Exit;
+  if not Exec(ExpandConstant('{app}\argos.exe'), 'cpu-temperature-supported',
+    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    Exit;
+
+  ExtractTemporaryFile('ARGOS-Sensor-Setup.exe');
+  Component := ExpandConstant('{tmp}\ARGOS-Sensor-Setup.exe');
+  Guard := TFileStream.Create(Component, fmOpenRead or fmShareDenyWrite);
+  try
+    if CompareText(GetSHA256OfStream(Guard), '{#SensorSha256}') <> 0 then
+      RaiseException('O pacote do sensor de temperatura não passou na validação.');
+    if not ShellExec('runas', Component, '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
+      ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, Code) then
+      Log('Sensor de temperatura não provisionado. ' + SysErrorMessage(Code))
+    else if Code <> 0 then
+      Log('Instalador do sensor de temperatura retornou ' + IntToStr(Code) + '.');
+  finally
+    Guard.Free;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
+    try
+      ProvisionCpuSensor;
+    except
+      Log('Falha ao preparar o sensor de temperatura. ' + GetExceptionMessage);
+    end;
     ReleaseLaunchLock;
+  end;
 end;
 
 procedure DeinitializeSetup;

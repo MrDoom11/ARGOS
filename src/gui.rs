@@ -22,7 +22,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::frames::{Process, SENSOR_COUNT, visible_processes};
+use crate::frames::{FrameTarget, Process, SENSOR_COUNT, visible_processes};
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
 use crate::update::{self, Source, Status, Updater};
 use crate::watch::{
@@ -31,6 +31,7 @@ use crate::watch::{
 
 mod board;
 mod chart;
+mod startup;
 
 use board::{Board, MAX_COLUMNS, MAX_ROWS, MAX_SLOTS};
 
@@ -42,7 +43,6 @@ const ROWS_FIRST: usize = 311;
 const SPLIT_PANEL: usize = 321;
 const RESET_COLORS: usize = 322;
 const MOVE_WINDOW: usize = 331;
-const SIZE_WINDOW: usize = 332;
 const MINIMIZE_WINDOW: usize = 333;
 const MAXIMIZE_WINDOW: usize = 334;
 const CLOSE_WINDOW: usize = 335;
@@ -57,11 +57,11 @@ const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 2000;
 const COLOR_FIRST: usize = 3000;
 const MOVE_PANEL_FIRST: usize = 4000;
-const FRAME_TARGET_OFF: usize = 5000;
-const FRAME_TARGET_FIRST: usize = 5001;
+const FRAME_TARGET_FOREGROUND: usize = 5000;
+const FRAME_TARGET_OFF: usize = 5001;
+const FRAME_TARGET_FIRST: usize = 5002;
 const FRAME_SENSORS: std::ops::Range<usize> = FRAME_SENSOR_START..FRAME_SENSOR_START + SENSOR_COUNT;
 const PERIODS: [(u64, &str); 4] = [(30, "30 s"), (60, "1 min"), (120, "2 min"), (300, "5 min")];
-const DEFAULT_METRICS: [usize; 12] = [0, 1, 2, 5, 6, 7, 11, 12, 13, 14, 16, 17];
 const SERIES: [COLORREF; 16] = [
     chart::rgb(72, 215, 185),
     chart::rgb(255, 182, 103),
@@ -90,16 +90,16 @@ pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
     };
     let saved_board = Board::load();
     let restored = saved_board.is_some();
-    let board = saved_board.unwrap_or_else(|| Board::new(DEFAULT_METRICS));
+    let startup_notice = startup::prepare(panel_instance.previous_version(), restored);
+    let board = saved_board.unwrap_or_else(|| Board::new(board::INITIAL_SENSORS));
+    let saved_bounds = board.window_bounds;
     let refresh_ms = board.refresh_ms;
-    let monitor = Monitor::start(gpu, refresh_ms)?;
+    let monitor = Monitor::start(gpu, refresh_ms, board.contains(CPU_TEMPERATURE_INDEX))?;
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
     let dpi = unsafe { GetDpiForSystem() }.max(96);
-    let state = Box::new(RefCell::new(Window::new(
-        monitor, board, restored, dpi, source,
-    )));
+    let state = Box::new(RefCell::new(Window::new(monitor, board, dpi, source)));
     let instance = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
@@ -135,10 +135,13 @@ pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
         return Err(window_error("criar a janela"));
     }
     let hwnd_guard = OwnedWindow(hwnd);
+    let placed = saved_bounds.is_some_and(|bounds| restore_window_bounds(hwnd, bounds));
     let window_dpi = unsafe { GetDpiForWindow(hwnd) };
     if window_dpi != 0 && window_dpi != dpi {
         state.borrow_mut().set_dpi(window_dpi);
-        position_window(hwnd, initial_bounds(work_area, window_dpi));
+        if !placed {
+            position_window(hwnd, initial_bounds(work_area, window_dpi));
+        }
     }
     unsafe {
         DwmSetWindowAttribute(
@@ -172,6 +175,9 @@ pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
     }
     panel_instance.ready();
     let _ = state.borrow_mut().updater.check(false);
+    if let Some(notice) = startup_notice {
+        notice.show(hwnd);
+    }
 
     let mut message = MSG::default();
     loop {
@@ -246,6 +252,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 if let Ok(mut app) = state.try_borrow_mut() {
                     app.set_dpi((wp & 0xffff) as u32);
                 }
+                if IsWindowVisible(hwnd) == 0 {
+                    // Durante a abertura, a posição já vem da configuração ou do monitor inicial.
+                    return 0;
+                }
                 let suggested = *(lp as *const RECT);
                 let bounds = if IsZoomed(hwnd) != 0 {
                     current_monitor(hwnd).map_or(suggested, |monitor| monitor.rcWork)
@@ -296,6 +306,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CLOSE => {
+                if let Some(placement) = window_placement(hwnd)
+                    && let Ok(mut app) = state.try_borrow_mut()
+                {
+                    let RECT {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    } = placement.rcNormalPosition;
+                    let bounds = Some([left, top, right, bottom]);
+                    if app.board.window_bounds != bounds || app.save_failed {
+                        app.board.window_bounds = bounds;
+                        let _ = app.board.save();
+                    }
+                }
                 if wp != instance::REPLACEMENT_CLOSE
                     && let Ok(mut app) = state.try_borrow_mut()
                     && let Err(error) = app.updater.apply(false)
@@ -756,11 +781,9 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             menu.separator();
             if unsafe { IsZoomed(hwnd) } != 0 {
                 menu.label("Mover janela");
-                menu.label("Redimensionar");
                 menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
             } else {
                 menu.item(MOVE_WINDOW, "Mover janela", false);
-                menu.item(SIZE_WINDOW, "Redimensionar", false);
                 menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
             }
             menu.item(MINIMIZE_WINDOW, "Minimizar", false);
@@ -787,9 +810,6 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             if let Ok(mut app) = state.try_borrow_mut() {
                 app.window_move = WindowMove::Armed;
             }
-        }
-        SIZE_WINDOW => {
-            unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, SC_SIZE as WPARAM, -1) };
         }
         MINIMIZE_WINDOW => {
             unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
@@ -852,16 +872,19 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
                 choose_series_color(hwnd, state, panel, choice - COLOR_FIRST);
             }
         }
-        choice if choice >= FRAME_TARGET_OFF => {
-            let pid = if choice == FRAME_TARGET_OFF {
-                0
-            } else if let Some(process) = processes.get(choice - FRAME_TARGET_FIRST) {
-                process.pid
-            } else {
-                return;
+        choice if choice >= FRAME_TARGET_FOREGROUND => {
+            let target = match choice {
+                FRAME_TARGET_FOREGROUND => FrameTarget::Foreground,
+                FRAME_TARGET_OFF => FrameTarget::Off,
+                _ => {
+                    let Some(process) = processes.get(choice - FRAME_TARGET_FIRST) else {
+                        return;
+                    };
+                    FrameTarget::Process(process.pid)
+                }
             };
             if let Ok(mut app) = state.try_borrow_mut() {
-                app.select_frame_target(pid);
+                app.select_frame_target(target);
             }
             invalidate(hwnd);
         }
@@ -917,6 +940,7 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
         return;
     };
     let old_interval = app.board.refresh_ms;
+    let temperature_was_enabled = app.board.contains(CPU_TEMPERATURE_INDEX);
     if !edit(&mut app) {
         return;
     }
@@ -924,6 +948,10 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
     let interval = app.board.refresh_ms;
     if interval != old_interval {
         app.monitor.set_interval_ms(interval);
+    }
+    let temperature_enabled = app.board.contains(CPU_TEMPERATURE_INDEX);
+    if temperature_enabled != temperature_was_enabled {
+        app.monitor.set_cpu_temperature_enabled(temperature_enabled);
     }
     app.save_failed = app.board.save().is_err();
     drop(app);
@@ -955,7 +983,6 @@ struct Window {
     updater: Updater,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
-    restored: bool,
     save_failed: bool,
     custom_colors: [COLORREF; 16],
     page: usize,
@@ -968,13 +995,12 @@ struct Window {
 }
 
 impl Window {
-    fn new(monitor: Monitor, board: Board, restored: bool, dpi: u32, source: Source) -> Self {
+    fn new(monitor: Monitor, board: Board, dpi: u32, source: Source) -> Self {
         Self {
             monitor,
             updater: Updater::new(source),
             snapshot: None,
             board,
-            restored,
             save_failed: false,
             custom_colors: SERIES,
             page: 0,
@@ -1004,11 +1030,6 @@ impl Window {
             .is_some_and(|last| Arc::ptr_eq(last, &next))
         {
             return false;
-        }
-        if self.snapshot.is_none() && !self.restored {
-            self.board
-                .reset_selection(default_selection(&next).iter().copied());
-            self.page = self.page.min(self.page_count() - 1);
         }
         self.snapshot = Some(next);
         true
@@ -1044,12 +1065,12 @@ impl Window {
             .is_some_and(|snapshot| now.saturating_duration_since(snapshot.at) >= limit)
     }
 
-    fn select_frame_target(&mut self, pid: u32) {
-        if self.monitor.frame_target() == pid {
+    fn select_frame_target(&mut self, target: FrameTarget) {
+        if self.monitor.frame_target() == target {
             return;
         }
-        self.monitor.set_frame_target(pid);
-        if pid != 0
+        self.monitor.set_frame_target(target);
+        if target != FrameTarget::Off
             && let Some(panel) = self
                 .board
                 .panels
@@ -1130,15 +1151,14 @@ impl Window {
                 return true;
             }
         }
-        let Some(snapshot) = &self.snapshot else {
-            return false;
-        };
         if choice == RESET_SENSORS {
-            self.board
-                .reset_selection(default_selection(snapshot).iter().copied());
+            self.board.reset_selection(board::INITIAL_SENSORS);
             self.page = 0;
             return true;
         }
+        let Some(snapshot) = &self.snapshot else {
+            return false;
+        };
         if let Some(index) = choice.checked_sub(SENSOR_FIRST)
             && snapshot.metrics.get(index).is_some()
         {
@@ -1202,6 +1222,11 @@ impl Window {
                 metric.name,
                 self.board.contains(index),
             );
+            if index == CPU_TEMPERATURE_INDEX
+                && let Some(reason) = &snapshot.cpu_temperature_status
+            {
+                menu.label(reason);
+            }
         }
         menu.separator();
         menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
@@ -1209,7 +1234,7 @@ impl Window {
 
     fn frame_menu(&self, menu: &Menu, processes: &[Process]) {
         let target = self.monitor.frame_target();
-        let status = if target == 0 {
+        let status = if target == FrameTarget::Off {
             "Captura desativada"
         } else {
             self.snapshot
@@ -1234,7 +1259,12 @@ impl Window {
         }
         menu.separator();
         menu.label("Captura por aplicativo");
-        menu.item(FRAME_TARGET_OFF, "Desativado", target == 0);
+        menu.item(
+            FRAME_TARGET_FOREGROUND,
+            "Aplicativo em foco",
+            target == FrameTarget::Foreground,
+        );
+        menu.item(FRAME_TARGET_OFF, "Desativado", target == FrameTarget::Off);
         if processes.is_empty() {
             menu.label("Nenhum aplicativo visível");
         }
@@ -1243,7 +1273,7 @@ impl Window {
             menu.item(
                 FRAME_TARGET_FIRST + index,
                 &format!("{name} (PID {})", process.pid),
-                process.pid == target,
+                target == FrameTarget::Process(process.pid),
             );
         }
     }
@@ -1437,18 +1467,6 @@ impl Window {
                 )
             };
         }
-    }
-}
-
-fn default_selection(snapshot: &Snapshot) -> &'static [usize] {
-    let gpu_present = snapshot
-        .metrics
-        .iter()
-        .any(|metric| metric.source.contains("NVML") && !metric.points.is_empty());
-    if gpu_present {
-        &DEFAULT_METRICS
-    } else {
-        &[16, 17]
     }
 }
 
@@ -1680,6 +1698,24 @@ fn initial_bounds(work_area: Option<RECT>, dpi: u32) -> RECT {
     area(x, y, x + w, y + h)
 }
 
+fn window_placement(hwnd: HWND) -> Option<WINDOWPLACEMENT> {
+    let mut placement = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    (unsafe { GetWindowPlacement(hwnd, &mut placement) } != 0).then_some(placement)
+}
+
+fn restore_window_bounds(hwnd: HWND, [left, top, right, bottom]: [i32; 4]) -> bool {
+    let Some(mut placement) = window_placement(hwnd) else {
+        return false;
+    };
+    placement.showCmd = SW_HIDE as u32;
+    placement.rcNormalPosition = area(left, top, right, bottom);
+    // O Windows usa as coordenadas da área de trabalho e ajusta posições fora dos monitores.
+    unsafe { SetWindowPlacement(hwnd, &placement) != 0 }
+}
+
 fn position_window(hwnd: HWND, rect: RECT) {
     unsafe {
         SetWindowPos(
@@ -1897,5 +1933,46 @@ mod tests {
         );
         assert_eq!(resize_hit(bounds, POINT { x: -3, y: 500 }, 5), HTRIGHT);
         assert_eq!(resize_hit(bounds, POINT { x: -680, y: 400 }, 5), HTCLIENT);
+    }
+
+    #[test]
+    fn saved_placement_restores_a_hidden_window_without_activating_it() {
+        let work = preferred_work_area().expect("monitor work area");
+        let (x, y) = (work.left + 20, work.top + 20);
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_APPWINDOW,
+                w!("STATIC"),
+                null(),
+                WS_POPUP | WS_THICKFRAME,
+                x,
+                y,
+                320,
+                200,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let _guard = OwnedWindow(hwnd);
+        let normal = window_placement(hwnd).unwrap().rcNormalPosition;
+        let offset = 30;
+        assert!(restore_window_bounds(
+            hwnd,
+            [
+                normal.left + offset,
+                normal.top + offset,
+                normal.right + offset,
+                normal.bottom + offset,
+            ],
+        ));
+        let mut restored = RECT::default();
+        assert_ne!(unsafe { GetWindowRect(hwnd, &mut restored) }, 0);
+        assert_eq!((restored.left, restored.top), (x + offset, y + offset));
+        assert_eq!((width(restored), height(restored)), (320, 200));
+        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
+        assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
     }
 }

@@ -9,7 +9,7 @@ As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.m
 Abra `ARGOS-Setup.exe` no Windows 11 x64 e escolha uma opção.
 
 - **Somente executar** abre o painel a partir de uma pasta temporária. Se o painel estiver fechado e houver uma instalação, você pode escolher entre a versão instalada e a versão do pacote, inclusive quando o pacote for mais antigo. Os arquivos extraídos são removidos ao fechar o painel.
-- **Instalar** adiciona o ARGOS à conta atual e cria um atalho no menu Iniciar. Para desinstalar, abra **Configurações → Aplicativos → Aplicativos instalados**.
+- **Instalar** adiciona o ARGOS à conta atual e cria um atalho no menu Iniciar. Em CPUs compatíveis, o instalador prepara a leitura de temperatura com uma confirmação de administrador do Windows. Para desinstalar, abra **Configurações → Aplicativos → Aplicativos instalados**.
 
 O painel mantém uma janela por conta do Windows. Se já houver uma janela aberta, pedir para executar uma versão igual ou mais antiga mostra o painel atual. Uma versão mais nova oferece a opção de trocar após fechar o painel. Ao instalar com o painel aberto, o instalador pede para fechá-lo e bloqueia a substituição de uma instalação por uma versão mais antiga. As duas opções usam as preferências do mesmo perfil do Windows.
 
@@ -40,20 +40,20 @@ O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
 
 ### Atualizações pelo painel
 
-O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do painel, use **Verificar nova versão do ARGOS** para consultar novamente. Quando o pacote estiver pronto, escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
+O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do painel, use **Verificar nova versão do ARGOS** para consultar novamente. Quando o pacote estiver pronto, escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. O painel mostra as novidades na primeira abertura depois da atualização. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
 
 ## Janela de monitoramento
 
 ![Painel do ARGOS com gráficos de temperatura, potência, atividade da GPU, VRAM, CPU e RAM](docs/screenshots/painel.jpg)
 
-Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. A janela sem barra de título começa em um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
+Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. Na primeira abertura, o guia rápido mostra os principais controles e o painel usa um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela. `gui --gpu ÍNDICE` seleciona outra GPU NVIDIA pelo índice da NVML.
 
-Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Pressione `Esc` para cancelar.
+Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Pressione `Esc` para cancelar. Arraste uma borda ou um canto para redimensionar. Ao reabrir, o painel restaura a última posição.
 
 - **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
-- **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. O padrão é 6 × 2. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
+- **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. Na primeira abertura, o ARGOS mostra quatro gráficos numa linha, na ordem de uso da CPU, temperatura da CPU, RAM usada e FPS. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
 - **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
-- **Quadros do jogo** seleciona o executável de um aplicativo aberto e mostra o estado da captura. Na seção **Gráficos exibidos**, marque separadamente o FPS, o frametime e a espera da CPU. Use **Desativado** para encerrar a captura de quadros.
+- **Quadros do jogo** segue o aplicativo em foco por padrão e mostra o estado da captura. Você pode escolher um executável específico ou usar **Desativado** para encerrar a captura. Na seção **Gráficos exibidos**, marque separadamente o FPS, o frametime e a espera da CPU.
 - **Histórico** (`F3`) alterna entre 30 segundos, 1 minuto, 2 minutos e 5 minutos.
 - Arraste um gráfico para posicioná-lo em um espaço livre ou para trocar de lugar com outro. O menu **Mover painel para** também permite escolher uma posição em outra página.
 - Ao clicar em um gráfico, o menu também permite escolher ou restaurar a cor de cada curva, inclusive em gráficos mesclados.
@@ -62,11 +62,11 @@ O traçado ocupa a maior parte do painel, com fundo preto, quadriculado fino e u
 
 Mínimo, máximo e média simples usam as leituras válidas do período selecionado. Leituras ausentes aparecem como lacunas, e a janela indica quando a coleta está atrasada. A coleta segue em segundo plano enquanto a janela está minimizada.
 
-O ARGOS salva a grade, as posições, os sensores, as mesclagens, as cores, a frequência e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`. O arquivo guarda as preferências do painel.
+O ARGOS salva a posição e o tamanho da janela, a grade, as posições dos gráficos, os sensores, as mesclagens, as cores, a frequência e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`.
 
 ### Quadros do jogo
 
-Abra o jogo e selecione seu executável em **Quadros do jogo**. O ARGOS começa com a captura desativada e mantém a seleção do processo em memória. A escolha do jogo e a visibilidade dos gráficos são independentes. A captura usa eventos do Windows para chamadas `Present()` do DXGI e do Direct3D 9. O Windows exige execução como administrador ou uma conta no grupo **Performance Log Users** para essa sessão. O menu mostra quando a captura está indisponível. [Permissões do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew#return-value)
+O ARGOS começa no modo **Aplicativo em foco**. Enquanto você interage com o painel, o ARGOS mantém o último aplicativo acompanhado. O menu **Quadros do jogo** permite escolher outro modo de captura para a sessão atual. A escolha do aplicativo e a visibilidade dos gráficos são independentes. A captura usa eventos do Windows para chamadas `Present()` do DXGI e do Direct3D 9. O Windows exige execução como administrador ou uma conta no grupo **Performance Log Users** para essa sessão. O menu mostra quando a captura está indisponível. [Permissões do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew#return-value)
 
 | Sensor | Medição |
 | --- | --- |
@@ -78,7 +78,11 @@ Os três sensores usam uma janela de até 1 s de eventos. As medições se refer
 
 ### Temperatura da CPU
 
-Em **Sensores**, marque **Temperatura da CPU**. O painel usa a temperatura interna de controle (`Tctl`) da CPU AMD família `19h`, modelo `75h`, a cada 1 s. Essa leitura requer a edição oficial assinada do PawnIO e o módulo oficial `AMDFamily17.bin` na mesma pasta de `argos.exe`. A configuração padrão do driver exige que o ARGOS seja executado como administrador. O gráfico mostra **N/D** quando a fonte estiver indisponível. [Driver PawnIO](https://pawnio.eu/) · [Módulos oficiais](https://github.com/namazso/PawnIO.Modules/releases)
+O painel consulta o sensor de controle (`Tctl`) de AMD Zen das famílias `17h`, `19h` e `1Ah` ou o sensor digital do pacote de CPUs Intel que oferecem essa leitura. A coleta acompanha o intervalo configurado no painel enquanto o gráfico está selecionado.
+
+O `ARGOS-Setup.exe` provisiona o driver assinado PawnIO e o serviço local **ARGOS Sensor de CPU** na primeira instalação ou atualização compatível. O painel usa as permissões normais da conta e o serviço inicia sob demanda. **Somente executar** aproveita um serviço já instalado. Se a leitura estiver indisponível, o gráfico mostra **N/D** e o menu **Sensores** informa o motivo. [Driver PawnIO](https://pawnio.eu/) · [Módulos oficiais](https://github.com/namazso/PawnIO.Modules/releases/tag/0.2.11)
+
+Em **Aplicativos instalados**, **ARGOS Sensor de CPU** remove o serviço compartilhado pelas cópias do ARGOS nesta máquina. O PawnIO tem sua própria entrada, pois pode ser usado por outros programas.
 
 ## Coleta contínua
 
@@ -125,4 +129,4 @@ RT Cores, cache L2 e os tempos de GPU por quadro seguem em investigação. A cap
 
 ## Licença
 
-O código do ARGOS é distribuído sob a [licença MIT](LICENSE).
+O código do ARGOS é distribuído sob a licença MIT. Os módulos PawnIO seguem a licença LGPL 2.1 ou posterior. Os avisos e fontes correspondentes acompanham o pacote. [Licença do ARGOS](LICENSE) · [Avisos do PawnIO](packaging/pawnio/NOTICE.txt)

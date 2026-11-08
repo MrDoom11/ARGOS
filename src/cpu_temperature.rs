@@ -22,12 +22,12 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::core::w;
 
-const MODULE_FILE: &str = "AMDFamily17.bin";
 const MODULE_SIZE_LIMIT: u64 = 64 * 1024;
-// THM_TCON_CUR_TMP in the System Management Network on the supported AMD CPU.
-const TEMPERATURE_REGISTER: u64 = 0x59800;
+const AMD_TEMPERATURE_REGISTER: u64 = 0x59800;
 const TEMPERATURE_RANGE_FLAG: u32 = 1 << 19;
 const TEMPERATURE_TJ_FLAGS: u32 = 3 << 16;
+const INTEL_PACKAGE_THERM_STATUS: u64 = 0x1b1;
+const INTEL_TEMPERATURE_TARGET: u64 = 0x1a2;
 
 // Public PawnIOLib C ABI. Sizes for execute are counts of u64 entries.
 type Open = unsafe extern "system" fn(*mut HANDLE) -> i32;
@@ -43,21 +43,33 @@ type Execute = unsafe extern "system" fn(
 ) -> i32;
 type ProcAddress = unsafe extern "system" fn() -> isize;
 
+enum CpuKind {
+    AmdZen,
+    IntelPackageDts,
+}
+
+enum Sensor {
+    AmdZen(OwnedHandle),
+    IntelPackageDts,
+}
+
 pub(crate) struct CpuTemperature {
     device: OwnedHandle,
-    pci_mutex: OwnedHandle,
+    sensor: Sensor,
     execute: Execute,
     _library: PawnIoLibrary,
 }
 
 impl CpuTemperature {
     pub(crate) fn open() -> io::Result<Self> {
-        if !supported_cpu() {
-            return Err(unsupported("modelo de CPU sem leitura de temperatura"));
-        }
-
-        let blob = read_blob()?;
+        let kind =
+            cpu_kind().ok_or_else(|| unsupported("Modelo de CPU sem leitura de temperatura"))?;
+        let module = match kind {
+            CpuKind::AmdZen => "AMDFamily17.bin",
+            CpuKind::IntelPackageDts => "IntelMSR.bin",
+        };
         let library = PawnIoLibrary::open()?;
+        let blob = read_blob(module)?;
         // Each name is paired with its documented PawnIOLib signature.
         let open =
             unsafe { std::mem::transmute::<ProcAddress, Open>(library.symbol(c"pawnio_open")?) };
@@ -76,46 +88,52 @@ impl CpuTemperature {
         let device = unsafe { OwnedHandle::from_raw_handle(device) };
         // The official driver validates and loads the module into this handle.
         check_hresult(unsafe { load(device.as_raw_handle(), blob.as_ptr(), blob.len()) })?;
-
-        // The module uses indexed PCI access and requires the shared Access_PCI mutex.
-        let pci_mutex = unsafe {
-            CreateMutexExW(
-                null(),
-                w!(r"Global\Access_PCI"),
-                0,
-                MUTEX_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
-            )
+        let sensor = match kind {
+            CpuKind::AmdZen => Sensor::AmdZen(pci_mutex()?),
+            CpuKind::IntelPackageDts => Sensor::IntelPackageDts,
         };
-        if pci_mutex.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let pci_mutex = unsafe { OwnedHandle::from_raw_handle(pci_mutex) };
 
         Ok(Self {
             device,
-            pci_mutex,
+            sensor,
             execute,
             _library: library,
         })
     }
 
     pub(crate) fn celsius(&self) -> io::Result<Option<f64>> {
-        let mutex = self.pci_mutex.as_raw_handle();
-        // A busy PCI bus is skipped so it cannot hold up the rest of the dashboard.
-        let _lock = match unsafe { WaitForSingleObject(mutex, 0) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => PciLock(mutex),
-            WAIT_TIMEOUT => return Ok(None),
-            _ => return Err(io::Error::last_os_error()),
+        let temperature = match &self.sensor {
+            Sensor::AmdZen(pci_mutex) => {
+                let mutex = pci_mutex.as_raw_handle();
+                // A busy PCI bus is skipped so it cannot hold up the dashboard.
+                let _lock = match unsafe { WaitForSingleObject(mutex, 0) } {
+                    WAIT_OBJECT_0 | WAIT_ABANDONED => PciLock(mutex),
+                    WAIT_TIMEOUT => return Ok(None),
+                    _ => return Err(io::Error::last_os_error()),
+                };
+                let register = self.read(c"ioctl_read_smn", AMD_TEMPERATURE_REGISTER)?;
+                u32::try_from(register).ok().and_then(decode_amd_celsius)
+            }
+            Sensor::IntelPackageDts => {
+                let target = self.read(c"ioctl_read_msr", INTEL_TEMPERATURE_TARGET)?;
+                let status = self.read(c"ioctl_read_msr", INTEL_PACKAGE_THERM_STATUS)?;
+                decode_intel_celsius(target, status)
+            }
         };
+        temperature
+            .map(Some)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Temperatura inválida"))
+    }
 
+    fn read(&self, operation: &CStr, address: u64) -> io::Result<u64> {
         let mut register = 0u64;
         let mut written = 0;
         // The module has one u64 input (register address) and one u64 output.
         check_hresult(unsafe {
             (self.execute)(
                 self.device.as_raw_handle(),
-                c"ioctl_read_smn".as_ptr().cast(),
-                &TEMPERATURE_REGISTER,
+                operation.as_ptr().cast(),
+                &address,
                 1,
                 &mut register,
                 1,
@@ -128,12 +146,24 @@ impl CpuTemperature {
                 "resposta incompleta do PawnIO",
             ));
         }
-        u32::try_from(register)
-            .ok()
-            .and_then(decode_celsius)
-            .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "temperatura inválida"))
+        Ok(register)
     }
+}
+
+fn pci_mutex() -> io::Result<OwnedHandle> {
+    // The AMD module uses indexed PCI access and requires the shared Access_PCI mutex.
+    let mutex = unsafe {
+        CreateMutexExW(
+            null(),
+            w!(r"Global\Access_PCI"),
+            0,
+            MUTEX_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
+        )
+    };
+    if mutex.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(mutex) })
 }
 
 struct PciLock(HANDLE);
@@ -182,7 +212,7 @@ impl Drop for PawnIoLibrary {
     }
 }
 
-fn installation_dir() -> io::Result<PathBuf> {
+pub(crate) fn installation_dir() -> io::Result<PathBuf> {
     let mut buffer = vec![0u16; 32_768];
     let mut size = (buffer.len() * size_of::<u16>()) as u32;
     // The installer documents this machine-wide key and stores a UTF-16 REG_SZ.
@@ -217,16 +247,17 @@ fn installation_dir() -> io::Result<PathBuf> {
     path.ok_or_else(|| unsupported("pasta de instalação do PawnIO inválida"))
 }
 
-fn read_blob() -> io::Result<Vec<u8>> {
-    let path = std::env::current_exe()?.with_file_name(MODULE_FILE);
-    let file = File::open(path)
-        .map_err(|error| missing_component(error, "módulo AMDFamily17.bin indisponível"))?;
+fn read_blob(module: &str) -> io::Result<Vec<u8>> {
+    let path = std::env::current_exe()?.with_file_name(module);
+    let file = File::open(path).map_err(|error| {
+        missing_component(error, "Módulo de temperatura do PawnIO indisponível")
+    })?;
     let mut blob = Vec::new();
     file.take(MODULE_SIZE_LIMIT + 1).read_to_end(&mut blob)?;
     if blob.is_empty() || blob.len() as u64 > MODULE_SIZE_LIMIT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "tamanho inválido do módulo AMDFamily17.bin",
+            "Tamanho inválido do módulo de temperatura do PawnIO",
         ));
     }
     Ok(blob)
@@ -261,31 +292,40 @@ fn unsupported(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
+pub(crate) fn supported() -> bool {
+    cpu_kind().is_some()
+}
+
 #[cfg(target_arch = "x86_64")]
-fn supported_cpu() -> bool {
+fn cpu_kind() -> Option<CpuKind> {
     use std::arch::x86_64::__cpuid;
 
     // CPUID is available on x86_64 and does not require kernel access.
     let vendor = __cpuid(0);
-    let authentic_amd = vendor.ebx.to_le_bytes() == *b"Auth"
-        && vendor.edx.to_le_bytes() == *b"enti"
-        && vendor.ecx.to_le_bytes() == *b"cAMD";
-    if vendor.eax < 1 || !authentic_amd {
-        return false;
+    let id = (
+        vendor.ebx.to_le_bytes(),
+        vendor.edx.to_le_bytes(),
+        vendor.ecx.to_le_bytes(),
+    );
+    if id == (*b"Genu", *b"ineI", *b"ntel") && vendor.eax >= 6 {
+        return (__cpuid(6).eax & (1 << 6) != 0).then_some(CpuKind::IntelPackageDts);
     }
+    if id != (*b"Auth", *b"enti", *b"cAMD") || vendor.eax < 1 {
+        return None;
+    }
+    // Zen families share the Tctl register in the System Management Network.
     let signature = __cpuid(1).eax;
     let base_family = (signature >> 8) & 0xf;
     let family = base_family + ((signature >> 20) & 0xff);
-    let model = ((signature >> 12) & 0xf0) | ((signature >> 4) & 0xf);
-    base_family == 0xf && family == 0x19 && model == 0x75
+    (base_family == 0xf && matches!(family, 0x17 | 0x19 | 0x1a)).then_some(CpuKind::AmdZen)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn supported_cpu() -> bool {
-    false
+fn cpu_kind() -> Option<CpuKind> {
+    None
 }
 
-fn decode_celsius(register: u32) -> Option<f64> {
+fn decode_amd_celsius(register: u32) -> Option<f64> {
     let ticks = register >> 21;
     if ticks == 0 || register == u32::MAX {
         return None;
@@ -300,27 +340,44 @@ fn decode_celsius(register: u32) -> Option<f64> {
     (0.0..=125.0).contains(&celsius).then_some(celsius)
 }
 
+fn decode_intel_celsius(target: u64, status: u64) -> Option<f64> {
+    // IA32_TEMPERATURE_TARGET supplies TjMax. Package DTS reports degrees below it.
+    let tj_max = ((target >> 16) & 0xff) as i16;
+    let delta = ((status >> 16) & 0x7f) as i16;
+    (status != u64::MAX && (40..=125).contains(&tj_max) && delta <= tj_max)
+        .then_some(f64::from(tj_max - delta))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn converts_zen_temperature_and_applies_the_alternate_range() {
-        assert_eq!(decode_celsius(421 << 21), Some(52.625));
+        assert_eq!(decode_amd_celsius(421 << 21), Some(52.625));
         assert_eq!(
-            decode_celsius((813 << 21) | TEMPERATURE_RANGE_FLAG),
+            decode_amd_celsius((813 << 21) | TEMPERATURE_RANGE_FLAG),
             Some(52.625)
         );
         assert_eq!(
-            decode_celsius((813 << 21) | TEMPERATURE_TJ_FLAGS),
+            decode_amd_celsius((813 << 21) | TEMPERATURE_TJ_FLAGS),
             Some(52.625)
         );
     }
 
     #[test]
     fn rejects_empty_and_out_of_range_registers() {
-        assert_eq!(decode_celsius(0), None);
-        assert_eq!(decode_celsius(u32::MAX), None);
-        assert_eq!(decode_celsius(1_100 << 21), None);
+        assert_eq!(decode_amd_celsius(0), None);
+        assert_eq!(decode_amd_celsius(u32::MAX), None);
+        assert_eq!(decode_amd_celsius(1_100 << 21), None);
+    }
+
+    #[test]
+    fn intel_package_dts_uses_tjmax_and_rejects_invalid_readings() {
+        assert_eq!(decode_intel_celsius(100 << 16, 42 << 16), Some(58.0));
+        assert_eq!(decode_intel_celsius(105 << 16, 0), Some(105.0));
+        assert_eq!(decode_intel_celsius(0, 42 << 16), None);
+        assert_eq!(decode_intel_celsius(100 << 16, 127 << 16), None);
+        assert_eq!(decode_intel_celsius(100 << 16, u64::MAX), None);
     }
 }
