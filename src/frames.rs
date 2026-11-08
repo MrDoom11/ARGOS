@@ -4,6 +4,7 @@ mod process;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
 
 use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 
@@ -63,9 +64,9 @@ impl FrameSampler {
         Self(ActiveCapture::start(pid))
     }
 
-    pub(crate) fn sample(&mut self) -> Sample {
+    pub(crate) fn sample(&mut self, interval: Duration) -> Sample {
         match &mut self.0 {
-            Ok(capture) => match capture.sample() {
+            Ok(capture) => match capture.sample(interval) {
                 Ok(sample) => sample,
                 Err(reason) => {
                     self.0 = Err(reason);
@@ -102,7 +103,7 @@ impl ActiveCapture {
         })
     }
 
-    fn sample(&mut self) -> Result<Sample, &'static str> {
+    fn sample(&mut self, interval: Duration) -> Result<Sample, &'static str> {
         if !self.target.is_running() {
             return Err("O processo selecionado foi encerrado");
         }
@@ -129,7 +130,7 @@ impl ActiveCapture {
         }
         Ok(self
             .presents
-            .measure(now as u64)
+            .measure(now as u64, interval)
             .map_or(Sample::Waiting(WAITING), Sample::Measured))
     }
 }
@@ -230,7 +231,7 @@ impl Presents {
         });
     }
 
-    fn measure(&mut self, now: u64) -> Option<[Option<f64>; SENSOR_COUNT]> {
+    fn measure(&mut self, now: u64, peak_window: Duration) -> Option<[Option<f64>; SENSOR_COUNT]> {
         // ETW may deliver a full second of events in one batch. Only discard the
         // last reading after allowing for that delay and one missed batch.
         let oldest = now.saturating_sub(self.frequency.saturating_mul(2));
@@ -243,6 +244,8 @@ impl Presents {
             .map(|timing| timing.stop)
             .max()?;
         let cutoff = latest.saturating_sub(self.frequency);
+        let peak_ticks = (u128::from(self.frequency) * peak_window.as_millis() / 1_000) as u64;
+        let peak_cutoff = latest.saturating_sub(peak_ticks);
         self.streams.retain(|_, timings| {
             while timings.front().is_some_and(|timing| timing.stop < cutoff) {
                 timings.pop_front();
@@ -261,19 +264,21 @@ impl Presents {
         let mut interval_count = 0;
         let mut total_ms = 0.0;
         let mut peak_interval = None;
-        let mut peak_wait = 0;
+        let mut peak_wait = None;
         for timing in timings {
-            peak_wait = peak_wait.max(timing.stop - timing.start);
+            if timing.stop >= peak_cutoff {
+                peak_wait = peak_wait.max(Some(timing.stop - timing.start));
+                peak_interval = peak_interval.max(timing.interval);
+            }
             if let Some(interval) = timing.interval {
                 interval_count += 1;
                 total_ms += to_ms(interval);
-                peak_interval = peak_interval.max(Some(interval));
             }
         }
         Some([
             (interval_count > 0).then(|| interval_count as f64 * 1_000.0 / total_ms),
             peak_interval.map(to_ms),
-            Some(to_ms(peak_wait)),
+            peak_wait.map(to_ms),
         ])
     }
 }
@@ -281,6 +286,8 @@ impl Presents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ONE_SECOND: Duration = Duration::from_secs(1);
 
     #[test]
     fn frame_target_follows_focus_without_overriding_manual_modes() {
@@ -327,17 +334,38 @@ mod tests {
     fn measures_timestamps_and_keeps_spikes_inside_the_window() {
         let mut presents = Presents::new(1_000);
         present(&mut presents, 1, 10, 100, 0);
-        assert_eq!(presents.measure(150), Some([None, None, Some(0.0)]));
+        assert_eq!(
+            presents.measure(150, ONE_SECOND),
+            Some([None, None, Some(0.0)])
+        );
         present(&mut presents, 1, 10, 120, 4);
         present(&mut presents, 1, 10, 200, 9);
         present(&mut presents, 1, 10, 220, 2);
         assert_eq!(
-            presents.measure(300),
+            presents.measure(300, ONE_SECOND),
             Some([Some(25.0), Some(80.0), Some(9.0)])
         );
         present(&mut presents, 1, 10, 1_211, 1);
-        assert_eq!(presents.measure(1_212).unwrap()[2], Some(2.0));
-        assert!(presents.measure(3_213).is_none());
+        assert_eq!(presents.measure(1_212, ONE_SECOND).unwrap()[2], Some(2.0));
+        assert!(presents.measure(3_213, ONE_SECOND).is_none());
+    }
+
+    #[test]
+    fn sampling_interval_limits_the_two_peaks_while_fps_uses_one_second() {
+        let mut presents = Presents::new(10_000);
+        present(&mut presents, 1, 10, 1_000, 0);
+        present(&mut presents, 1, 10, 5_000, 120);
+        present(&mut presents, 1, 10, 6_000, 30);
+        present(&mut presents, 1, 10, 6_200, 10);
+
+        assert_eq!(
+            presents.measure(6_500, Duration::from_millis(200)),
+            Some([Some(3_000.0 / 520.0), Some(400.0), Some(12.0)])
+        );
+        assert_eq!(
+            presents.measure(6_500, Duration::from_millis(100)),
+            Some([Some(3_000.0 / 520.0), Some(100.0), Some(3.0)])
+        );
     }
 
     #[test]
@@ -359,11 +387,14 @@ mod tests {
         present(&mut presents, 2, 11, 160, 7);
         present(&mut presents, 1, 10, 200, 2);
         assert_eq!(
-            presents.measure(250),
+            presents.measure(250, ONE_SECOND),
             Some([Some(10.0), Some(100.0), Some(3.0)])
         );
         presents.clear();
         present(&mut presents, 1, 10, 300, 1);
-        assert_eq!(presents.measure(350), Some([None, None, Some(1.0)]));
+        assert_eq!(
+            presents.measure(350, ONE_SECOND),
+            Some([None, None, Some(1.0)])
+        );
     }
 }

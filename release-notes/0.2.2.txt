@@ -1,0 +1,3 @@
+• Os novos sensores ocupam os espaços livres da grade. Quando há gráficos abaixo da área visível, aparece uma barra de rolagem à direita.
+• O menu continua aberto ao mudar configurações, facilitando a seleção de vários sensores.
+• Quadros do jogo passou a se chamar FPS, e Atualização passou a se chamar Taxa de amostragem. Os picos de frametime e espera da CPU seguem o intervalo escolhido.

@@ -58,13 +58,13 @@ const FRAME_SENSORS: [Sensor; frames::SENSOR_COUNT] = [
     ("present-fps", "FPS apresentado", " FPS", Axis::Fixed(360.0)),
     (
         "present-frametime",
-        "Frametime (pico 1 s)",
+        "Frametime (pico)",
         " ms",
         Axis::Fixed(100.0),
     ),
     (
         "present-cpu-wait",
-        "Espera CPU (pico 1 s)",
+        "Espera CPU (pico)",
         " ms",
         Axis::Fixed(100.0),
     ),
@@ -498,9 +498,10 @@ impl FrameMonitor {
     }
 
     fn collect(&mut self, start: Instant) -> bool {
+        let interval = self.group.cadence.interval();
         self.group
             .capture(start, || {
-                let sample = self.sampler.sample();
+                let sample = self.sampler.sample(interval);
                 self.status = Some(sample.status());
                 match sample {
                     frames::Sample::Measured(values) => {
