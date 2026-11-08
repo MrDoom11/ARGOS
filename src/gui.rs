@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::io;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW,
 };
+use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, ReleaseCapture, SetCapture, VK_END, VK_ESCAPE, VK_F2, VK_F3, VK_F4, VK_HOME,
@@ -31,9 +33,11 @@ use crate::watch::{
 
 mod board;
 mod chart;
+mod menu;
 mod startup;
 
 use board::{Board, MAX_COLUMNS, MAX_ROWS, MAX_SLOTS};
+use menu::Menu;
 
 const TIMER: usize = 1;
 const PERIOD_FIRST: usize = 201;
@@ -120,7 +124,12 @@ pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
             WS_EX_APPWINDOW,
             WINDOW_CLASS,
             WINDOW_TITLE,
-            WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
+            WS_POPUP
+                | WS_THICKFRAME
+                | WS_SYSMENU
+                | WS_MINIMIZEBOX
+                | WS_MAXIMIZEBOX
+                | WS_CLIPCHILDREN,
             start.left,
             start.top,
             width(start),
@@ -186,7 +195,10 @@ pub(crate) fn run(gpu: Option<u32>, source: Source) -> Result<(), String> {
             0 => break,
             _ => {}
         }
-        if message.message == WM_KEYDOWN && keyboard(hwnd, &state, message.wParam as u16) {
+        if message.message == WM_KEYDOWN
+            && unsafe { GetAncestor(message.hwnd, GA_ROOT) } == hwnd
+            && keyboard(hwnd, &state, message.wParam as u16)
+        {
             continue;
         }
         unsafe {
@@ -215,6 +227,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
         match msg {
+            WM_CREATE => {
+                let scrollbar = CreateWindowExW(
+                    0,
+                    windows_sys::w!("SCROLLBAR"),
+                    null(),
+                    WS_CHILD | SBS_VERT as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                    hwnd,
+                    null_mut(),
+                    (*(lp as *const CREATESTRUCTW)).hInstance,
+                    null(),
+                );
+                if scrollbar.is_null() {
+                    return -1;
+                }
+                state.borrow_mut().scrollbar = scrollbar;
+                0
+            }
             WM_NCHITTEST => {
                 let mut bounds = RECT::default();
                 let dpi = state.try_borrow().map_or(96, |app| app.dpi);
@@ -267,6 +300,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_PAINT => {
+                if IsIconic(hwnd) == 0 {
+                    sync_scrollbar(hwnd, state);
+                }
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
                 if !dc.is_null()
@@ -292,6 +328,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     .ok()
                     .and_then(|mut app| app.updater.poll());
                 if let Some(notice) = notice {
+                    EndMenu();
                     update_notice(hwnd, &notice);
                 }
                 if IsIconic(hwnd) == 0
@@ -330,7 +367,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_MOUSEWHEEL => {
-                navigate(hwnd, state, PageMove::Wheel((wp >> 16) as i16));
+                navigate(hwnd, state, ScrollMove::Wheel((wp >> 16) as i16));
+                0
+            }
+            WM_VSCROLL => {
+                let movement = match i32::from(wp as u16) {
+                    SB_LINEUP => ScrollMove::Rows(-1),
+                    SB_LINEDOWN => ScrollMove::Rows(1),
+                    SB_PAGEUP => ScrollMove::PreviousPage,
+                    SB_PAGEDOWN => ScrollMove::NextPage,
+                    SB_TOP => ScrollMove::First,
+                    SB_BOTTOM => ScrollMove::Last,
+                    SB_THUMBPOSITION | SB_THUMBTRACK => ScrollMove::ToRow(wp >> 16),
+                    _ => return 0,
+                };
+                navigate(hwnd, state, movement);
                 0
             }
             WM_LBUTTONDOWN => {
@@ -362,6 +413,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_INITMENUPOPUP | WM_UNINITMENUPOPUP | WM_MENUSELECT => {
+                menu::notify(hwnd, msg, wp, lp);
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            menu::APPLY => {
+                apply_open_option(hwnd, state, wp);
+                0
             }
             WM_CONTEXTMENU | WM_NCRBUTTONUP => {
                 stop_window_move(hwnd, state, false);
@@ -528,7 +587,7 @@ fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
         if app.window_move.begin(hwnd, point) {
             return app.window_move.is_active();
         }
-        let Some(source) = app.layout(client(hwnd)).panel_at(app.page, point) else {
+        let Some(source) = app.panel_at(client(hwnd), point) else {
             return false;
         };
         if app.snapshot.is_none() || !app.panel_is_occupied(source) || app.drag.is_some() {
@@ -560,7 +619,7 @@ fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
         if app.drag.is_none() {
             return false;
         }
-        let target = app.layout(client(hwnd)).panel_at(app.page, point);
+        let target = app.panel_at(client(hwnd), point);
         let threshold = scale(4, app.dpi) as u32;
         app.drag
             .as_mut()
@@ -578,7 +637,7 @@ fn finish_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
     }
     let drag = state.try_borrow_mut().ok().and_then(|mut app| {
         let mut drag = app.drag.take()?;
-        let target = app.layout(client(hwnd)).panel_at(app.page, point);
+        let target = app.panel_at(client(hwnd), point);
         drag.update(point, target, scale(4, app.dpi) as u32);
         Some(drag)
     });
@@ -632,10 +691,10 @@ fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
         VK_F4 => MenuSection::Grid,
         VK_PRIOR | VK_NEXT | VK_HOME | VK_END => {
             let step = match key {
-                VK_PRIOR => PageMove::Previous,
-                VK_NEXT => PageMove::Next,
-                VK_HOME => PageMove::First,
-                _ => PageMove::Last,
+                VK_PRIOR => ScrollMove::PreviousPage,
+                VK_NEXT => ScrollMove::NextPage,
+                VK_HOME => ScrollMove::First,
+                _ => ScrollMove::Last,
             };
             navigate(hwnd, state, step);
             return true;
@@ -648,34 +707,38 @@ fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
     true
 }
 
-enum PageMove {
-    Previous,
-    Next,
+enum ScrollMove {
+    Rows(isize),
+    PreviousPage,
+    NextPage,
     First,
     Last,
+    ToRow(usize),
     Wheel(i16),
 }
 
-fn navigate(hwnd: HWND, state: &RefCell<Window>, step: PageMove) {
+fn navigate(hwnd: HWND, state: &RefCell<Window>, step: ScrollMove) {
     let changed = state.try_borrow_mut().is_ok_and(|mut app| {
         if app.drag.is_some() {
             return false;
         }
-        let last = app.page_count() - 1;
-        let page = match step {
-            PageMove::Previous => app.page.saturating_sub(1),
-            PageMove::Next => (app.page + 1).min(last),
-            PageMove::First => 0,
-            PageMove::Last => last,
-            PageMove::Wheel(delta) => {
+        let row = match step {
+            ScrollMove::Rows(rows) => app.scroll_row.saturating_add_signed(rows),
+            ScrollMove::PreviousPage => app.scroll_row.saturating_sub(app.board.rows),
+            ScrollMove::NextPage => app.scroll_row + app.board.rows,
+            ScrollMove::First => 0,
+            ScrollMove::Last => app.scroll_limit(),
+            ScrollMove::ToRow(row) => row,
+            ScrollMove::Wheel(delta) => {
                 let motion = app.wheel_remainder + i32::from(delta);
-                let pages = motion / WHEEL_DELTA as i32;
+                let rows = motion / WHEEL_DELTA as i32;
                 app.wheel_remainder = motion % WHEEL_DELTA as i32;
-                app.page.saturating_add_signed(-pages as isize).min(last)
+                app.scroll_row.saturating_add_signed(-rows as isize)
             }
         };
-        let changed = page != app.page;
-        app.page = page;
+        let row = row.min(app.scroll_limit());
+        let changed = row != app.scroll_row;
+        app.scroll_row = row;
         changed
     });
     if changed {
@@ -683,6 +746,78 @@ fn navigate(hwnd: HWND, state: &RefCell<Window>, step: PageMove) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ScrollbarState {
+    position: [i32; 4],
+    total_rows: usize,
+    visible_rows: usize,
+    first_row: usize,
+}
+
+fn scrollbar_bounds(bounds: RECT, dpi: u32) -> RECT {
+    let grip = scale(5, dpi);
+    let scrollbar_width = unsafe { GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) };
+    let right = bounds.right - grip;
+    area(
+        (right - scrollbar_width).max(bounds.left),
+        bounds.top + grip,
+        right,
+        bounds.bottom - grip,
+    )
+}
+
+fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
+    let Ok(mut app) = state.try_borrow_mut() else {
+        return;
+    };
+    let scrollbar = app.scrollbar;
+    let next = (app.scroll_limit() > 0).then(|| {
+        let bounds = scrollbar_bounds(client(hwnd), app.dpi);
+        ScrollbarState {
+            position: [bounds.left, bounds.top, width(bounds), height(bounds)],
+            total_rows: app.total_rows(),
+            visible_rows: app.board.rows,
+            first_row: app.scroll_row,
+        }
+    });
+    let previous = app.scrollbar_state;
+    if previous == next {
+        return;
+    }
+    app.scrollbar_state = next;
+    drop(app);
+
+    unsafe {
+        if let Some(next) = next {
+            let info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                nMin: 0,
+                nMax: next.total_rows as i32 - 1,
+                nPage: next.visible_rows as u32,
+                nPos: next.first_row as i32,
+                nTrackPos: 0,
+            };
+            SetScrollInfo(scrollbar, SB_CTL, &info, 1);
+            if previous.is_none_or(|previous| previous.position != next.position) {
+                let [x, y, w, h] = next.position;
+                SetWindowPos(
+                    scrollbar,
+                    null_mut(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+                );
+            }
+        } else {
+            ShowWindow(scrollbar, SW_HIDE);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum MenuSection {
     All,
     Sensors,
@@ -690,122 +825,191 @@ enum MenuSection {
     Grid,
 }
 
+struct OpenMenu {
+    root: HMENU,
+    section: MenuSection,
+    processes: Vec<Process>,
+    panel_sensors: Vec<usize>,
+}
+
+impl OpenMenu {
+    fn panel(&self, app: &Window) -> Option<usize> {
+        self.panel_sensors.iter().find_map(|sensor| {
+            app.board
+                .panels
+                .iter()
+                .position(|panel| panel.contains(sensor))
+        })
+    }
+}
+
 fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: MenuSection) {
+    if state
+        .try_borrow()
+        .map_or(true, |app| app.open_menu.is_some())
+    {
+        return;
+    }
     let processes = if matches!(section, MenuSection::All) {
         visible_processes()
     } else {
         Vec::new()
     };
-    let (menu, panel) = {
+    let (menu, panel_sensors) = {
         let Ok(app) = state.try_borrow() else { return };
-        let Some(menu) = Menu::new() else { return };
-        match section {
-            MenuSection::Sensors => app.sensor_menu(&menu),
-            MenuSection::Period => app.period_menu(&menu),
-            MenuSection::Grid => app.grid_menu(&menu),
-            MenuSection::All => {
-                if let Some(snapshot) = &app.snapshot {
-                    if app.snapshot_is_stale(Instant::now()) {
-                        menu.label("Coleta atrasada");
-                    }
-                    menu.label(&snapshot.notice);
-                    menu.separator();
-                }
-                menu.group("Atualização", |items| {
-                    for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
-                        items.item(
-                            REFRESH_FIRST + index,
-                            &format!("{ms} ms"),
-                            ms == app.board.refresh_ms,
-                        );
-                    }
-                });
-                menu.group("Histórico", |items| app.period_menu(items));
-                menu.group("Sensores", |items| app.sensor_menu(items));
-                menu.group("Quadros do jogo", |items| app.frame_menu(items, &processes));
-                menu.group("Grade", |items| app.grid_menu(items));
-                match app.updater.status() {
-                    Status::Idle => {
-                        menu.item(UPDATE_CHECK, "Verificar nova versão do ARGOS", false)
-                    }
-                    Status::Checking => menu.label("Verificando nova versão do ARGOS…"),
-                    Status::Ready(version, scheduled) => {
-                        menu.group(&format!("ARGOS {version} disponível"), |items| {
-                            items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
-                            if scheduled {
-                                items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
-                            } else {
-                                items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
-                            }
-                        });
-                    }
-                }
-                if update::last_error().is_some() {
-                    menu.item(UPDATE_ERROR, "Ver erro da última atualização", false);
-                }
-                if app.page_count() > 1 {
-                    menu.group("Página", |items| {
-                        for page in 0..app.page_count() {
-                            items.item(
-                                PAGE_FIRST + page,
-                                &format!("Página {}", page + 1),
-                                page == app.page,
-                            );
-                        }
-                    });
-                }
-                if app.save_failed {
-                    menu.label("Configuração disponível nesta sessão");
-                }
-            }
-        }
-        let panel = if matches!(section, MenuSection::All) {
-            let mut point = screen;
-            if unsafe { ScreenToClient(hwnd, &mut point) } == 0 {
-                None
-            } else {
-                app.layout(client(hwnd))
-                    .panel_at(app.page, point)
-                    .filter(|&index| app.panel_is_occupied(index))
-            }
+        let mut point = screen;
+        let panel = if matches!(section, MenuSection::All)
+            && unsafe { ScreenToClient(hwnd, &mut point) } != 0
+        {
+            app.panel_at(client(hwnd), point)
+                .filter(|&index| app.panel_is_occupied(index))
         } else {
             None
         };
-        if let Some(index) = panel
-            && let Some(snapshot) = &app.snapshot
-        {
-            menu.separator();
-            app.panel_menu(&menu, snapshot, index);
-        }
-        if matches!(section, MenuSection::All) {
-            menu.separator();
-            if unsafe { IsZoomed(hwnd) } != 0 {
-                menu.label("Mover janela");
-                menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
-            } else {
-                menu.item(MOVE_WINDOW, "Mover janela", false);
-                menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
-            }
-            menu.item(MINIMIZE_WINDOW, "Minimizar", false);
-            menu.item(CLOSE_WINDOW, "Fechar", false);
-        }
-        (menu, panel)
-    };
-
-    // TrackPopupMenu e ChooseColorW despacham mensagens. Nenhum empréstimo vive aqui.
-    let choice = unsafe {
-        TrackPopupMenu(
-            menu.0,
-            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-            screen.x,
-            screen.y,
-            0,
-            hwnd,
-            null(),
+        (
+            options_menu(hwnd, &app, section, &processes, panel),
+            panel.map_or_else(Vec::new, |index| app.board.panels[index].clone()),
         )
-    } as usize;
+    };
+    let Some(menu) = menu else { return };
+    let opened = Rc::new(OpenMenu {
+        root: menu.0,
+        section,
+        processes,
+        panel_sensors,
+    });
+    state.borrow_mut().open_menu = Some(Rc::clone(&opened));
+    // TrackPopupMenu despacha mensagens enquanto o menu está aberto.
+    let choice = menu.track(hwnd, screen, keep_menu_open);
+    state.borrow_mut().open_menu = None;
+    if choice != 0 {
+        let panel = opened.panel(&state.borrow());
+        apply_option(hwnd, state, choice, panel, &opened.processes);
+    }
+}
+
+fn keep_menu_open(choice: usize) -> bool {
+    matches!(choice, RESET_SENSORS | RESET_COLORS)
+        || (PERIOD_FIRST..PERIOD_FIRST + PERIODS.len()).contains(&choice)
+        || (COLUMNS_FIRST..COLUMNS_FIRST + MAX_COLUMNS).contains(&choice)
+        || (ROWS_FIRST..ROWS_FIRST + MAX_ROWS).contains(&choice)
+        || (REFRESH_FIRST..REFRESH_FIRST + GUI_INTERVALS_MS.len()).contains(&choice)
+        || (PAGE_FIRST..MERGE_FIRST).contains(&choice)
+        || choice >= FRAME_TARGET_FOREGROUND
+}
+
+fn options_menu(
+    hwnd: HWND,
+    app: &Window,
+    section: MenuSection,
+    processes: &[Process],
+    panel: Option<usize>,
+) -> Option<Menu> {
+    let menu = Menu::new()?;
+    match section {
+        MenuSection::Sensors => app.sensor_menu(&menu),
+        MenuSection::Period => app.period_menu(&menu),
+        MenuSection::Grid => app.grid_menu(&menu),
+        MenuSection::All => {
+            if let Some(snapshot) = &app.snapshot {
+                if app.snapshot_is_stale(Instant::now()) {
+                    menu.label("Coleta atrasada");
+                }
+                menu.label(&snapshot.notice);
+                menu.separator();
+            }
+            menu.group("Taxa de amostragem", |items| {
+                for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
+                    items.item(
+                        REFRESH_FIRST + index,
+                        &format!("{ms} ms"),
+                        ms == app.board.refresh_ms,
+                    );
+                }
+            });
+            menu.group("Histórico", |items| app.period_menu(items));
+            menu.group("Sensores", |items| app.sensor_menu(items));
+            menu.group("FPS", |items| app.frame_menu(items, processes));
+            menu.group("Grade", |items| app.grid_menu(items));
+            match app.updater.status() {
+                Status::Idle => menu.item(UPDATE_CHECK, "Verificar nova versão do ARGOS", false),
+                Status::Checking => menu.label("Verificando nova versão do ARGOS…"),
+                Status::Ready(version, scheduled) => {
+                    menu.group(&format!("ARGOS {version} disponível"), |items| {
+                        items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
+                        if scheduled {
+                            items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
+                        } else {
+                            items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
+                        }
+                    });
+                }
+            }
+            if update::last_error().is_some() {
+                menu.item(UPDATE_ERROR, "Ver erro da última atualização", false);
+            }
+            if app.page_count() > 1 {
+                menu.group("Página", |items| {
+                    for page in 0..app.page_count() {
+                        items.item(
+                            PAGE_FIRST + page,
+                            &format!("Página {}", page + 1),
+                            app.page_is_current(page),
+                        );
+                    }
+                });
+            }
+            if app.save_failed {
+                menu.label("Configuração disponível nesta sessão");
+            }
+        }
+    }
+    if let Some(index) = panel
+        && let Some(snapshot) = &app.snapshot
+    {
+        menu.separator();
+        app.panel_menu(&menu, snapshot, index);
+    }
+    if matches!(section, MenuSection::All) {
+        menu.separator();
+        if unsafe { IsZoomed(hwnd) } != 0 {
+            menu.label("Mover janela");
+            menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
+        } else {
+            menu.item(MOVE_WINDOW, "Mover janela", false);
+            menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
+        }
+        menu.item(MINIMIZE_WINDOW, "Minimizar", false);
+        menu.item(CLOSE_WINDOW, "Fechar", false);
+    }
+    Some(menu)
+}
+
+fn apply_open_option(hwnd: HWND, state: &RefCell<Window>, choice: usize) {
+    if !keep_menu_open(choice) {
+        return;
+    }
+    let Some(opened) = state.borrow().open_menu.clone() else {
+        return;
+    };
+    let panel = opened.panel(&state.borrow());
+    apply_option(hwnd, state, choice, panel, &opened.processes);
+    let app = state.borrow();
+    let panel = opened.panel(&app);
+    let updated = options_menu(hwnd, &app, opened.section, &opened.processes, panel);
+    drop(app);
+    if let Some(updated) = updated {
+        menu::sync(opened.root, &updated);
+    }
+}
+fn apply_option(
+    hwnd: HWND,
+    state: &RefCell<Window>,
+    choice: usize,
+    panel: Option<usize>,
+    processes: &[Process],
+) {
     match choice {
-        0 => {}
         MOVE_WINDOW => {
             if let Ok(mut app) = state.try_borrow_mut() {
                 app.window_move = WindowMove::Armed;
@@ -863,7 +1067,7 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         }
         choice if (PAGE_FIRST..SENSOR_FIRST).contains(&choice) => {
             if let Ok(mut app) = state.try_borrow_mut() {
-                app.page = (choice - PAGE_FIRST).min(app.page_count() - 1);
+                app.show_page(choice - PAGE_FIRST);
             }
             invalidate(hwnd);
         }
@@ -944,7 +1148,7 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
     if !edit(&mut app) {
         return;
     }
-    app.page = app.page.min(app.page_count() - 1);
+    app.scroll_row = app.scroll_row.min(app.scroll_limit());
     let interval = app.board.refresh_ms;
     if interval != old_interval {
         app.monitor.set_interval_ms(interval);
@@ -985,7 +1189,10 @@ struct Window {
     board: Board,
     save_failed: bool,
     custom_colors: [COLORREF; 16],
-    page: usize,
+    open_menu: Option<Rc<OpenMenu>>,
+    scroll_row: usize,
+    scrollbar: HWND,
+    scrollbar_state: Option<ScrollbarState>,
     wheel_remainder: i32,
     window_move: WindowMove,
     drag: Option<PanelDrag>,
@@ -1003,7 +1210,10 @@ impl Window {
             board,
             save_failed: false,
             custom_colors: SERIES,
-            page: 0,
+            open_menu: None,
+            scroll_row: 0,
+            scrollbar: null_mut(),
+            scrollbar_state: None,
             wheel_remainder: 0,
             window_move: WindowMove::Idle,
             drag: None,
@@ -1043,6 +1253,38 @@ impl Window {
         self.board.panels.len().div_ceil(self.slots()).max(1)
     }
 
+    fn total_rows(&self) -> usize {
+        self.board.panels.len().div_ceil(self.board.columns)
+    }
+
+    fn scroll_limit(&self) -> usize {
+        self.total_rows().saturating_sub(self.board.rows)
+    }
+
+    fn page_row(&self, page: usize) -> usize {
+        page.saturating_mul(self.board.rows)
+            .min(self.scroll_limit())
+    }
+
+    fn page_is_current(&self, page: usize) -> bool {
+        self.scroll_row == self.page_row(page)
+    }
+
+    fn show_page(&mut self, page: usize) {
+        self.scroll_row = self.page_row(page);
+    }
+
+    fn first_slot(&self) -> usize {
+        self.scroll_row * self.board.columns
+    }
+
+    fn show_panel(&mut self, panel: usize) {
+        let row = panel / self.board.columns;
+        self.scroll_row = self
+            .scroll_row
+            .clamp(row.saturating_sub(self.board.rows - 1), row);
+    }
+
     fn panel_is_occupied(&self, index: usize) -> bool {
         self.board
             .panels
@@ -1054,7 +1296,7 @@ impl Window {
         if !self.board.move_panel(source, target) {
             return false;
         }
-        self.page = target / self.slots();
+        self.show_panel(target);
         true
     }
 
@@ -1077,7 +1319,7 @@ impl Window {
                 .iter()
                 .position(|panel| panel.iter().any(|sensor| FRAME_SENSORS.contains(sensor)))
         {
-            self.page = panel / self.slots();
+            self.show_panel(panel);
         }
     }
 
@@ -1096,7 +1338,7 @@ impl Window {
             self.board.period = period;
             return changed;
         }
-        let first = self.page * self.slots();
+        let first = self.first_slot();
         let grid = if (COLUMNS_FIRST..COLUMNS_FIRST + MAX_COLUMNS).contains(&choice) {
             Some((&mut self.board.columns, choice - COLUMNS_FIRST + 1))
         } else if (ROWS_FIRST..ROWS_FIRST + MAX_ROWS).contains(&choice) {
@@ -1109,7 +1351,7 @@ impl Window {
                 return false;
             }
             *dimension = count;
-            self.page = first / self.slots();
+            self.scroll_row = first / self.board.columns;
             return true;
         }
         if let Some(panel) = panel {
@@ -1146,14 +1388,14 @@ impl Window {
                     .iter()
                     .position(|series| series.contains(&sensor))
                 {
-                    self.page = merged / self.slots();
+                    self.show_panel(merged);
                 }
                 return true;
             }
         }
         if choice == RESET_SENSORS {
             self.board.reset_selection(board::INITIAL_SENSORS);
-            self.page = 0;
+            self.scroll_row = 0;
             return true;
         }
         let Some(snapshot) = &self.snapshot else {
@@ -1162,16 +1404,8 @@ impl Window {
         if let Some(index) = choice.checked_sub(SENSOR_FIRST)
             && snapshot.metrics.get(index).is_some()
         {
-            self.board.toggle(index);
-            if (FRAME_SENSORS.contains(&index) || index == CPU_TEMPERATURE_INDEX)
-                && let Some(panel) = self
-                    .board
-                    .panels
-                    .iter()
-                    .position(|panel| panel.contains(&index))
-            {
-                self.page = panel / self.slots();
-            }
+            let first = self.first_slot();
+            self.board.toggle(index, first);
             return true;
         }
         false
@@ -1362,8 +1596,15 @@ impl Window {
             .unwrap_or(SERIES[index % SERIES.len()])
     }
 
-    fn layout(&self, bounds: RECT) -> Layout {
+    fn layout(&self, mut bounds: RECT) -> Layout {
+        if self.scroll_limit() > 0 {
+            bounds.right = scrollbar_bounds(bounds, self.dpi).left;
+        }
         Layout::new(bounds, self.board.columns, self.board.rows)
+    }
+
+    fn panel_at(&self, bounds: RECT, point: POINT) -> Option<usize> {
+        self.layout(bounds).panel_at(self.first_slot(), point)
     }
 
     fn paint(&mut self, front: HDC, bounds: RECT) {
@@ -1389,7 +1630,7 @@ impl Window {
                 .board
                 .panels
                 .iter()
-                .skip(self.page * layout.slots())
+                .skip(self.first_slot())
                 .take(layout.slots())
                 .enumerate()
             {
@@ -1425,7 +1666,7 @@ impl Window {
         if let Some(drag) = &self.drag
             && drag.active
         {
-            let first = self.page * layout.slots();
+            let first = self.first_slot();
             if let Some(source) = drag
                 .source
                 .checked_sub(first)
@@ -1507,14 +1748,14 @@ impl Layout {
         )
     }
 
-    fn panel_at(&self, page: usize, point: POINT) -> Option<usize> {
+    fn panel_at(&self, first_slot: usize, point: POINT) -> Option<usize> {
         (0..self.slots())
             .find(|&slot| {
                 let rect = self.card(slot);
                 (rect.left..rect.right).contains(&point.x)
                     && (rect.top..rect.bottom).contains(&point.y)
             })
-            .map(|slot| page * self.slots() + slot)
+            .map(|slot| first_slot + slot)
             .filter(|&index| index < MAX_SLOTS)
     }
 }
@@ -1568,52 +1809,6 @@ impl Drop for BackBuffer {
                 DeleteDC(self.dc);
             }
         }
-    }
-}
-
-struct Menu(HMENU);
-
-impl Menu {
-    fn new() -> Option<Self> {
-        let menu = unsafe { CreatePopupMenu() };
-        (!menu.is_null()).then_some(Self(menu))
-    }
-
-    fn item(&self, id: usize, label: &str, checked: bool) {
-        let label = wide(label);
-        unsafe {
-            AppendMenuW(
-                self.0,
-                MF_STRING | if checked { MF_CHECKED } else { 0 },
-                id,
-                label.as_ptr(),
-            )
-        };
-    }
-
-    fn label(&self, label: &str) {
-        let label = wide(label);
-        unsafe { AppendMenuW(self.0, MF_STRING | MF_GRAYED, 0, label.as_ptr()) };
-    }
-
-    fn separator(&self) {
-        unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, std::ptr::null()) };
-    }
-
-    fn group(&self, label: &str, items: impl FnOnce(&Self)) {
-        let Some(submenu) = Self::new() else { return };
-        items(&submenu);
-        let label = wide(label);
-        // Uma inclusão bem-sucedida transfere o submenu para o menu pai.
-        if unsafe { AppendMenuW(self.0, MF_POPUP, submenu.0 as usize, label.as_ptr()) } != 0 {
-            std::mem::forget(submenu);
-        }
-    }
-}
-
-impl Drop for Menu {
-    fn drop(&mut self) {
-        unsafe { DestroyMenu(self.0) };
     }
 }
 
@@ -1819,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_hit_uses_page_offset_and_skips_grid_gaps() {
+    fn panel_hit_uses_scroll_offset_and_skips_grid_gaps() {
         let layout = Layout::new(area(0, 0, 1118, 419), 3, 2);
         let card = layout.card(4);
         let center = POINT {
@@ -1827,12 +2022,12 @@ mod tests {
             y: (card.top + card.bottom) / 2,
         };
         assert_eq!(layout.panel_at(0, center), Some(4));
-        assert_eq!(layout.panel_at(2, center), Some(16));
+        assert_eq!(layout.panel_at(3, center), Some(7));
         let gap = POINT {
             x: card.right,
             y: center.y,
         };
-        assert_eq!(layout.panel_at(2, gap), None);
+        assert_eq!(layout.panel_at(3, gap), None);
     }
 
     #[test]
@@ -1895,15 +2090,15 @@ mod tests {
     }
 
     #[test]
-    fn last_partial_page_has_no_targets_past_the_board_limit() {
+    fn last_visible_rows_have_no_targets_past_the_board_limit() {
         let layout = Layout::new(area(0, 0, 1118, 419), 3, 2);
-        let page = (MAX_SLOTS - 1) / layout.slots();
-        let last_slot = (MAX_SLOTS - 1) % layout.slots();
+        let first = (MAX_SLOTS.div_ceil(layout.columns) - layout.rows) * layout.columns;
+        let last_slot = MAX_SLOTS - 1 - first;
         let last = layout.card(last_slot);
         let invalid = layout.card(last_slot + 1);
         assert_eq!(
             layout.panel_at(
-                page,
+                first,
                 POINT {
                     x: last.left,
                     y: last.top
@@ -1913,7 +2108,7 @@ mod tests {
         );
         assert_eq!(
             layout.panel_at(
-                page,
+                first,
                 POINT {
                     x: invalid.left,
                     y: invalid.top

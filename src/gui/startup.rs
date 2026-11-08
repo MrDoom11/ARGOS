@@ -13,7 +13,7 @@ use super::{board, wide};
 const WELCOME: &str = "Clique com o botão direito no painel para abrir o menu.\n\n\
     Use Sensores e Grade para escolher os gráficos. Arraste um gráfico para mudar a ordem.\n\n\
     Para mover o painel, escolha Mover janela e arraste com o botão esquerdo. Para redimensionar, arraste uma borda.\n\n\
-    Em Quadros do jogo, escolha o aplicativo em foco, um processo específico ou Desativado.\n\n\
+    Em FPS, escolha o aplicativo em foco, um processo específico ou Desativado.\n\n\
     No menu você também pode verificar se há uma nova versão do ARGOS.";
 const RELEASE_NOTES: &str = include_str!(concat!(
     "../../release-notes/",

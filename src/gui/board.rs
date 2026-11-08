@@ -88,17 +88,23 @@ impl Board {
         true
     }
 
-    pub(super) fn toggle(&mut self, sensor: usize) {
+    pub(super) fn toggle(&mut self, sensor: usize, first_slot: usize) {
         if let Some(index) = self.panels.iter().position(|panel| panel.contains(&sensor)) {
             self.panels[index].retain(|&entry| entry != sensor);
             if self.panels[index].is_empty() {
                 self.remove_empty_panel(index);
             }
         } else if sensor_catalog().nth(sensor).is_some() {
-            if self.panels.len() < MAX_SLOTS {
-                self.panels.push(vec![sensor]);
-            } else if let Some(panel) = self.panels.iter_mut().find(|panel| panel.is_empty()) {
-                panel.push(sensor);
+            let first_slot = first_slot.min(self.panels.len());
+            if let Some(slot) = (first_slot..MAX_SLOTS)
+                .chain(0..first_slot)
+                .find(|&slot| self.panels.get(slot).is_none_or(Vec::is_empty))
+            {
+                if let Some(panel) = self.panels.get_mut(slot) {
+                    panel.push(sensor);
+                } else {
+                    self.panels.push(vec![sensor]);
+                }
             }
         }
     }
@@ -432,21 +438,21 @@ mod tests {
         let mut board = Board::new([0]);
 
         for sensor in [fps, frametime, cpu_wait] {
-            board.toggle(sensor);
+            board.toggle(sensor, 0);
         }
         assert_eq!(
             board.panels,
             [vec![0], vec![fps], vec![frametime], vec![cpu_wait]]
         );
 
-        board.toggle(fps);
-        board.toggle(cpu_wait);
+        board.toggle(fps, 0);
+        board.toggle(cpu_wait, 0);
         let config = board.encode();
         assert!(config.lines().any(|line| line == "panel=present-frametime"));
         let mut reopened = Board::decode(&config).unwrap();
         assert_eq!(reopened.panels, [vec![0], vec![frametime]]);
 
-        reopened.toggle(frametime);
+        reopened.toggle(frametime, 0);
         assert_eq!(Board::decode(&reopened.encode()), Some(Board::new([0])));
     }
 
@@ -496,12 +502,27 @@ mod tests {
         assert!(board.split(3));
         assert_eq!(board.panels[3], [11]);
         assert_eq!(board.panels[4], [5]);
-        board.toggle(5);
+        board.toggle(5, 0);
         assert!(board.panels[4].is_empty());
-        board.toggle(5);
+        board.toggle(5, 0);
         assert!(board.contains(5));
         assert_eq!(board.panels[MAX_SLOTS - 1], [0]);
         assert_eq!(board.panels.len(), MAX_SLOTS);
+    }
+
+    #[test]
+    fn adding_sensors_fills_vacant_slots_from_the_visible_row() {
+        let mut board = Board::new([0, 1, 2, 3]);
+        assert!(board.move_panel(1, 8));
+
+        board.toggle(5, 4);
+        assert_eq!(board.panels[4], [5]);
+        assert!(board.panels[1].is_empty());
+
+        board.toggle(6, 0);
+        assert_eq!(board.panels[1], [6]);
+        assert_eq!(board.panels[8], [1]);
+        assert_eq!(board.panels.len(), 9);
     }
 
     #[test]
@@ -553,7 +574,7 @@ mod tests {
         assert!(board.set_color(5, Some(0x00ff_0000)));
         assert!(board.merge(1, 0));
         assert!(board.split(0));
-        board.toggle(5);
+        board.toggle(5, 0);
         board.reset_selection([6, 5]);
         assert_eq!(board.color(5), Some(0x00ff_0000));
         assert!(board.set_color(5, None));
@@ -581,10 +602,10 @@ mod tests {
     fn toggles_and_reset_keep_each_sensor_visible_at_most_once() {
         let mut board = Board::new([5, 6, 5, usize::MAX]);
         assert!(board.merge(1, 0));
-        board.toggle(5);
+        board.toggle(5, 0);
         assert!(!board.contains(5));
         assert_eq!(board.panels, [vec![6]]);
-        board.toggle(5);
+        board.toggle(5, 0);
         assert!(board.contains(5));
         assert_eq!(board.panels, [vec![6], vec![5]]);
         board.columns = 3;

@@ -50,13 +50,15 @@ Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. Na prime
 
 Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Pressione `Esc` para cancelar. Arraste uma borda ou um canto para redimensionar. Ao reabrir, o painel restaura a última posição.
 
-- **Atualização** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
-- **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas. Na primeira abertura, o ARGOS mostra quatro gráficos numa linha, na ordem de uso da CPU, temperatura da CPU, RAM usada e FPS. Quando os painéis excedem o espaço da grade, navegue pelas páginas.
+- **Taxa de amostragem** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
+- **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas visíveis. Na primeira abertura, o ARGOS mostra quatro gráficos numa linha, na ordem de uso da CPU, temperatura da CPU, RAM usada e FPS. Novos sensores ocupam os espaços livres. Use a roda do mouse ou a barra de rolagem à direita para ver os gráficos que ficam abaixo.
 - **Sensores** (`F2`) escolhe as curvas visíveis. Clique com o botão direito num gráfico e use **Mesclar com** para sobrepor curvas da mesma unidade. O menu lista as curvas do painel e oferece **Separar gráficos** para devolver cada uma ao seu próprio painel.
-- **Quadros do jogo** segue o aplicativo em foco por padrão e mostra o estado da captura. Você pode escolher um executável específico ou usar **Desativado** para encerrar a captura. Na seção **Gráficos exibidos**, marque separadamente o FPS, o frametime e a espera da CPU.
+- **FPS** segue o aplicativo em foco por padrão e mostra o estado da captura. Você pode escolher um executável específico ou usar **Desativado** para encerrar a captura. Na seção **Gráficos exibidos**, marque separadamente o FPS, o frametime e a espera da CPU.
 - **Histórico** (`F3`) alterna entre 30 segundos, 1 minuto, 2 minutos e 5 minutos.
 - Arraste um gráfico para posicioná-lo em um espaço livre ou para trocar de lugar com outro. O menu **Mover painel para** também permite escolher uma posição em outra página.
 - Ao clicar em um gráfico, o menu também permite escolher ou restaurar a cor de cada curva, inclusive em gráficos mesclados.
+
+O menu permanece aberto ao ajustar as configurações. Clique fora dele ou pressione `Esc` para fechá-lo.
 
 O traçado ocupa a maior parte do painel, com fundo preto, quadriculado fino e unidade ao lado do valor atual. A escala vertical fica fixa durante a sessão. Percentuais e temperatura vão de 0 a 100. Memória usa a capacidade detectada, e potência e clocks usam limites informados pelo driver quando disponíveis. Uma leitura atual fora da escala mantém seu valor e recebe uma seta. [Consultas de dispositivos da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html)
 
@@ -64,17 +66,17 @@ Mínimo, máximo e média simples usam as leituras válidas do período selecion
 
 O ARGOS salva a posição e o tamanho da janela, a grade, as posições dos gráficos, os sensores, as mesclagens, as cores, a frequência e o período em `%LOCALAPPDATA%\ARGOS\dashboard.cfg`.
 
-### Quadros do jogo
+### FPS
 
-O ARGOS começa no modo **Aplicativo em foco**. Enquanto você interage com o painel, o ARGOS mantém o último aplicativo acompanhado. O menu **Quadros do jogo** permite escolher outro modo de captura para a sessão atual. A escolha do aplicativo e a visibilidade dos gráficos são independentes. A captura usa eventos do Windows para chamadas `Present()` do DXGI e do Direct3D 9. O Windows exige execução como administrador ou uma conta no grupo **Performance Log Users** para essa sessão. O menu mostra quando a captura está indisponível. [Permissões do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew#return-value)
+O ARGOS começa no modo **Aplicativo em foco**. Enquanto você interage com o painel, o ARGOS mantém o último aplicativo acompanhado. O menu **FPS** permite escolher outro modo de captura para a sessão atual. A escolha do aplicativo e a visibilidade dos gráficos são independentes. A captura usa eventos do Windows para chamadas `Present()` do DXGI e do Direct3D 9. O Windows exige execução como administrador ou uma conta no grupo **Performance Log Users** para essa sessão. O menu mostra quando a captura está indisponível. [Permissões do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew#return-value)
 
 | Sensor | Medição |
 | --- | --- |
 | FPS apresentado | Taxa calculada a partir dos intervalos entre apresentações bem-sucedidas na cadeia de apresentação mais ativa do processo. |
-| Frametime (pico 1 s) | Maior intervalo entre inícios de chamadas `Present()` na janela de eventos mais recente. |
-| Espera CPU (pico 1 s) | Maior tempo que a thread passou dentro de `Present()` na janela de eventos mais recente. |
+| Frametime (pico) | Maior intervalo entre inícios de chamadas `Present()` na janela de amostragem mais recente. |
+| Espera CPU (pico) | Maior tempo que a thread passou dentro de `Present()` na janela de amostragem mais recente. |
 
-Os três sensores usam uma janela de até 1 s de eventos. As medições se referem a apresentações do aplicativo. Quadros efetivamente exibidos, quadros gerados pelo driver e espera da GPU exigem outras fontes de eventos. O Windows pode entregar eventos em lotes, mesmo com o painel configurado para atualizar a cada 100 ms. Os tempos são calculados a partir dos relógios dos próprios eventos. [Entrega de buffers do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties) · [Cálculo da espera no PresentMon](https://github.com/GameTechDev/PresentMon/blob/main/IntelPresentMon/CommonUtilities/mc/MetricsCalculatorCpuGpu.cpp#L35-L49)
+O FPS usa uma janela de até 1 s. O frametime e a espera da CPU usam o intervalo definido em **Taxa de amostragem**. As medições se referem a apresentações do aplicativo. Quadros efetivamente exibidos, quadros gerados pelo driver e espera da GPU exigem outras fontes de eventos. O Windows pode entregar eventos em lotes, mesmo com o painel configurado para atualizar a cada 100 ms. Os tempos são calculados a partir dos relógios dos próprios eventos. [Entrega de buffers do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties) · [Cálculo da espera no PresentMon](https://github.com/GameTechDev/PresentMon/blob/main/IntelPresentMon/CommonUtilities/mc/MetricsCalculatorCpuGpu.cpp#L35-L49)
 
 ### Temperatura da CPU
 
