@@ -1,40 +1,73 @@
 use std::fmt::Display;
 
-use crate::cli::Options;
-use crate::nvml::{Device, Nvml};
+use crate::adlx;
+use crate::cli::{GpuIndex, Options};
+use crate::gpu::{self, Inventory, Selection};
+use crate::nvml::Device;
 use crate::system;
 
 pub(crate) fn run(options: Options) -> Result<(), String> {
     println!("ARGOS {} — sonda de telemetria", env!("CARGO_PKG_VERSION"));
     system::report();
 
+    let inventory = Inventory::discover();
     println!("\nNVIDIA NVML");
-    let nvml = Nvml::load().map_err(|error| error.to_string())?;
-    print_value("Driver NVIDIA", nvml.driver_version());
-    print_value("Versão da NVML", nvml.library_version());
-    let count = nvml
-        .device_count()
-        .map_err(|error| format!("falha ao enumerar as GPUs NVIDIA ({error})"))?;
-    println!("  GPUs enumeradas pela NVML: {count}");
-
-    let indices = match options.gpu {
-        Some(index) if index < count => index..index + 1,
-        Some(index) => return Err(format!("índice NVML {index} fora da lista de GPUs")),
-        None if count == 0 => {
-            println!("  Nenhuma GPU NVIDIA encontrada pela NVML.");
-            return Ok(());
+    let nvidia_count = match inventory.nvml() {
+        Ok(nvml) => {
+            print_value("Driver NVIDIA", nvml.driver_version());
+            print_value("Versão da NVML", nvml.library_version());
+            let count = nvml.device_count();
+            let enumerated = count.as_ref().copied().unwrap_or(0);
+            print_value("GPUs enumeradas pela NVML", count);
+            enumerated
         }
-        None => 0..count,
+        Err(error) => {
+            println!("  NVML: indisponível ({error})");
+            0
+        }
     };
 
+    println!("\nAMD ADLX");
+    if let Some(error) = inventory.adlx_error() {
+        println!("  ADLX: indisponível ({error})");
+    } else {
+        let count = inventory
+            .devices()
+            .iter()
+            .filter(|device| matches!(device.index, GpuIndex::Radeon(_)))
+            .count();
+        println!("  GPUs enumeradas pela ADLX: {count}");
+    }
+
+    let devices = match options.gpu {
+        Some(index) => inventory
+            .resolve(&Selection::Index(index))?
+            .map_or(&[][..], std::slice::from_ref),
+        None => inventory.devices(),
+    };
+    if devices.is_empty() && nvidia_count == 0 {
+        if inventory.nvml().is_err() && inventory.adlx_error().is_some() {
+            return Err("não foi possível consultar GPUs pela NVML ou pela ADLX".into());
+        }
+        println!("  Nenhuma GPU compatível encontrada.");
+        return Ok(());
+    }
+
     let mut opened = false;
-    for index in indices {
-        println!("\nGPU NVIDIA {index}");
-        match nvml.device(index) {
-            Ok(device) => {
+    for info in devices {
+        match info.index {
+            GpuIndex::Nvidia(index) => println!("\nGPU NVIDIA {index}"),
+            GpuIndex::Radeon(index) => println!("\nGPU Radeon {index}"),
+        }
+        match inventory.open(info.index) {
+            Ok(gpu::Device::Nvidia(device)) => {
                 opened = true;
                 report_baseline(&device);
                 report_gpm(&device, &options);
+            }
+            Ok(gpu::Device::Radeon(device)) => {
+                opened = true;
+                report_radeon(&device);
             }
             Err(error) => println!("  Acesso indisponível ({error})"),
         }
@@ -63,7 +96,7 @@ fn report_baseline(device: &Device<'_>) {
         }),
     );
     print_value(
-        "Atividade geral da GPU e da memória",
+        "Atividade da GPU e da VRAM",
         device.utilization().map(|usage| {
             format!(
                 "{}% do tempo com kernels em execução / {}% com leitura ou escrita na memória",
@@ -82,20 +115,20 @@ fn report_baseline(device: &Device<'_>) {
             .map(|value| format!("{:.2} W", f64::from(value) / 1_000.0)),
     );
     print_value(
-        "Clock gráfico",
+        "Clock gráfico da GPU",
         device
             .graphics_clock_mhz()
             .map(|value| format!("{value} MHz")),
     );
     print_value(
-        "Clock da memória",
+        "Clock da VRAM",
         device
             .memory_clock_mhz()
             .map(|value| format!("{value} MHz")),
     );
     for (engine, utilization) in [
-        ("NVENC", device.encoder_utilization()),
-        ("NVDEC", device.decoder_utilization()),
+        ("Codificação da GPU (NVENC)", device.encoder_utilization()),
+        ("Decodificação da GPU (NVDEC)", device.decoder_utilization()),
     ] {
         print_value(
             engine,
@@ -107,6 +140,49 @@ fn report_baseline(device: &Device<'_>) {
             }),
         );
     }
+}
+
+fn report_radeon(device: &adlx::Device<'_>) {
+    println!("  Modelo: {}", device.name());
+    let total = device.total_vram_mib();
+    print_adlx_value("VRAM total", total, "MiB", 1);
+    let sample = match device.current_sample() {
+        Ok(sample) => sample,
+        Err(error) => {
+            println!("  Métricas ADLX: indisponíveis ({error})");
+            return;
+        }
+    };
+    let free = total
+        .zip(sample.vram_used_mib)
+        .and_then(|(total, used)| (used >= 0.0 && used <= total).then_some(total - used));
+    for (label, value, unit, precision) in [
+        ("VRAM em uso", sample.vram_used_mib, "MiB", 1),
+        ("VRAM livre", free, "MiB", 1),
+        (
+            "Memória compartilhada em uso",
+            sample.shared_memory_mib,
+            "MiB",
+            1,
+        ),
+        ("Uso da GPU", sample.usage_percent, "%", 1),
+        ("Temperatura da GPU", sample.temperature, "°C", 1),
+        ("Potência total da placa", sample.board_power_watts, "W", 2),
+        ("Clock gráfico da GPU", sample.graphics_clock_mhz, "MHz", 0),
+        ("Clock da VRAM", sample.memory_clock_mhz, "MHz", 0),
+    ] {
+        print_adlx_value(label, value, unit, precision);
+    }
+}
+
+fn print_adlx_value(label: &str, value: Option<f64>, unit: &str, precision: usize) {
+    print_value(
+        label,
+        value
+            .filter(|value| value.is_finite())
+            .map(|value| format!("{value:.precision$} {unit}"))
+            .ok_or("driver não informou a leitura"),
+    );
 }
 
 fn report_gpm(device: &Device<'_>, options: &Options) {

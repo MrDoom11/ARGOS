@@ -1,0 +1,13 @@
+• Modo dropdown — abra o painel no topo do monitor escolhido com o mouse ou um atalho global configurável. Ajuste e visualize a faixa de ativação ou fixe o painel aberto. O tamanho e os gráficos vêm do modo normal, com coleta contínua mesmo recolhido.
+
+• Aparência — temas claro e escuro e fundo de 0% a 100% de opacidade nos dois modos. Textos e curvas continuam opacos. Abaixo de 100%, a faixa superior de 10 pixels dá acesso ao menu e os demais cliques passam para o aplicativo de baixo.
+
+• Menus — visual inspirado no Windows 11, com ícones, temas e fechamento ao clicar fora. Em Sobre o ARGOS, veja a versão, a licença e o link para as versões no GitHub.
+
+• CPU e RAM — novos gráficos de RAM disponível e potência média do pacote da CPU. A potência depende do processador AMD ou Intel e do componente ARGOS Sensor de CPU atualizado.
+
+• GPUs Radeon — sensores de temperatura, atividade, clocks, VRAM, RAM compartilhada e potência conforme a placa e o driver. O vídeo mostra codificação e decodificação ou o motor compartilhado, conforme o Windows reporta.
+
+• Várias GPUs — selecione placas NVIDIA e Radeon em GPUs monitoradas, com gráficos e histórico por placa. O console também aceita múltiplas GPUs em watch e índices Radeon como amd:0.
+
+• Gráficos e preferências — nomes mais claros para métricas de CPU, GPU, FPS e contadores NVIDIA, com a GPU identificada na legenda. O painel reaproveita o layout da 0.2.x na primeira abertura e guarda os ajustes da 0.3.0 separadamente.

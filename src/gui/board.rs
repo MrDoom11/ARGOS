@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -5,9 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+
+use super::appearance::{Appearance, OPACITIES, Theme};
 use crate::watch::{
-    CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX,
-    sensor_catalog,
+    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CpuMetrics, FRAME_SENSOR_START,
+    GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
 };
 
 pub(super) const MAX_COLUMNS: usize = 6;
@@ -21,11 +25,145 @@ pub(super) const INITIAL_SENSORS: [usize; 4] = [
 ];
 
 const VERSION: &str = "version=1";
-const MAX_CONFIG_BYTES: u64 = 8192;
+const DASHBOARD_CONFIG: &str = "dashboard-multi.cfg";
+const LEGACY_DASHBOARD_CONFIG: &str = "dashboard.cfg";
+const DROPDOWN_CONFIG: &str = "dropdown.conf";
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_DROPDOWN_CONFIG_BYTES: u64 = 8192;
+const MAX_GPU_BINDINGS: usize = MAX_SLOTS * CPU_USAGE_INDEX;
 const PERIOD_SECONDS: [u32; 4] = [30, 60, 120, 300];
 const DEFAULT_REFRESH_MS: u32 = 1000;
 const MAX_COLORREF: u32 = 0x00ff_ffff;
+const MAX_MONITOR_ID_BYTES: usize = 512;
 static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DropdownSettings {
+    pub(super) enabled: bool,
+    pub(super) monitor: Option<String>,
+    pub(super) alignment: u8,
+    pub(super) width: u8,
+    pub(super) hotkey: Option<DropdownHotkey>,
+}
+
+impl Default for DropdownSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            monitor: None,
+            alignment: 50,
+            width: 30,
+            hotkey: None,
+        }
+    }
+}
+
+impl DropdownSettings {
+    fn encode(&self) -> String {
+        let mut text = format!(
+            "{VERSION}\nenabled={}\nalignment={}\nwidth={}\n",
+            self.enabled, self.alignment, self.width,
+        );
+        if let Some(monitor) = &self.monitor {
+            let _ = writeln!(text, "monitor={}", hex::encode(monitor));
+        }
+        if let Some(DropdownHotkey { modifiers, key }) = self.hotkey {
+            let _ = writeln!(text, "hotkey={modifiers},{key}");
+        }
+        text
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        if text.len() as u64 > MAX_DROPDOWN_CONFIG_BYTES {
+            return None;
+        }
+        let mut lines = text.trim_start_matches('\u{feff}').lines();
+        if lines.next()?.trim() != VERSION {
+            return None;
+        }
+        let mut settings = Self::default();
+        for (key, value) in lines.filter_map(|line| line.split_once('=')) {
+            let value = value.trim();
+            match key.trim() {
+                "enabled" => {
+                    if let Ok(enabled) = value.parse() {
+                        settings.enabled = enabled;
+                    }
+                }
+                "alignment" => {
+                    if let Ok(alignment @ 0..=100) = value.parse() {
+                        settings.alignment = alignment;
+                    }
+                }
+                "width" => {
+                    if let Ok(width @ 5..=100) = value.parse() {
+                        settings.width = width;
+                    }
+                }
+                "monitor" => {
+                    if let Some(monitor) = decode_device_id(value) {
+                        settings.monitor = Some(monitor);
+                    }
+                }
+                "hotkey" => {
+                    if let Some(hotkey) = DropdownHotkey::decode(value) {
+                        settings.hotkey = Some(hotkey);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(settings)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DropdownHotkey {
+    pub(super) modifiers: u32,
+    pub(super) key: u32,
+}
+
+impl DropdownHotkey {
+    pub(super) fn new(modifiers: u32, key: u32) -> Option<Self> {
+        const MODIFIERS: u32 = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN;
+        let vk = u16::try_from(key).ok()?;
+        if modifiers == 0 || modifiers & !MODIFIERS != 0 {
+            return None;
+        }
+        // A F12 é reservada pelo Windows para o depurador.
+        let supported = matches!(
+            vk,
+            VK_0..=VK_9 | VK_A..=VK_Z | VK_F1..=VK_F11 | VK_F13..=VK_F24
+                | VK_NUMPAD0..=VK_DIVIDE | VK_OEM_1..=VK_OEM_3 | VK_OEM_4..=VK_OEM_8
+                | VK_OEM_102 | VK_BACK | VK_TAB | VK_RETURN | VK_ESCAPE | VK_SPACE
+                | VK_PRIOR..=VK_DOWN | VK_INSERT | VK_DELETE
+        );
+        let reserved = match vk {
+            VK_TAB => modifiers & (MOD_ALT | MOD_WIN) != 0,
+            VK_ESCAPE => modifiers & (MOD_ALT | MOD_CONTROL | MOD_WIN) != 0,
+            VK_DELETE => modifiers & (MOD_CONTROL | MOD_ALT) == (MOD_CONTROL | MOD_ALT),
+            VK_F4 => modifiers & MOD_ALT != 0 || modifiers == (MOD_WIN | MOD_CONTROL),
+            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_0..=VK_9 => modifiers & MOD_WIN != 0,
+            VK_SPACE => modifiers & (MOD_ALT | MOD_WIN) != 0,
+            VK_D => modifiers == MOD_WIN || modifiers == (MOD_WIN | MOD_CONTROL),
+            VK_E | VK_I | VK_L | VK_M | VK_P | VK_R | VK_S | VK_X => modifiers == MOD_WIN,
+            _ => false,
+        };
+        (supported && !reserved).then_some(Self { modifiers, key })
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let (modifiers, key) = text.split_once(',')?;
+        Self::new(modifiers.trim().parse().ok()?, key.trim().parse().ok()?)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GpuSensor {
+    gpu_id: String,
+    base: usize,
+    persistent: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Board {
@@ -35,7 +173,11 @@ pub(super) struct Board {
     pub(super) refresh_ms: u32,
     pub(super) panels: Vec<Vec<usize>>,
     pub(super) window_bounds: Option<[i32; 4]>,
+    pub(super) gpu_ids: Vec<String>,
+    pub(super) appearance: Appearance,
+    pub(super) dropdown: DropdownSettings,
     colors: Vec<Option<u32>>,
+    gpu_sensors: Vec<GpuSensor>,
 }
 
 impl Board {
@@ -47,30 +189,143 @@ impl Board {
             refresh_ms: DEFAULT_REFRESH_MS,
             panels: Vec::new(),
             window_bounds: None,
+            gpu_ids: Vec::new(),
+            appearance: Appearance::default(),
+            dropdown: DropdownSettings::default(),
             colors: vec![None; sensor_catalog().count()],
+            gpu_sensors: Vec::new(),
         };
         board.reset_selection(active);
         board
     }
 
     pub(super) fn load() -> Option<Self> {
-        let path = config_path()?;
-        let mut text = String::new();
-        File::open(path)
-            .ok()?
-            .take(MAX_CONFIG_BYTES + 1)
-            .read_to_string(&mut text)
-            .ok()?;
-        Self::decode(&text)
+        Self::load_from(&config_path()?)
+    }
+
+    fn load_from(path: &Path) -> Option<Self> {
+        let dashboard = match File::open(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                File::open(path.with_file_name(LEGACY_DASHBOARD_CONFIG))
+            }
+            result => result,
+        };
+        let mut board = dashboard
+            .ok()
+            .and_then(|file| read_config(file, MAX_CONFIG_BYTES))
+            .and_then(|text| Self::decode(&text));
+        if let Some(dropdown) = File::open(path.with_file_name(DROPDOWN_CONFIG))
+            .ok()
+            .and_then(|file| read_config(file, MAX_DROPDOWN_CONFIG_BYTES))
+            .and_then(|text| DropdownSettings::decode(&text))
+        {
+            board
+                .get_or_insert_with(|| Self::new(INITIAL_SENSORS))
+                .dropdown = dropdown;
+        }
+        board
     }
 
     pub(super) fn save(&self) -> io::Result<()> {
         let path = config_path().ok_or_else(|| io::Error::other("LOCALAPPDATA indisponível"))?;
-        replace_file(&path, self.encode().as_bytes())
+        let text = self.encode();
+        if text.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(io::Error::other(
+                "configuração do painel excede o limite de tamanho",
+            ));
+        }
+        replace_file(&path, text.as_bytes())
+    }
+
+    pub(super) fn save_dropdown(&self) -> io::Result<()> {
+        let path = config_path().ok_or_else(|| io::Error::other("LOCALAPPDATA indisponível"))?;
+        replace_file(
+            &path.with_file_name(DROPDOWN_CONFIG),
+            self.dropdown.encode().as_bytes(),
+        )
     }
 
     pub(super) fn contains(&self, sensor: usize) -> bool {
         self.panels.iter().any(|panel| panel.contains(&sensor))
+    }
+
+    pub(super) fn gpu_sensor(&self, slot: usize) -> Option<(&str, usize)> {
+        let binding = self
+            .gpu_sensors
+            .get(slot.checked_sub(sensor_catalog().count())?)?;
+        Some((&binding.gpu_id, binding.base))
+    }
+
+    pub(super) fn gpu_sensor_slot(&self, gpu_id: &str, base: usize) -> Option<usize> {
+        self.gpu_sensor_index(gpu_id, base)
+            .map(|index| sensor_catalog().count() + index)
+    }
+
+    pub(super) fn register_gpu_sensor(
+        &mut self,
+        gpu_id: &str,
+        persistent: bool,
+        base: usize,
+    ) -> usize {
+        assert!(base < CPU_USAGE_INDEX);
+        let persistent = persistent && is_persistent_gpu_id(gpu_id);
+        if let Some(index) = self.gpu_sensor_index(gpu_id, base) {
+            self.gpu_sensors[index].persistent |= persistent;
+            return sensor_catalog().count() + index;
+        }
+        let slot = self.colors.len();
+        self.gpu_sensors.push(GpuSensor {
+            gpu_id: gpu_id.to_owned(),
+            base,
+            persistent,
+        });
+        self.colors.push(None);
+        slot
+    }
+
+    fn gpu_sensor_index(&self, gpu_id: &str, base: usize) -> Option<usize> {
+        self.gpu_sensors
+            .iter()
+            .position(|binding| binding.base == base && binding.gpu_id == gpu_id)
+    }
+
+    pub(super) fn bind_legacy_gpu(&mut self, gpu_id: &str) -> bool {
+        if !is_persistent_gpu_id(gpu_id) {
+            return false;
+        }
+        let mut changed = false;
+        for base in 0..CPU_USAGE_INDEX {
+            if !self.contains(base) && self.color(base).is_none() {
+                continue;
+            }
+            let slot = self.register_gpu_sensor(gpu_id, true, base);
+            let already_bound = self.contains(slot);
+            for panel in &mut self.panels {
+                if already_bound {
+                    panel.retain(|&sensor| sensor != base);
+                } else if let Some(sensor) = panel.iter_mut().find(|sensor| **sensor == base) {
+                    *sensor = slot;
+                }
+            }
+            if let Some(color) = self.colors[base].take() {
+                self.colors[slot].get_or_insert(color);
+            }
+            changed = true;
+        }
+        self.trim_empty_tail();
+        changed
+    }
+
+    pub(super) fn sensor_unit(&self, slot: usize) -> Option<&'static str> {
+        let base = self.gpu_sensor(slot).map_or(slot, |(_, base)| base);
+        sensor_catalog().nth(base).map(|(_, unit)| unit)
+    }
+
+    pub(super) fn cpu_metrics(&self) -> CpuMetrics {
+        CpuMetrics {
+            temperature: self.contains(CPU_TEMPERATURE_INDEX),
+            power: self.contains(CPU_POWER_INDEX),
+        }
     }
 
     pub(super) fn color(&self, sensor: usize) -> Option<u32> {
@@ -94,7 +349,7 @@ impl Board {
             if self.panels[index].is_empty() {
                 self.remove_empty_panel(index);
             }
-        } else if sensor_catalog().nth(sensor).is_some() {
+        } else if self.sensor_unit(sensor).is_some() {
             let first_slot = first_slot.min(self.panels.len());
             if let Some(slot) = (first_slot..MAX_SLOTS)
                 .chain(0..first_slot)
@@ -175,7 +430,7 @@ impl Board {
     }
 
     pub(super) fn reset_selection(&mut self, active: impl IntoIterator<Item = usize>) {
-        let mut seen = vec![false; sensor_catalog().count()];
+        let mut seen = vec![false; self.colors.len()];
         self.panels = active
             .into_iter()
             .filter(|&sensor| mark_new(&mut seen, sensor))
@@ -205,29 +460,75 @@ impl Board {
 
     fn panel_unit(&self, index: usize) -> Option<&'static str> {
         let sensor = *self.panels.get(index)?.first()?;
-        sensor_catalog().nth(sensor).map(|(_, unit)| unit)
+        self.sensor_unit(sensor)
     }
 
     fn encode(&self) -> String {
         let catalog: Vec<_> = sensor_catalog().collect();
+        let theme = match self.appearance.theme {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        };
         let mut text = format!(
-            "{VERSION}\ncolumns={}\nrows={}\nperiod={}\nrefresh_ms={}\n",
-            self.columns, self.rows, PERIOD_SECONDS[self.period], self.refresh_ms,
+            "{VERSION}\ncolumns={}\nrows={}\nperiod={}\nrefresh_ms={}\ntheme={theme}\nopacity={}\n",
+            self.columns,
+            self.rows,
+            PERIOD_SECONDS[self.period],
+            self.refresh_ms,
+            self.appearance.opacity,
         );
         if let Some([left, top, right, bottom]) = self.window_bounds {
             let _ = writeln!(text, "window={left},{top},{right},{bottom}");
         }
+        for gpu in self.gpu_ids.iter().filter(|id| is_persistent_gpu_id(id)) {
+            let _ = writeln!(text, "gpu={}", hex::encode(gpu));
+        }
         for panel in &self.panels {
-            let keys: Vec<_> = panel.iter().map(|&sensor| catalog[sensor].0).collect();
+            let keys: Vec<_> = panel
+                .iter()
+                .filter_map(|&sensor| self.encode_sensor_key(sensor, &catalog))
+                .collect();
             let _ = writeln!(text, "panel={}", keys.join(","));
         }
-        for ((key, _), &color) in catalog.iter().zip(&self.colors) {
-            if let Some(color) = color {
+        for (sensor, &color) in self.colors.iter().enumerate() {
+            if let Some(color) = color
+                && let Some(key) = self.encode_sensor_key(sensor, &catalog)
+            {
                 let rgb = swap_red_blue(color);
                 let _ = writeln!(text, "color.{key}=#{rgb:06X}");
             }
         }
         text
+    }
+
+    fn encode_sensor_key(&self, slot: usize, catalog: &[(&str, &str)]) -> Option<String> {
+        if let Some(&(key, _)) = catalog.get(slot) {
+            return Some(key.to_owned());
+        }
+        let binding = self.gpu_sensors.get(slot.checked_sub(catalog.len())?)?;
+        binding.persistent.then(|| {
+            format!(
+                "{}@{}",
+                catalog[binding.base].0,
+                hex::encode(&binding.gpu_id)
+            )
+        })
+    }
+
+    fn decode_sensor_key(&mut self, key: &str, catalog: &[(&str, &str)]) -> Option<usize> {
+        let (key, gpu) = key
+            .split_once('@')
+            .map_or((key, None), |(key, gpu)| (key, Some(gpu)));
+        let base = catalog.iter().position(|(id, _)| *id == key)?;
+        let Some(gpu) = gpu else { return Some(base) };
+        if base >= CPU_USAGE_INDEX {
+            return None;
+        }
+        let gpu = decode_persistent_gpu_id(gpu)?;
+        if self.gpu_sensors.len() >= MAX_GPU_BINDINGS {
+            return self.gpu_sensor_slot(&gpu, base);
+        }
+        Some(self.register_gpu_sensor(&gpu, true, base))
     }
 
     fn decode(text: &str) -> Option<Self> {
@@ -239,7 +540,7 @@ impl Board {
             return None;
         }
         let catalog: Vec<_> = sensor_catalog().collect();
-        let mut seen = vec![false; catalog.len()];
+        let mut seen = HashSet::new();
         let mut board = Self::new([]);
         let mut has_panel_entries = false;
         for (key, value) in lines.filter_map(|line| line.split_once('=')) {
@@ -262,9 +563,29 @@ impl Board {
                         board.refresh_ms = refresh_ms;
                     }
                 }
+                "theme" => match value {
+                    "dark" => board.appearance.theme = Theme::Dark,
+                    "light" => board.appearance.theme = Theme::Light,
+                    _ => {}
+                },
+                "opacity" => {
+                    if let Ok(opacity) = value.parse()
+                        && OPACITIES.contains(&opacity)
+                    {
+                        board.appearance.opacity = opacity;
+                    }
+                }
                 "window" => {
                     if let Some(bounds) = parse_window_bounds(value) {
                         board.window_bounds = Some(bounds);
+                    }
+                }
+                "gpu" => {
+                    if board.gpu_ids.len() < MAX_SLOTS
+                        && let Some(gpu) = decode_persistent_gpu_id(value)
+                        && !board.gpu_ids.contains(&gpu)
+                    {
+                        board.gpu_ids.push(gpu);
                     }
                 }
                 "panel" => {
@@ -273,18 +594,20 @@ impl Board {
                     }
                     has_panel_entries |= !value.is_empty();
                     let first = board.panels.len();
-                    for sensor in value
-                        .split(',')
-                        .filter_map(|key| catalog.iter().position(|(id, _)| *id == key.trim()))
-                        .filter(|&sensor| mark_new(&mut seen, sensor))
-                    {
-                        let unit = catalog[sensor].1;
+                    for key in value.split(',').map(str::trim) {
+                        let Some(sensor) = board.decode_sensor_key(key, &catalog) else {
+                            continue;
+                        };
+                        if !seen.insert(sensor) {
+                            continue;
+                        }
+                        let unit = board.sensor_unit(sensor);
                         // Registros editados com unidades distintas viram painéis separados.
-                        if let Some(panel) = board.panels[first..]
-                            .iter_mut()
-                            .find(|panel| catalog[panel[0]].1 == unit)
+                        if let Some(offset) = board.panels[first..]
+                            .iter()
+                            .position(|panel| board.sensor_unit(panel[0]) == unit)
                         {
-                            panel.push(sensor);
+                            board.panels[first + offset].push(sensor);
                         } else if board.panels.len() < MAX_SLOTS {
                             board.panels.push(vec![sensor]);
                         }
@@ -295,8 +618,8 @@ impl Board {
                 }
                 key => {
                     if let Some(key) = key.strip_prefix("color.")
-                        && let Some(sensor) = catalog.iter().position(|(id, _)| *id == key)
                         && let Some(color) = parse_color(value)
+                        && let Some(sensor) = board.decode_sensor_key(key, &catalog)
                     {
                         board.set_color(sensor, Some(color));
                     }
@@ -306,6 +629,27 @@ impl Board {
         board.trim_empty_tail();
         (!has_panel_entries || !board.panels.is_empty()).then_some(board)
     }
+}
+
+fn is_persistent_gpu_id(id: &str) -> bool {
+    id.len() <= MAX_MONITOR_ID_BYTES
+        && !id.chars().any(char::is_control)
+        && id
+            .strip_prefix("nvidia:")
+            .or_else(|| id.strip_prefix("radeon:"))
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn decode_persistent_gpu_id(value: &str) -> Option<String> {
+    decode_device_id(value).filter(|id| is_persistent_gpu_id(id))
+}
+
+fn decode_device_id(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 2 * MAX_MONITOR_ID_BYTES {
+        return None;
+    }
+    let monitor = String::from_utf8(hex::decode(value).ok()?).ok()?;
+    (!monitor.chars().any(char::is_control)).then_some(monitor)
 }
 
 fn parse_window_bounds(value: &str) -> Option<[i32; 4]> {
@@ -345,7 +689,13 @@ fn bounded(text: &str, max: usize) -> Option<usize> {
 pub(super) fn config_path() -> Option<PathBuf> {
     let root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
     root.is_absolute()
-        .then(|| root.join("ARGOS").join("dashboard.cfg"))
+        .then(|| root.join("ARGOS").join(DASHBOARD_CONFIG))
+}
+
+fn read_config(file: File, max_bytes: u64) -> Option<String> {
+    let mut text = String::new();
+    file.take(max_bytes + 1).read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 pub(super) fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -393,14 +743,20 @@ mod tests {
 
     #[test]
     fn merges_compatible_panels_in_place_and_splits_the_result() {
-        let mut board = Board::new([5, 0, 6, 11, 1]);
+        let fp32 = sensor_catalog()
+            .position(|(key, _)| key == "gpm-fp32")
+            .unwrap();
+        let mut board = Board::new([5, 0, 6, fp32, 1]);
         assert!(!board.merge(0, 1));
         assert!(!board.merge(2, 2));
         assert!(board.merge(0, 2));
         assert!(board.merge(2, 1));
-        assert_eq!(board.panels, [vec![0], vec![6, 5, 11], vec![1]]);
+        assert_eq!(board.panels, [vec![0], vec![6, 5, fp32], vec![1]]);
         assert!(board.split(1));
-        assert_eq!(board.panels, [vec![0], vec![6], vec![5], vec![11], vec![1]]);
+        assert_eq!(
+            board.panels,
+            [vec![0], vec![6], vec![5], vec![fp32], vec![1]]
+        );
         assert!(!board.split(1));
     }
 
@@ -427,6 +783,189 @@ mod tests {
         for invalid in ["1,2,3", "1,2,3,4,5", "1,2,0,4", "-2147483648,1,1,2"] {
             let text = format!("{legacy}window={invalid}\n");
             assert_eq!(Board::decode(&text).unwrap().window_bounds, None);
+        }
+    }
+
+    #[test]
+    fn saves_gpu_identity_without_changing_the_sensor_selection() {
+        let mut board = Board::new(INITIAL_SENSORS);
+        assert!(Board::decode(&board.encode()).unwrap().gpu_ids.is_empty());
+        let radeon = r"radeon:pnp:PCI\VEN_1002&DEV_15BF\3&ABC&0&01";
+        let legacy = format!("{}gpu={}\n", board.encode(), hex::encode(radeon));
+        assert_eq!(Board::decode(&legacy).unwrap().gpu_ids, [radeon]);
+        board.gpu_ids = vec![radeon.into(), "nvidia:GPU-123".into()];
+        assert_eq!(Board::decode(&board.encode()).unwrap(), board);
+        let invalid = format!(
+            "{}gpu=666f6f\ngpu={}\n",
+            board.encode(),
+            hex::encode(radeon)
+        );
+        assert_eq!(Board::decode(&invalid).unwrap(), board);
+    }
+
+    #[test]
+    fn same_sensor_on_two_gpus_keeps_independent_series_and_colors() {
+        let mut board = Board::new([]);
+        let nvidia = board.register_gpu_sensor("nvidia:GPU-123", true, 0);
+        let radeon = board.register_gpu_sensor("radeon:pci:01:00.0", true, 0);
+        assert_ne!(nvidia, radeon);
+        assert_eq!(board.register_gpu_sensor("nvidia:GPU-123", true, 0), nvidia);
+        board.toggle(nvidia, 0);
+        board.toggle(radeon, 0);
+        assert!(board.merge(1, 0));
+        assert!(board.set_color(nvidia, Some(0x0012_3456)));
+        assert!(board.set_color(radeon, Some(0x00ab_cdef)));
+
+        let reopened = Board::decode(&board.encode()).unwrap();
+        let [nvidia, radeon] = reopened.panels[0].as_slice() else {
+            panic!("as duas GPUs devem permanecer no painel");
+        };
+        assert_eq!(reopened.gpu_sensor(*nvidia), Some(("nvidia:GPU-123", 0)));
+        assert_eq!(
+            reopened.gpu_sensor(*radeon),
+            Some(("radeon:pci:01:00.0", 0))
+        );
+        assert_eq!(reopened.color(*nvidia), Some(0x0012_3456));
+        assert_eq!(reopened.color(*radeon), Some(0x00ab_cdef));
+    }
+
+    #[test]
+    fn binds_legacy_gpu_charts_and_colors_to_the_persistent_device() {
+        let mut board = Board::new([0, CPU_USAGE_INDEX]);
+        assert!(board.set_color(0, Some(0x0012_3456)));
+        assert!(board.set_color(1, Some(0x0065_4321)));
+        assert!(!board.bind_legacy_gpu("nvidia-session:0"));
+        assert!(board.bind_legacy_gpu("nvidia:GPU-123"));
+        assert!(!board.bind_legacy_gpu("radeon:pci:01:00.0"));
+        assert_eq!(board.panels[1], [CPU_USAGE_INDEX]);
+        assert_eq!(
+            board.gpu_sensor(board.panels[0][0]),
+            Some(("nvidia:GPU-123", 0))
+        );
+        assert_eq!(board.color(board.panels[0][0]), Some(0x0012_3456));
+        assert_eq!(board.color(0), None);
+        let other = board.register_gpu_sensor("nvidia:GPU-123", true, 1);
+        assert_eq!(board.color(other), Some(0x0065_4321));
+        assert_eq!(Board::decode(&board.encode()), Some(board));
+    }
+
+    #[test]
+    fn session_gpu_bindings_are_never_loaded_or_saved() {
+        let mut board = Board::new([CPU_USAGE_INDEX]);
+        let session_id = "radeon-session:0";
+        board.gpu_ids.push(session_id.to_owned());
+        let sensor = board.register_gpu_sensor(session_id, false, 0);
+        board.toggle(sensor, 0);
+        assert!(board.set_color(sensor, Some(0)));
+        assert!(board.move_panel(1, 0));
+
+        let encoded = board.encode();
+        assert!(!encoded.contains('@'));
+        assert!(!encoded.contains("gpu="));
+        let session = hex::encode(session_id);
+        let persistent = hex::encode("nvidia:GPU-123");
+        let temperature = sensor_catalog().next().unwrap().0;
+        let malformed = format!(
+            "{encoded}gpu={session}\npanel={temperature}@{session},cpu-usage@{persistent}\n"
+        );
+        let reopened = Board::decode(&malformed).unwrap();
+        assert!(reopened.gpu_ids.is_empty());
+        assert_eq!(reopened.panels, [vec![], vec![CPU_USAGE_INDEX]]);
+        assert!(reopened.gpu_sensors.is_empty());
+    }
+
+    #[test]
+    fn dropdown_settings_preserve_monitor_position_width_and_hotkey() {
+        let mut board = Board::new(INITIAL_SENSORS);
+        let dashboard = board.encode();
+        board.dropdown = DropdownSettings {
+            enabled: true,
+            monitor: Some(r"\\?\DISPLAY#ARGOS#5&abc&0&UID17#{e6f07b5f}".into()),
+            alignment: 0,
+            width: 100,
+            hotkey: DropdownHotkey::new(MOD_CONTROL | MOD_SHIFT, u32::from(VK_F8)),
+        };
+        assert!(board.dropdown.hotkey.is_some());
+        assert_eq!(
+            DropdownSettings::decode(&board.dropdown.encode()),
+            Some(board.dropdown.clone())
+        );
+        assert_eq!(board.encode(), dashboard);
+    }
+
+    #[test]
+    fn legacy_configuration_leaves_dropdown_disabled() {
+        let legacy = "version=1\ncolumns=3\nrows=2\npanel=cpu-usage\n";
+        let board = Board::decode(legacy).unwrap();
+        assert_eq!(board.dropdown, DropdownSettings::default());
+        assert_eq!((board.columns, board.rows), (3, 2));
+        assert_eq!(board.panels, [vec![CPU_USAGE_INDEX]]);
+    }
+
+    #[test]
+    fn uses_legacy_dashboard_only_until_the_new_file_exists() {
+        let dir = std::env::temp_dir().join(format!("argos-board-test-{}", std::process::id()));
+        let path = dir.join(DASHBOARD_CONFIG);
+        let legacy_path = dir.join(LEGACY_DASHBOARD_CONFIG);
+        let legacy = Board::new([CPU_USAGE_INDEX]);
+        let current = Board::new([CPU_TEMPERATURE_INDEX]);
+        replace_file(&legacy_path, legacy.encode().as_bytes()).unwrap();
+        assert_eq!(Board::load_from(&path), Some(legacy));
+
+        replace_file(&path, current.encode().as_bytes()).unwrap();
+        assert_eq!(Board::load_from(&path), Some(current));
+        replace_file(&path, b"version=invalid\n").unwrap();
+        assert_eq!(Board::load_from(&path), None);
+        assert!(legacy_path.is_file());
+
+        fs::remove_file(path).unwrap();
+        fs::remove_file(legacy_path).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_dropdown_settings_keep_defaults() {
+        let monitor = hex::encode("display\r\nrows=4");
+        let text = format!(
+            "version=1\nenabled=1\nalignment=101\nwidth=4\n\
+             monitor={monitor}\nhotkey={MOD_CONTROL},{VK_F12}\n"
+        );
+        assert_eq!(
+            DropdownSettings::decode(&text),
+            Some(DropdownSettings::default())
+        );
+        assert_eq!(DropdownSettings::decode("version=2\nenabled=true\n"), None);
+        for invalid in ["", "f", "gg", "ff", "00"] {
+            assert_eq!(decode_device_id(invalid), None);
+        }
+    }
+
+    #[test]
+    fn dropdown_hotkeys_require_supported_keys_and_modifiers() {
+        for (modifiers, key) in [
+            (0, VK_A),
+            (MOD_CONTROL | MOD_NOREPEAT, VK_A),
+            (MOD_CONTROL, VK_CONTROL),
+            (MOD_CONTROL, VK_F12),
+            (MOD_CONTROL | MOD_ALT, VK_DELETE),
+            (MOD_CONTROL | MOD_SHIFT, VK_ESCAPE),
+            (MOD_ALT | MOD_SHIFT, VK_TAB),
+            (MOD_ALT, VK_F4),
+            (MOD_WIN, VK_L),
+        ] {
+            assert_eq!(DropdownHotkey::new(modifiers, u32::from(key)), None);
+        }
+        assert_eq!(DropdownHotkey::new(MOD_ALT, u32::MAX), None);
+        for (modifiers, key) in [
+            (MOD_ALT, VK_F8),
+            (MOD_CONTROL | MOD_SHIFT, VK_DOWN),
+            (MOD_WIN | MOD_SHIFT, VK_OEM_102),
+        ] {
+            let key = u32::from(key);
+            assert_eq!(
+                DropdownHotkey::new(modifiers, key),
+                Some(DropdownHotkey { modifiers, key })
+            );
         }
     }
 
@@ -494,13 +1033,16 @@ mod tests {
 
     #[test]
     fn sparse_merge_split_and_toggle_leave_other_occupied_slots_in_place() {
-        let mut board = Board::new([0, 5, 6, 11]);
+        let fp32 = sensor_catalog()
+            .position(|(key, _)| key == "gpm-fp32")
+            .unwrap();
+        let mut board = Board::new([0, 5, 6, fp32]);
         assert!(board.move_panel(0, MAX_SLOTS - 1));
         assert!(board.merge(1, 3));
         assert!(board.panels[1].is_empty());
-        assert_eq!(board.panels[3], [11, 5]);
+        assert_eq!(board.panels[3], [fp32, 5]);
         assert!(board.split(3));
-        assert_eq!(board.panels[3], [11]);
+        assert_eq!(board.panels[3], [fp32]);
         assert_eq!(board.panels[4], [5]);
         board.toggle(5, 0);
         assert!(board.panels[4].is_empty());
@@ -546,6 +1088,21 @@ mod tests {
         assert_eq!(board.panels, [vec![0]]);
         assert_eq!(board.refresh_ms, 1000);
         assert_eq!(board.color(0), None);
+    }
+
+    #[test]
+    fn appearance_round_trips_and_rejects_unknown_values() {
+        let legacy = "version=1\npanel=cpu-usage\n";
+        let mut board = Board::decode(legacy).unwrap();
+        assert_eq!(board.appearance.theme, Theme::Dark);
+        assert_eq!(board.appearance.opacity, 100);
+
+        board.appearance.theme = Theme::Light;
+        board.appearance.opacity = 0;
+        let text = board.encode();
+        assert!(text.contains("theme=light\nopacity=0\n"));
+        let malformed = format!("{text}theme=unknown\nopacity=75\nopacity=256\n");
+        assert_eq!(Board::decode(&malformed), Some(board));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
@@ -6,37 +7,41 @@ use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
     DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, Ellipse, FW_NORMAL, FW_SEMIBOLD,
     FillRect, GetStockObject, GetTextExtentPoint32W, HDC, HGDIOBJ, IntersectClipRect,
-    OUT_DEFAULT_PRECIS, PS_SOLID, PolyPolyline, Polyline, RestoreDC, RoundRect, SaveDC,
-    SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor, TRANSPARENT,
+    NONANTIALIASED_QUALITY, OUT_DEFAULT_PRECIS, PS_SOLID, PolyPolyline, Polyline, RestoreDC,
+    RoundRect, SaveDC, SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor,
+    TRANSPARENT,
 };
 
 use crate::watch::{MetricPoint, MetricSnapshot, Reading};
 
-pub(super) const CARD: COLORREF = rgb(0, 0, 0);
-pub(super) const BORDER: COLORREF = rgb(42, 56, 78);
-pub(super) const TEXT: COLORREF = rgb(230, 239, 250);
-pub(super) const MUTED: COLORREF = rgb(151, 169, 191);
-const PLOT: COLORREF = CARD;
-const GRID: COLORREF = rgb(34, 34, 34);
+use super::appearance::Palette;
 
 pub(super) const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+pub(super) struct PaintStyle<'a> {
+    pub(super) fonts: &'a ChartFonts,
+    pub(super) palette: Palette,
 }
 
 pub(super) fn paint(
     dc: HDC,
     rect: RECT,
     dpi: u32,
-    series: &[(&MetricSnapshot, COLORREF)],
+    series: &[(&MetricSnapshot, COLORREF, Option<&str>)],
     at: Instant,
     window: Duration,
-    fonts: &ChartFonts,
+    PaintStyle { fonts, palette }: PaintStyle<'_>,
 ) {
-    let Some(&(first, _)) = series.first() else {
+    let Some(&(first, _, _)) = series.first() else {
         return;
     };
     let unit = first.unit.trim();
-    if series.iter().any(|(metric, _)| metric.unit.trim() != unit) {
+    if series
+        .iter()
+        .any(|(metric, _, _)| metric.unit.trim() != unit)
+    {
         return;
     }
     let px = |dips: i32| (dips * dpi as i32 + 48) / 96;
@@ -48,11 +53,12 @@ pub(super) fn paint(
 
     let views: Vec<_> = series
         .iter()
-        .map(|&(metric, color)| {
+        .map(|&(metric, color, gpu)| {
             let points = visible_points(&metric.points, at, window);
             SeriesView {
                 metric,
                 color,
+                gpu,
                 timeline: Timeline {
                     points,
                     at,
@@ -63,7 +69,7 @@ pub(super) fn paint(
             }
         })
         .collect();
-    let scale = Scale::fixed(series.iter().map(|(metric, _)| metric.axis_max));
+    let scale = Scale::fixed(series.iter().map(|(metric, _, _)| metric.axis_max));
     // Restaurar o contexto evita que uma fonte continue selecionada após o desenho.
     let Some(_state) = SavedDc::new(dc) else {
         return;
@@ -75,8 +81,8 @@ pub(super) fn paint(
         SetBkMode(dc, TRANSPARENT as i32);
         SelectObject(dc, GetStockObject(DC_BRUSH));
         SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCBrushColor(dc, CARD);
-        SetDCPenColor(dc, BORDER);
+        SetDCBrushColor(dc, palette.background);
+        SetDCPenColor(dc, palette.border);
         RoundRect(
             dc,
             rect.left,
@@ -106,7 +112,8 @@ pub(super) fn paint(
         0
     };
     let bottom = rect.bottom - px(2);
-    fonts.detail.select(dc);
+    let font_variant = usize::from(palette.text_outline.is_some());
+    fonts.detail[font_variant].select(dc);
     let gutter = (text_width(dc, &axis_text(scale.high)) + px(5)).min(width / 2);
     let plot = RECT {
         left: left + gutter,
@@ -115,7 +122,7 @@ pub(super) fn paint(
         bottom: bottom - stats_height,
     };
 
-    fonts.legend.select(dc);
+    fonts.legend[font_variant].select(dc);
     paint_legend(
         dc,
         RECT {
@@ -125,18 +132,18 @@ pub(super) fn paint(
             bottom: legend_bottom,
         },
         &views,
-        columns,
-        rows,
+        (columns, rows),
         px(5),
         scale,
+        palette,
     );
     if plot.right <= plot.left || plot.bottom - plot.top < px(5) {
         return;
     }
 
-    fonts.detail.select(dc);
-    draw_grid(dc, plot, px(12).max(1) as usize);
-    draw_ticks(dc, plot, left, px(3), px(10), scale);
+    fonts.detail[font_variant].select(dc);
+    draw_grid(dc, plot, px(12).max(1) as usize, palette);
+    draw_ticks(dc, plot, left, px(3), px(10), scale, palette);
     let weight = px(1).max(1);
     for view in &views {
         draw_trace(dc, plot, view.color, scale, view.timeline, weight);
@@ -153,6 +160,7 @@ pub(super) fn paint(
             },
             &views,
             px(80),
+            palette,
         );
     }
 }
@@ -160,8 +168,22 @@ pub(super) fn paint(
 struct SeriesView<'a> {
     metric: &'a MetricSnapshot,
     color: COLORREF,
+    gpu: Option<&'a str>,
     timeline: Timeline<'a>,
     stats: Option<Statistics>,
+}
+
+impl SeriesView<'_> {
+    fn label(&self, compact: bool) -> Cow<'_, str> {
+        let metric = if compact {
+            compact_name(self.metric.name)
+        } else {
+            self.metric.name
+        };
+        self.gpu.map_or(Cow::Borrowed(metric), |gpu| {
+            Cow::Owned(format!("{gpu} · {metric}"))
+        })
+    }
 }
 
 fn legend_rows(series: usize, columns: i32, room_for_second_row: bool) -> i32 {
@@ -173,10 +195,10 @@ fn paint_legend(
     dc: HDC,
     bounds: RECT,
     views: &[SeriesView<'_>],
-    columns: i32,
-    rows: i32,
+    (columns, rows): (i32, i32),
     marker: i32,
     scale: Scale,
+    palette: Palette,
 ) {
     let column_width = (bounds.right - bounds.left) / columns;
     let row_height = (bounds.bottom - bounds.top) / rows;
@@ -211,23 +233,24 @@ fn paint_legend(
         let current = current_label(view, compact, scale);
         let value_width = (text_width(dc, &current) + 1).min((right - label_left).max(0));
         let label_right = right - value_width - marker / 2;
-        let name = if compact || text_width(dc, view.metric.name) > label_right - label_left {
-            compact_name(view.metric.name)
-        } else {
-            view.metric.name
-        };
+        let mut name = view.label(compact);
+        if !compact && text_width(dc, &name) > label_right - label_left {
+            name = view.label(true);
+        }
         text(
             dc,
             (label_left, top, label_right, bottom),
-            name,
-            TEXT,
+            &name,
+            palette.text,
+            palette.text_outline,
             DT_LEFT,
         );
         text(
             dc,
             (right - value_width, top, right, bottom),
             &current,
-            view.color,
+            palette.text,
+            palette.text_outline,
             DT_RIGHT,
         );
     }
@@ -238,7 +261,14 @@ fn paint_legend(
         } else {
             format!("+{hidden} curvas")
         };
-        text(dc, cell(visible), &label, MUTED, DT_LEFT);
+        text(
+            dc,
+            cell(visible),
+            &label,
+            palette.muted,
+            palette.text_outline,
+            DT_LEFT,
+        );
     }
 }
 
@@ -272,16 +302,35 @@ fn compact_name(name: &str) -> &str {
     match name {
         "Temperatura da GPU" => "Temp. GPU",
         "Temperatura da CPU" => "Temp. CPU",
-        "VRAM · atividade" => "VRAM ativa",
-        "Atividade dos SMs" => "SMs ativos",
-        "Ocupação dos SMs" => "Ocup. SMs",
-        "VRAM · largura de banda" => "VRAM · banda",
-        "Uso de CPU" => "CPU",
+        "Potência da GPU" => "Pot. GPU",
+        "Potência da CPU" => "Pot. CPU",
+        "Atividade da GPU" => "Ativ. GPU",
+        "Uso da CPU" => "Uso CPU",
+        "Tempo ativo da VRAM" => "VRAM ativa",
+        "Uso da banda da VRAM" => "Banda VRAM",
+        "Clock gráfico da GPU" => "Clock GPU",
+        "Clock da VRAM" => "Clock VRAM",
+        "RAM compartilhada da GPU" => "RAM GPU",
+        "Codificação da GPU (NVENC)" => "NVENC",
+        "Decodificação da GPU (NVDEC)" => "NVDEC",
+        "Codificação de vídeo da GPU (Radeon)" => "Encode AMD",
+        "Decodificação de vídeo da GPU (Radeon)" => "Decode AMD",
+        "Uso do motor de vídeo da GPU (Radeon)" => "Vídeo AMD",
+        "Ocupação de warps nos SMs" => "Ocup. warps",
+        "FPS do aplicativo" => "FPS do app",
+        "Intervalo entre quadros (pico)" => "Quadro pico",
+        "Tempo em Present() (pico)" => "Present() pico",
         _ => name.strip_prefix("Atividade ").unwrap_or(name),
     }
 }
 
-fn paint_statistics(dc: HDC, bounds: RECT, views: &[SeriesView<'_>], label_width: i32) {
+fn paint_statistics(
+    dc: HDC,
+    bounds: RECT,
+    views: &[SeriesView<'_>],
+    label_width: i32,
+    palette: Palette,
+) {
     let row_height = (bounds.bottom - bounds.top) / views.len() as i32;
     let multiple = views.len() > 1;
     for (index, view) in views.iter().enumerate() {
@@ -292,8 +341,9 @@ fn paint_statistics(dc: HDC, bounds: RECT, views: &[SeriesView<'_>], label_width
             text(
                 dc,
                 (left, top, left + label_width, bottom),
-                compact_name(view.metric.name),
-                view.color,
+                &view.label(true),
+                palette.text,
+                palette.text_outline,
                 DT_LEFT,
             );
             left += label_width;
@@ -309,7 +359,14 @@ fn paint_statistics(dc: HDC, bounds: RECT, views: &[SeriesView<'_>], label_width
                 )
             },
         );
-        text(dc, (left, top, bounds.right, bottom), &line, MUTED, DT_LEFT);
+        text(
+            dc,
+            (left, top, bounds.right, bottom),
+            &line,
+            palette.muted,
+            palette.text_outline,
+            DT_LEFT,
+        );
     }
 }
 
@@ -414,11 +471,11 @@ fn grid_offsets(length: i32, step: usize) -> impl Iterator<Item = i32> {
     (0..length).step_by(step).chain(std::iter::once(length))
 }
 
-fn draw_grid(dc: HDC, plot: RECT, step: usize) {
-    fill(dc, plot, PLOT);
+fn draw_grid(dc: HDC, plot: RECT, step: usize, palette: Palette) {
+    fill(dc, plot, palette.plot);
     unsafe {
         SelectObject(dc, GetStockObject(DC_PEN));
-        SetDCPenColor(dc, GRID);
+        SetDCPenColor(dc, palette.grid);
     }
     let width = plot.right - plot.left - 1;
     let height = plot.bottom - plot.top - 1;
@@ -448,21 +505,31 @@ fn draw_grid(dc: HDC, plot: RECT, step: usize) {
     unsafe { PolyPolyline(dc, points.as_ptr(), lengths.as_ptr(), lengths.len() as u32) };
 }
 
-fn draw_ticks(dc: HDC, plot: RECT, left: i32, margin: i32, label_height: i32, scale: Scale) {
+fn draw_ticks(
+    dc: HDC,
+    plot: RECT,
+    left: i32,
+    margin: i32,
+    label_height: i32,
+    scale: Scale,
+    palette: Palette,
+) {
     let right = plot.left - margin;
     let label_height = label_height.min((plot.bottom - plot.top) / 2);
     text(
         dc,
         (left, plot.top, right, plot.top + label_height),
         &axis_text(scale.high),
-        MUTED,
+        palette.muted,
+        palette.text_outline,
         DT_RIGHT,
     );
     text(
         dc,
         (left, plot.bottom - label_height, right, plot.bottom),
         &axis_text(scale.low),
-        MUTED,
+        palette.muted,
+        palette.text_outline,
         DT_RIGHT,
     );
 }
@@ -575,8 +642,15 @@ fn text_units(value: &str, units: &mut [u16]) -> i32 {
     count
 }
 
-fn text(dc: HDC, bounds: (i32, i32, i32, i32), value: &str, color: COLORREF, align: u32) {
-    let mut rect = RECT {
+pub(super) fn text(
+    dc: HDC,
+    bounds: (i32, i32, i32, i32),
+    value: &str,
+    color: COLORREF,
+    outline: Option<COLORREF>,
+    align: u32,
+) {
+    let rect = RECT {
         left: bounds.0,
         top: bounds.1,
         right: bounds.2,
@@ -588,16 +662,23 @@ fn text(dc: HDC, bounds: (i32, i32, i32, i32), value: &str, color: COLORREF, ali
     // The dashboard strings are short. Keep their UTF-16 representation on the stack.
     let mut units = [0; 128];
     let count = text_units(value, &mut units);
-    unsafe {
-        SetTextColor(dc, color);
-        DrawTextW(
-            dc,
-            units.as_ptr(),
-            count,
-            &mut rect,
-            align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
+    let flags = align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+    let draw = |mut bounds: RECT| unsafe {
+        DrawTextW(dc, units.as_ptr(), count, &mut bounds, flags);
+    };
+    if let Some(outline) = outline {
+        unsafe { SetTextColor(dc, outline) };
+        for (x, y) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            draw(RECT {
+                left: rect.left + x,
+                right: rect.right + x,
+                top: rect.top + y,
+                bottom: rect.bottom + y,
+            });
+        }
     }
+    unsafe { SetTextColor(dc, color) };
+    draw(rect);
 }
 
 struct SavedDc {
@@ -625,22 +706,23 @@ impl Drop for SavedDc {
 struct Object(HGDIOBJ);
 
 pub(super) struct ChartFonts {
-    legend: Object,
-    detail: Object,
+    legend: [Object; 2],
+    detail: [Object; 2],
 }
 
 impl ChartFonts {
     pub(super) fn new(dpi: u32) -> Self {
         let px = |dips: i32| (dips * dpi as i32 + 48) / 96;
+        let qualities = [ANTIALIASED_QUALITY, NONANTIALIASED_QUALITY];
         Self {
-            legend: Object::font(px(11), FW_SEMIBOLD),
-            detail: Object::font(px(10), FW_NORMAL),
+            legend: qualities.map(|quality| Object::font(px(11), FW_SEMIBOLD, quality)),
+            detail: qualities.map(|quality| Object::font(px(10), FW_NORMAL, quality)),
         }
     }
 }
 
 impl Object {
-    fn font(height: i32, weight: u32) -> Self {
+    fn font(height: i32, weight: u32, quality: u8) -> Self {
         let name: [u16; 9] = [83, 101, 103, 111, 101, 32, 85, 73, 0]; // Segoe UI
         Self(unsafe {
             CreateFontW(
@@ -655,7 +737,7 @@ impl Object {
                 DEFAULT_CHARSET as u32,
                 OUT_DEFAULT_PRECIS as u32,
                 CLIP_DEFAULT_PRECIS as u32,
-                ANTIALIASED_QUALITY as u32,
+                quality as u32,
                 DEFAULT_PITCH as u32,
                 name.as_ptr(),
             )
