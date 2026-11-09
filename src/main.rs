@@ -1,6 +1,8 @@
 use std::process::ExitCode;
 
 #[cfg(windows)]
+mod adlx;
+#[cfg(windows)]
 mod cli;
 #[cfg(windows)]
 mod cpu_sensor;
@@ -10,6 +12,10 @@ mod cpu_temperature;
 mod desktop;
 #[cfg(windows)]
 mod frames;
+#[cfg(windows)]
+mod gpu;
+#[cfg(windows)]
+mod gpu_video;
 #[cfg(windows)]
 mod gui;
 #[cfg(windows)]

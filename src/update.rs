@@ -16,6 +16,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::w;
 
+pub(crate) const RELEASES_URL: &str = "https://github.com/MrDoom11/ARGOS/releases";
+
 const INSTALL_KEY: *const u16 = w!(
     "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{618CF44B-59D7-424F-89F7-6B2714DF1BD8}_is1"
 );

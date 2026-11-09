@@ -94,7 +94,9 @@ unsafe extern "system" fn service_main(_count: u32, _arguments: *mut *mut u16) {
         let pipe = Pipe::new(PIPE)?;
         report(status, SERVICE_RUNNING, ERROR_SUCCESS);
         let mut cache = SampleCache::default();
-        serve(&pipe, stop.as_raw_handle(), || cache.sample())
+        serve(&pipe, stop.as_raw_handle(), |temperature, power| {
+            cache.sample(temperature, power)
+        })
     })();
     let code = result.map_or_else(
         |error| {
@@ -145,7 +147,11 @@ unsafe extern "system" fn control(
     }
 }
 
-fn serve(pipe: &Pipe, stop: HANDLE, mut sample: impl FnMut() -> i32) -> io::Result<()> {
+fn serve(
+    pipe: &Pipe,
+    stop: HANDLE,
+    mut sample: impl FnMut(bool, bool) -> [i32; 2],
+) -> io::Result<()> {
     while unsafe { WaitForSingleObject(stop, 0) } != WAIT_OBJECT_0 {
         match pipe.operation(stop, IDLE_MS, |overlap, _| unsafe {
             ConnectNamedPipe(pipe.handle.as_raw_handle(), overlap)
@@ -165,52 +171,95 @@ fn serve(pipe: &Pipe, stop: HANDLE, mut sample: impl FnMut() -> i32) -> io::Resu
             Err(error) => return Err(error),
         }
         let mut request = [0];
-        if matches!(pipe.read(stop, &mut request), Ok(1)) && request == [b'T'] {
-            let response = sample().to_le_bytes();
-            if matches!(pipe.write(stop, &response), Ok(4)) {
-                // Wait for the reader to close or acknowledge before discarding unread data.
-                let _ = pipe.read(stop, &mut request);
-            }
+        if matches!(pipe.read(stop, &mut request), Ok(1))
+            && let Some((response, length)) = sample_response(request[0], &mut sample)
+            && pipe.write(stop, &response[..length]).ok() == Some(length as u32)
+        {
+            // Wait for the reader to close or acknowledge before discarding unread data.
+            let _ = pipe.read(stop, &mut request);
         }
         unsafe { DisconnectNamedPipe(pipe.handle.as_raw_handle()) };
     }
     Ok(())
 }
 
+fn sample_response(
+    request: u8,
+    sample: &mut impl FnMut(bool, bool) -> [i32; 2],
+) -> Option<([u8; 8], usize)> {
+    let (temperature, power) = match request {
+        b'T' => (true, false),
+        b'P' => (false, true),
+        b'B' => (true, true),
+        _ => return None,
+    };
+    let [temperature_value, power_value] = sample(temperature, power).map(i32::to_le_bytes);
+    let mut response = [0; 8];
+    response[..4].copy_from_slice(if temperature {
+        &temperature_value
+    } else {
+        &power_value
+    });
+    response[4..].copy_from_slice(&power_value);
+    Some((response, if temperature && power { 8 } else { 4 }))
+}
+
 #[derive(Default)]
 struct SampleCache {
     sensor: Option<CpuTemperature>,
-    sample: Option<(Instant, i32)>,
+    temperature: Option<(Instant, i32)>,
+    power: Option<(Instant, i32)>,
     opened: Option<Instant>,
 }
 
 impl SampleCache {
-    fn sample(&mut self) -> i32 {
+    fn sample(&mut self, temperature: bool, power: bool) -> [i32; 2] {
         let now = Instant::now();
-        if let Some((when, value)) = self.sample
-            && now.duration_since(when) < SAMPLE_INTERVAL
-        {
-            return value;
-        }
         if self.sensor.is_none()
-            && cpu_temperature::supported()
             && self
                 .opened
                 .is_none_or(|when| now.duration_since(when) >= REOPEN_INTERVAL)
+            && cpu_temperature::supported()
         {
             self.opened = Some(now);
             self.sensor = trusted_pawnio().and_then(|()| CpuTemperature::open()).ok();
         }
-        let value = match self.sensor.as_ref().map(CpuTemperature::celsius) {
-            Some(Ok(Some(celsius))) if (0.0..=125.0).contains(&celsius) => {
-                (celsius * 1000.0).round() as i32
-            }
-            Some(Ok(None)) => PENDING,
-            _ => UNAVAILABLE,
+        let temperature = if temperature {
+            cached_sample(&mut self.temperature, now, 125.0, || {
+                self.sensor.as_ref().map(CpuTemperature::celsius)
+            })
+        } else {
+            UNAVAILABLE
         };
-        self.sample = Some((now, value));
-        value
+        let power = if power {
+            cached_sample(&mut self.power, now, 2_000.0, || {
+                self.sensor.as_mut().map(CpuTemperature::watts)
+            })
+        } else {
+            UNAVAILABLE
+        };
+        [temperature, power]
     }
+}
+
+fn cached_sample(
+    cache: &mut Option<(Instant, i32)>,
+    now: Instant,
+    max: f64,
+    read: impl FnOnce() -> Option<io::Result<Option<f64>>>,
+) -> i32 {
+    if let Some((when, value)) = *cache
+        && now.duration_since(when) < SAMPLE_INTERVAL
+    {
+        return value;
+    }
+    let value = match read() {
+        Some(Ok(Some(value))) if (0.0..=max).contains(&value) => (value * 1000.0).round() as i32,
+        Some(Ok(None)) => PENDING,
+        _ => UNAVAILABLE,
+    };
+    *cache = Some((now, value));
+    value
 }
 
 struct Pipe {
@@ -560,13 +609,20 @@ mod tests {
     }
 
     #[test]
-    fn pipe_identifies_its_peer_and_only_answers_temperature_requests() {
+    fn pipe_identifies_its_peer_and_preserves_legacy_temperature_requests() {
         let path = format!(r"\\.\pipe\ARGOS.CpuTemperature.Test.{}", std::process::id());
         let name: Vec<u16> = path.encode_utf16().chain([0]).collect();
         let pipe = Pipe::new(name.as_ptr()).unwrap();
         let stop = event().unwrap();
         std::thread::scope(|scope| {
-            let server = scope.spawn(|| serve(&pipe, stop.as_raw_handle(), || 43_125));
+            let server = scope.spawn(|| {
+                serve(&pipe, stop.as_raw_handle(), |temperature, power| {
+                    [
+                        if temperature { 43_125 } else { UNAVAILABLE },
+                        if power { 52_345 } else { UNAVAILABLE },
+                    ]
+                })
+            });
             let mut invalid = connect(&path);
             invalid.write_all(b"X").unwrap();
             let mut response = [0; 4];
@@ -586,6 +642,18 @@ mod tests {
             client.write_all(b"T").unwrap();
             client.read_exact(&mut response).unwrap();
             assert_eq!(i32::from_le_bytes(response), 43_125);
+            drop(client);
+            let mut client = connect(&path);
+            client.write_all(b"P").unwrap();
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(i32::from_le_bytes(response), 52_345);
+            drop(client);
+            let mut client = connect(&path);
+            client.write_all(b"B").unwrap();
+            let mut pair = [0; 8];
+            client.read_exact(&mut pair).unwrap();
+            assert_eq!(&pair[..4], &43_125i32.to_le_bytes());
+            assert_eq!(&pair[4..], &52_345i32.to_le_bytes());
             drop(client);
             check(unsafe { SetEvent(stop.as_raw_handle()) }).unwrap();
             server.join().unwrap().unwrap();

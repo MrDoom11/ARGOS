@@ -8,10 +8,11 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use semver::Version;
 use serde_json::Value;
 
+use super::RELEASES_URL;
+
 pub(super) const MANIFEST_NAME: &str = "argos-update.json";
 pub(super) const INSTALLER_NAME: &str = "ARGOS-Setup.exe";
 
-const RELEASES_URL: &str = "https://github.com/MrDoom11/ARGOS/releases";
 const MAX_MANIFEST_SIZE: u64 = 4 * 1024;
 const MAX_INSTALLER_SIZE: u64 = 32 * 1024 * 1024;
 

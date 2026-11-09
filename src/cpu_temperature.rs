@@ -5,16 +5,21 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_MOD_NOT_FOUND, ERROR_SUCCESS, FreeLibrary, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
-    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_MOD_NOT_FOUND, ERROR_SUCCESS, FreeLibrary, HANDLE, HMODULE,
+    INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+};
+use windows_sys::Win32::System::SystemInformation::{
+    GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP, RelationProcessorDie,
+    RelationProcessorPackage, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
 };
 use windows_sys::Win32::System::Threading::{
     CreateMutexExW, MUTEX_MODIFY_STATE, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
@@ -28,6 +33,9 @@ const TEMPERATURE_RANGE_FLAG: u32 = 1 << 19;
 const TEMPERATURE_TJ_FLAGS: u32 = 3 << 16;
 const INTEL_PACKAGE_THERM_STATUS: u64 = 0x1b1;
 const INTEL_TEMPERATURE_TARGET: u64 = 0x1a2;
+const INTEL_TEMPERATURE_VALID: u64 = 1 << 31;
+const MAX_PACKAGE_WATTS: f64 = 2_000.0;
+const MAX_POWER_SAMPLE_GAP: Duration = Duration::from_secs(5);
 
 // Public PawnIOLib C ABI. Sizes for execute are counts of u64 entries.
 type Open = unsafe extern "system" fn(*mut HANDLE) -> i32;
@@ -56,8 +64,74 @@ enum Sensor {
 pub(crate) struct CpuTemperature {
     device: OwnedHandle,
     sensor: Sensor,
+    power: Option<PackagePower>,
     execute: Execute,
     _library: PawnIoLibrary,
+}
+
+struct PackagePower {
+    registers: EnergyRegisters,
+    joules_per_tick: Option<f64>,
+    previous: Option<EnergySample>,
+}
+
+#[derive(Clone, Copy)]
+struct EnergyRegisters {
+    unit: u64,
+    counter: u64,
+}
+
+#[derive(Clone, Copy)]
+struct EnergySample {
+    at: Instant,
+    counter: u32,
+}
+
+impl PackagePower {
+    fn sample(&mut self, mut read: impl FnMut(u64) -> io::Result<u64>) -> io::Result<Option<f64>> {
+        // A falha de leitura interrompe o intervalo usado para calcular potência.
+        let previous = self.previous.take();
+        let joules_per_tick = match self.joules_per_tick {
+            Some(unit) => unit,
+            None => {
+                let register = read(self.registers.unit)?;
+                if register == 0 || register == u64::MAX {
+                    return Err(invalid_energy_counter());
+                }
+                let exponent = ((register >> 8) & 0x1f) as i32;
+                let unit = 2_f64.powi(-exponent);
+                self.joules_per_tick = Some(unit);
+                unit
+            }
+        };
+        let register = read(self.registers.counter)?;
+        if register == u64::MAX {
+            return Err(invalid_energy_counter());
+        }
+        let current = EnergySample {
+            at: Instant::now(),
+            counter: register as u32,
+        };
+        self.previous = Some(current);
+        Ok(previous.and_then(|previous| current.watts_since(previous, joules_per_tick)))
+    }
+}
+
+impl EnergySample {
+    fn watts_since(self, previous: Self, joules_per_tick: f64) -> Option<f64> {
+        let interval = self.at.checked_duration_since(previous.at)?;
+        if interval.is_zero() || interval > MAX_POWER_SAMPLE_GAP {
+            return None;
+        }
+        let seconds = interval.as_secs_f64();
+        let counter_span_joules = (f64::from(u32::MAX) + 1.0) * joules_per_tick;
+        if seconds * MAX_PACKAGE_WATTS >= counter_span_joules {
+            return None;
+        }
+        let ticks = self.counter.wrapping_sub(previous.counter);
+        let watts = f64::from(ticks) * joules_per_tick / seconds;
+        (watts <= MAX_PACKAGE_WATTS).then_some(watts)
+    }
 }
 
 impl CpuTemperature {
@@ -88,6 +162,17 @@ impl CpuTemperature {
         let device = unsafe { OwnedHandle::from_raw_handle(device) };
         // The official driver validates and loads the module into this handle.
         check_hresult(unsafe { load(device.as_raw_handle(), blob.as_ptr(), blob.len()) })?;
+        let power = energy_registers(&kind)
+            .filter(|_| single_processor_unit(RelationProcessorPackage))
+            // Alguns Intel têm um contador por die em um mesmo pacote.
+            .filter(|_| {
+                matches!(kind, CpuKind::AmdZen) || single_processor_unit(RelationProcessorDie)
+            })
+            .map(|registers| PackagePower {
+                registers,
+                joules_per_tick: None,
+                previous: None,
+            });
         let sensor = match kind {
             CpuKind::AmdZen => Sensor::AmdZen(pci_mutex()?),
             CpuKind::IntelPackageDts => Sensor::IntelPackageDts,
@@ -96,6 +181,7 @@ impl CpuTemperature {
         Ok(Self {
             device,
             sensor,
+            power,
             execute,
             _library: library,
         })
@@ -117,37 +203,83 @@ impl CpuTemperature {
             Sensor::IntelPackageDts => {
                 let target = self.read(c"ioctl_read_msr", INTEL_TEMPERATURE_TARGET)?;
                 let status = self.read(c"ioctl_read_msr", INTEL_PACKAGE_THERM_STATUS)?;
-                decode_intel_celsius(target, status)
+                return decode_intel_celsius(target, status);
             }
         };
-        temperature
-            .map(Some)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Temperatura inválida"))
+        temperature.map(Some).ok_or_else(invalid_temperature)
+    }
+
+    pub(crate) fn watts(&mut self) -> io::Result<Option<f64>> {
+        let power = self
+            .power
+            .as_mut()
+            .ok_or_else(|| unsupported("Potência do pacote indisponível neste processador"))?;
+        let device = self.device.as_raw_handle();
+        let execute = self.execute;
+        power.sample(|address| read_register(device, execute, c"ioctl_read_msr", address))
     }
 
     fn read(&self, operation: &CStr, address: u64) -> io::Result<u64> {
-        let mut register = 0u64;
-        let mut written = 0;
-        // The module has one u64 input (register address) and one u64 output.
-        check_hresult(unsafe {
-            (self.execute)(
-                self.device.as_raw_handle(),
-                operation.as_ptr().cast(),
-                &address,
-                1,
-                &mut register,
-                1,
-                &mut written,
-            )
-        })?;
-        if written != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "resposta incompleta do PawnIO",
-            ));
-        }
-        Ok(register)
+        read_register(
+            self.device.as_raw_handle(),
+            self.execute,
+            operation,
+            address,
+        )
     }
+}
+
+fn read_register(
+    device: HANDLE,
+    execute: Execute,
+    operation: &CStr,
+    address: u64,
+) -> io::Result<u64> {
+    let mut register = 0;
+    let mut written = 0;
+    // The module has one u64 input (register address) and one u64 output.
+    check_hresult(unsafe {
+        execute(
+            device,
+            operation.as_ptr().cast(),
+            &address,
+            1,
+            &mut register,
+            1,
+            &mut written,
+        )
+    })?;
+    if written != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resposta incompleta do PawnIO",
+        ));
+    }
+    Ok(register)
+}
+
+fn invalid_energy_counter() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "Contador de energia inválido")
+}
+
+fn single_processor_unit(relationship: LOGICAL_PROCESSOR_RELATIONSHIP) -> bool {
+    type ProcessorInfo = SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+    let mut bytes = 0;
+    // A chamada inicial informa o espaço para os registros de tamanho variável.
+    let queried = unsafe { GetLogicalProcessorInformationEx(relationship, null_mut(), &mut bytes) };
+    if queried != 0
+        || io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        || !(8..=65_536).contains(&bytes)
+    {
+        return false;
+    }
+    let mut info =
+        vec![ProcessorInfo::default(); (bytes as usize).div_ceil(size_of::<ProcessorInfo>())];
+    // O buffer tem o alinhamento e a capacidade exigidos pela API.
+    let received =
+        unsafe { GetLogicalProcessorInformationEx(relationship, info.as_mut_ptr(), &mut bytes) };
+    // Só há uma unidade se o primeiro registro ocupar todo o espaço preenchido.
+    received != 0 && info[0].Relationship == relationship && info[0].Size == bytes
 }
 
 fn pci_mutex() -> io::Result<OwnedHandle> {
@@ -320,6 +452,40 @@ fn cpu_kind() -> Option<CpuKind> {
     (base_family == 0xf && matches!(family, 0x17 | 0x19 | 0x1a)).then_some(CpuKind::AmdZen)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn energy_registers(kind: &CpuKind) -> Option<EnergyRegisters> {
+    use std::arch::x86_64::__cpuid;
+
+    match kind {
+        CpuKind::AmdZen => {
+            // CPUID.80000007H:EDX[14] anuncia os contadores de energia AMD RAPL.
+            let supported = __cpuid(0x8000_0000).eax >= 0x8000_0007
+                && __cpuid(0x8000_0007).edx & (1 << 14) != 0;
+            supported.then_some(EnergyRegisters {
+                unit: 0xc001_0299,
+                counter: 0xc001_029b,
+            })
+        }
+        CpuKind::IntelPackageDts => {
+            let signature = __cpuid(1).eax;
+            let family = (signature >> 8) & 0xf;
+            let model = ((signature >> 12) & 0xf0) | ((signature >> 4) & 0xf);
+            // Os Atom Silvermont e Airmont abaixo usam outra codificação de unidade.
+            (family == 6 && !matches!(model, 0x37 | 0x4a | 0x4c | 0x5a)).then_some(
+                EnergyRegisters {
+                    unit: 0x606,
+                    counter: 0x611,
+                },
+            )
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn energy_registers(_: &CpuKind) -> Option<EnergyRegisters> {
+    None
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 fn cpu_kind() -> Option<CpuKind> {
     None
@@ -340,12 +506,23 @@ fn decode_amd_celsius(register: u32) -> Option<f64> {
     (0.0..=125.0).contains(&celsius).then_some(celsius)
 }
 
-fn decode_intel_celsius(target: u64, status: u64) -> Option<f64> {
+fn decode_intel_celsius(target: u64, status: u64) -> io::Result<Option<f64>> {
+    if status == u64::MAX {
+        return Err(invalid_temperature());
+    }
+    if status & INTEL_TEMPERATURE_VALID == 0 {
+        return Ok(None);
+    }
     // IA32_TEMPERATURE_TARGET supplies TjMax. Package DTS reports degrees below it.
     let tj_max = ((target >> 16) & 0xff) as i16;
-    let delta = ((status >> 16) & 0x7f) as i16;
-    (status != u64::MAX && (40..=125).contains(&tj_max) && delta <= tj_max)
-        .then_some(f64::from(tj_max - delta))
+    let delta = ((status >> 16) & 0xff) as i16;
+    ((40..=125).contains(&tj_max) && delta <= tj_max)
+        .then_some(Some(f64::from(tj_max - delta)))
+        .ok_or_else(invalid_temperature)
+}
+
+fn invalid_temperature() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "Temperatura inválida")
 }
 
 #[cfg(test)]
@@ -374,10 +551,78 @@ mod tests {
 
     #[test]
     fn intel_package_dts_uses_tjmax_and_rejects_invalid_readings() {
-        assert_eq!(decode_intel_celsius(100 << 16, 42 << 16), Some(58.0));
-        assert_eq!(decode_intel_celsius(105 << 16, 0), Some(105.0));
-        assert_eq!(decode_intel_celsius(0, 42 << 16), None);
-        assert_eq!(decode_intel_celsius(100 << 16, 127 << 16), None);
-        assert_eq!(decode_intel_celsius(100 << 16, u64::MAX), None);
+        let valid = INTEL_TEMPERATURE_VALID;
+        assert_eq!(
+            decode_intel_celsius(100 << 16, valid | (42 << 16)).unwrap(),
+            Some(58.0)
+        );
+        assert_eq!(decode_intel_celsius(105 << 16, valid).unwrap(), Some(105.0));
+        assert_eq!(decode_intel_celsius(105 << 16, 0).unwrap(), None);
+        assert_eq!(decode_intel_celsius(100 << 16, 42 << 16).unwrap(), None);
+        assert!(decode_intel_celsius(0, valid | (42 << 16)).is_err());
+        assert!(decode_intel_celsius(100 << 16, valid | (128 << 16)).is_err());
+        assert!(decode_intel_celsius(100 << 16, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn package_power_uses_elapsed_seconds_and_handles_counter_wrap() {
+        let start = Instant::now();
+        let previous = EnergySample {
+            at: start,
+            counter: u32::MAX - 1023,
+        };
+        let current = EnergySample {
+            at: start + Duration::from_millis(500),
+            counter: 1024,
+        };
+        assert_eq!(current.watts_since(previous, 2_f64.powi(-10)), Some(4.0));
+        assert_eq!(previous.watts_since(previous, 2_f64.powi(-10)), None);
+
+        let after_sleep = EnergySample {
+            at: start + Duration::from_secs(60),
+            ..current
+        };
+        assert_eq!(after_sleep.watts_since(previous, 2_f64.powi(-10)), None);
+        assert_eq!(current.watts_since(previous, 2_f64.powi(-31)), None);
+    }
+
+    #[test]
+    fn package_power_recovers_after_a_failed_reading() {
+        let registers = EnergyRegisters {
+            unit: 0x606,
+            counter: 0x611,
+        };
+        let mut power = PackagePower {
+            registers,
+            joules_per_tick: None,
+            previous: None,
+        };
+        assert_eq!(
+            power
+                .sample(|register| match register {
+                    0x606 => Ok(16 << 8),
+                    0x611 => Ok(1000),
+                    _ => unreachable!(),
+                })
+                .unwrap(),
+            None
+        );
+        assert!(power.previous.is_some());
+        assert!(
+            power
+                .sample(|_| Err(io::Error::other("falha temporária")))
+                .is_err()
+        );
+        assert!(power.previous.is_none());
+        assert_eq!(
+            power
+                .sample(|register| {
+                    assert_eq!(register, registers.counter);
+                    Ok(2000)
+                })
+                .unwrap(),
+            None
+        );
+        assert!(power.previous.is_some());
     }
 }

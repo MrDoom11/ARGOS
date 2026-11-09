@@ -120,17 +120,17 @@ pub(crate) static GPM_METRICS: [GpmMetric; 5] = [
     },
     GpmMetric {
         id: 2,
-        name: "Atividade dos SMs",
+        name: "SMs ativos",
         key: "gpm-sm-active",
     },
     GpmMetric {
         id: 3,
-        name: "Ocupação dos SMs",
+        name: "Ocupação de warps nos SMs",
         key: "gpm-sm-occupancy",
     },
     GpmMetric {
         id: 10,
-        name: "VRAM · largura de banda",
+        name: "Uso da banda da VRAM",
         key: "gpm-dram-bandwidth",
     },
 ];
@@ -312,6 +312,7 @@ pub struct Nvml {
     driver_version: Symbol<SystemString>,
     library_version: Symbol<SystemString>,
     name: Symbol<DeviceString>,
+    uuid: Symbol<DeviceString>,
     driver_model: Symbol<DevicePair>,
     memory: Symbol<DeviceValue<Memory>>,
     utilization: Symbol<DeviceValue<Utilization>>,
@@ -355,6 +356,7 @@ impl Nvml {
                 driver_version: library.symbol(c"nvmlSystemGetDriverVersion"),
                 library_version: library.symbol(c"nvmlSystemGetNVMLVersion"),
                 name: library.symbol(c"nvmlDeviceGetName"),
+                uuid: library.symbol(c"nvmlDeviceGetUUID"),
                 driver_model,
                 memory: library.symbol(c"nvmlDeviceGetMemoryInfo"),
                 utilization: library.symbol(c"nvmlDeviceGetUtilizationRates"),
@@ -437,7 +439,14 @@ pub struct Device<'a> {
 
 impl<'a> Device<'a> {
     pub fn name(&self) -> Result<String, Error> {
-        let query = self.nvml.name;
+        self.device_string(self.nvml.name)
+    }
+
+    pub fn uuid(&self) -> Option<String> {
+        self.device_string(self.nvml.uuid).ok()
+    }
+
+    fn device_string(&self, query: Symbol<DeviceString>) -> Result<String, Error> {
         let function = query.get()?;
         read_string(|buffer, length| {
             // The handle belongs to a live session, and the output holds length bytes.

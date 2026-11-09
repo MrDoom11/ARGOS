@@ -16,8 +16,8 @@ Uso: argos [--gpu ÍNDICE] [--samples N] [--interval-ms MS]
      argos watch [OPÇÕES]
      argos gui [--gpu ÍNDICE]
 
-  --gpu ÍNDICE      Seleciona uma GPU NVIDIA pelo índice NVML (começa em 0).
-                    Por padrão, consulta todas as GPUs NVIDIA encontradas.
+  --gpu ÍNDICE      Selecione NVIDIA com 0 ou nvidia:0 e Radeon com amd:0.
+                    Sem seleção, consulta todas as GPUs encontradas.
   --samples N       Número de intervalos GPM por GPU (padrão: 1).
   --interval-ms MS  Tempo entre amostras GPM (padrão: 1000, mínimo: 101).
   watch --help      Exibe as opções da coleta contínua.
@@ -30,16 +30,17 @@ pub(crate) const GUI_HELP: &str = "ARGOS — janela de monitoramento
 
 Uso: argos gui [--gpu ÍNDICE]
 
-  --gpu ÍNDICE  Seleciona a GPU NVIDIA (padrão: 0, quando disponível).
+  --gpu ÍNDICE  Selecione NVIDIA com 0 ou nvidia:0 e Radeon com amd:0.
   -h, --help    Exibe esta ajuda.
 ";
 
 pub(crate) const WATCH_HELP: &str = "ARGOS — coleta contínua (Ctrl+C para encerrar)
 
-Uso: argos watch [--gpu ÍNDICE] [--gpu-interval-ms MS] [--gpm-interval-ms MS]
+Uso: argos watch [--gpu ÍNDICE]... [--gpu-interval-ms MS] [--gpm-interval-ms MS]
                  [--system-interval-ms MS] [--duration-secs S]
 
-  --gpu ÍNDICE           Seleciona uma GPU NVIDIA (padrão: 0, quando disponível).
+  --gpu ÍNDICE           Selecione NVIDIA com 0 ou nvidia:0 e Radeon com amd:0.
+                         Repita a opção para coletar de várias GPUs.
   --gpu-interval-ms MS   Intervalo dos sensores básicos da GPU (mínimo: 100).
   --gpm-interval-ms MS   Intervalo dos contadores GPM (mínimo: 101).
   --system-interval-ms MS  Intervalo de CPU e RAM (mínimo: 100).
@@ -49,16 +50,22 @@ Todos os intervalos começam em 1000 ms por padrão. O histórico em memória re
 até os últimos 5 minutos de cada grupo.
 ";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuIndex {
+    Nvidia(u32),
+    Radeon(u32),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Options {
-    pub(crate) gpu: Option<u32>,
+    pub(crate) gpu: Option<GpuIndex>,
     pub(crate) samples: NonZeroU32,
     pub(crate) interval: Duration,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WatchOptions {
-    pub(crate) gpu: Option<u32>,
+    pub(crate) gpus: Vec<GpuIndex>,
     pub(crate) gpu_interval: Duration,
     pub(crate) gpm_interval: Duration,
     pub(crate) system_interval: Duration,
@@ -70,7 +77,7 @@ pub(crate) enum Command {
     Probe(Options),
     Watch(WatchOptions),
     Gui {
-        gpu: Option<u32>,
+        gpu: Option<GpuIndex>,
         source: Source,
     },
     PrepareInstall {
@@ -107,7 +114,10 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
         let target = match flag {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
-            "--gpu" => &mut gpu,
+            "--gpu" => {
+                read_gpu(&mut gpu, &mut args)?;
+                continue;
+            }
             "--samples" => &mut samples,
             "--interval-ms" => &mut interval_ms,
             _ => return Err(format!("opção desconhecida {flag:?}")),
@@ -131,7 +141,7 @@ fn parse_gui(mut args: impl Iterator<Item = OsString>) -> Result<Command, String
     while let Some(flag) = args.next() {
         match flag.to_str().ok_or("argumento com texto inválido")? {
             "-h" | "--help" => return Ok(Command::GuiHelp),
-            "--gpu" => read_number(&mut gpu, "--gpu", &mut args)?,
+            "--gpu" => read_gpu(&mut gpu, &mut args)?,
             "--portable" if source == Source::Direct => source = Source::Portable,
             "--portable-exact" if source == Source::Direct => source = Source::PortableExact,
             flag => {
@@ -167,7 +177,7 @@ fn parse_prepare_install(mut args: impl Iterator<Item = OsString>) -> Result<Com
 }
 
 fn parse_watch(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
-    let mut gpu = None;
+    let mut gpus = Vec::new();
     let mut gpu_ms = None;
     let mut gpm_ms = None;
     let mut system_ms = None;
@@ -177,7 +187,14 @@ fn parse_watch(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
         let flag = flag.to_str().ok_or("argumento com texto inválido")?;
         let target = match flag {
             "-h" | "--help" => return Ok(Command::WatchHelp),
-            "--gpu" => &mut gpu,
+            "--gpu" => {
+                let gpu = read_gpu_index(&mut args)?;
+                if gpus.contains(&gpu) {
+                    return Err("GPU repetida em --gpu".into());
+                }
+                gpus.push(gpu);
+                continue;
+            }
             "--gpu-interval-ms" => &mut gpu_ms,
             "--gpm-interval-ms" => &mut gpm_ms,
             "--system-interval-ms" => &mut system_ms,
@@ -196,12 +213,36 @@ fn parse_watch(mut args: impl Iterator<Item = OsString>) -> Result<Command, Stri
     }
 
     Ok(Command::Watch(WatchOptions {
-        gpu,
+        gpus,
         gpu_interval: interval(gpu_ms, "--gpu-interval-ms", MIN_WATCH_INTERVAL_MS)?,
         gpm_interval: interval(gpm_ms, "--gpm-interval-ms", MIN_INTERVAL_MS)?,
         system_interval: interval(system_ms, "--system-interval-ms", MIN_WATCH_INTERVAL_MS)?,
         duration: duration.map(|seconds| Duration::from_secs(u64::from(seconds))),
     }))
+}
+
+fn read_gpu(
+    target: &mut Option<GpuIndex>,
+    args: &mut impl Iterator<Item = OsString>,
+) -> Result<(), String> {
+    if target.is_some() {
+        return Err("opção repetida --gpu".into());
+    }
+    *target = Some(read_gpu_index(args)?);
+    Ok(())
+}
+
+fn read_gpu_index(args: &mut impl Iterator<Item = OsString>) -> Result<GpuIndex, String> {
+    let invalid = "--gpu requer um índice NVIDIA ou um índice AMD, como 0 ou amd:0";
+    let value = args.next().ok_or(invalid)?;
+    let text = value.to_str().ok_or(invalid)?;
+    let (vendor, index) = text.split_once(':').unwrap_or(("nvidia", text));
+    let index = index.parse::<u32>().map_err(|_| invalid)?;
+    match vendor {
+        "nvidia" => Ok(GpuIndex::Nvidia(index)),
+        "amd" => Ok(GpuIndex::Radeon(index)),
+        _ => Err(invalid.into()),
+    }
 }
 
 fn read_number(
@@ -274,7 +315,7 @@ mod tests {
         assert_eq!(
             parse(args.map(OsString::from)),
             Ok(Command::Probe(Options {
-                gpu: Some(0),
+                gpu: Some(GpuIndex::Nvidia(0)),
                 samples: NonZeroU32::new(3).unwrap(),
                 interval: Duration::from_millis(101),
             }))
@@ -312,13 +353,30 @@ mod tests {
         assert_eq!(
             parse(args.map(OsString::from)),
             Ok(Command::Watch(WatchOptions {
-                gpu: Some(0),
+                gpus: vec![GpuIndex::Nvidia(0)],
                 gpu_interval: Duration::from_millis(100),
                 gpm_interval: Duration::from_millis(101),
                 system_interval: Duration::from_secs(1),
                 duration: Some(Duration::from_secs(30)),
             }))
         );
+    }
+
+    #[test]
+    fn watch_accepts_multiple_distinct_gpus() {
+        let args = ["watch", "--gpu", "0", "--gpu", "amd:0", "--gpu", "nvidia:1"];
+        let Ok(Command::Watch(options)) = parse(args.map(OsString::from)) else {
+            panic!("argumentos válidos para três GPUs");
+        };
+        assert_eq!(
+            options.gpus,
+            [
+                GpuIndex::Nvidia(0),
+                GpuIndex::Radeon(0),
+                GpuIndex::Nvidia(1)
+            ]
+        );
+        assert!(parse(["watch", "--gpu", "0", "--gpu", "nvidia:0"].map(OsString::from)).is_err());
     }
 
     #[test]
@@ -346,7 +404,7 @@ mod tests {
         assert_eq!(
             parse(["gui", "--gpu", "1"].map(OsString::from)),
             Ok(Command::Gui {
-                gpu: Some(1),
+                gpu: Some(GpuIndex::Nvidia(1)),
                 source: Source::Direct
             })
         );
@@ -371,5 +429,30 @@ mod tests {
             );
         }
         assert!(parse(["gui", "--portable", "--portable-exact"].map(OsString::from)).is_err());
+    }
+
+    #[test]
+    fn distinguishes_radeon_from_nvidia_in_every_mode() {
+        assert!(matches!(
+            parse(["--gpu", "amd:1"].map(OsString::from)),
+            Ok(Command::Probe(Options {
+                gpu: Some(GpuIndex::Radeon(1)),
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(["watch", "--gpu", "amd:0"].map(OsString::from)),
+            Ok(Command::Watch(WatchOptions { gpus, .. })) if gpus == [GpuIndex::Radeon(0)]
+        ));
+        assert!(matches!(
+            parse(["gui", "--gpu", "nvidia:2"].map(OsString::from)),
+            Ok(Command::Gui {
+                gpu: Some(GpuIndex::Nvidia(2)),
+                ..
+            })
+        ));
+        for value in ["amd:", "amd:-1", "intel:0"] {
+            assert!(parse(["--gpu", value].map(OsString::from)).is_err());
+        }
     }
 }

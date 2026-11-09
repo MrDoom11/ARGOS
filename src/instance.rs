@@ -28,14 +28,16 @@ use windows_sys::Win32::UI::Shell::{
     FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FlashWindow, GetWindowThreadProcessId, IDYES, IsIconic, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_YESNO, MessageBoxW,
-    PostMessageW, SW_RESTORE, SetForegroundWindow, ShowWindowAsync, WM_CLOSE,
+    FindWindowExW, FlashWindow, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId, IDYES,
+    IsIconic, IsWindowVisible, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK,
+    MB_SETFOREGROUND, MB_YESNO, MessageBoxW, PostMessageW, SW_RESTORE, SetForegroundWindow,
+    ShowWindowAsync, WM_APP, WM_CLOSE, WS_EX_NOACTIVATE,
 };
 use windows_sys::w;
 
 pub(crate) const WINDOW_CLASS: *const u16 = w!("ArgosMonitorWindow");
 pub(crate) const WINDOW_TITLE: *const u16 = w!("ARGOS — Monitor de hardware");
+pub(crate) const REVEAL_PANEL: u32 = WM_APP + 2;
 pub(crate) const REPLACEMENT_CLOSE: usize = 0x4152_474f;
 const PANEL_BUSY: &str = "O painel do ARGOS está aberto. Feche-o antes de continuar.";
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -392,6 +394,11 @@ fn activate(window: HWND) {
     unsafe {
         if IsIconic(window) != 0 {
             ShowWindowAsync(window, SW_RESTORE);
+        } else if IsWindowVisible(window) == 0
+            || GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE != 0
+        {
+            PostMessageW(window, REVEAL_PANEL, 0, 0);
+            return;
         }
         if SetForegroundWindow(window) == 0 {
             FlashWindow(window, 1);

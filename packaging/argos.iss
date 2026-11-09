@@ -3,7 +3,7 @@
 #endif
 
 #if !defined(SensorInstaller) || !defined(SensorSha256)
-  #error Compile com packaging/build.ps1 para incluir o sensor de temperatura.
+  #error Compile com packaging/build.ps1 para incluir o serviço de sensores da CPU.
 #endif
 
 #define ArgosAppId "{618CF44B-59D7-424F-89F7-6B2714DF1BD8}"
@@ -48,6 +48,7 @@ Filename: "{app}\argos-gui.exe"; WorkingDir: "{app}"; Description: "Abrir o pain
 const
   ArgosUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#ArgosAppId}_is1';
   SensorKey = 'Software\ARGOS\CpuSensor';
+  RequiredSensorMetricsRevision = 2;
   SensorServiceKey = 'SYSTEM\CurrentControlSet\Services\ArgosCpuSensor';
   PawnIoServiceKey = 'SYSTEM\CurrentControlSet\Services\PawnIO';
   AccessReadWrite = $C0000000;
@@ -316,12 +317,14 @@ end;
 
 procedure ProvisionCpuSensor;
 var
-  Protocol: Cardinal;
+  Protocol, MetricsRevision: Cardinal;
   Code: Integer;
   Component: String;
   Guard: TFileStream;
 begin
   if RegQueryDWordValue(HKLM64, SensorKey, 'Protocol', Protocol) and (Protocol = 1) and
+    RegQueryDWordValue(HKLM64, SensorKey, 'MetricsRevision', MetricsRevision) and
+    (MetricsRevision >= RequiredSensorMetricsRevision) and
     RegKeyExists(HKLM, SensorServiceKey) and RegKeyExists(HKLM, PawnIoServiceKey) and
     FileExists(ExpandConstant('{commonpf64}\ARGOS Sensor\argos-sensor.exe')) then
     Exit;
@@ -334,12 +337,12 @@ begin
   Guard := TFileStream.Create(Component, fmOpenRead or fmShareDenyWrite);
   try
     if CompareText(GetSHA256OfStream(Guard), '{#SensorSha256}') <> 0 then
-      RaiseException('O pacote do sensor de temperatura não passou na validação.');
+      RaiseException('O pacote do serviço de sensores da CPU não passou na validação.');
     if not ShellExec('runas', Component, '/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
       ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, Code) then
-      Log('Sensor de temperatura não provisionado. ' + SysErrorMessage(Code))
+      Log('Serviço de sensores da CPU não provisionado. ' + SysErrorMessage(Code))
     else if Code <> 0 then
-      Log('Instalador do sensor de temperatura retornou ' + IntToStr(Code) + '.');
+      Log('Instalador do serviço de sensores da CPU retornou ' + IntToStr(Code) + '.');
   finally
     Guard.Free;
   end;
@@ -352,7 +355,7 @@ begin
     try
       ProvisionCpuSensor;
     except
-      Log('Falha ao preparar o sensor de temperatura. ' + GetExceptionMessage);
+      Log('Falha ao preparar o serviço de sensores da CPU. ' + GetExceptionMessage);
     end;
     ReleaseLaunchLock;
   end;
