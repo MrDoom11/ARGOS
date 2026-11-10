@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
 };
@@ -11,18 +11,29 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-use windows_sys::Win32::UI::Accessibility::{
-    HCF_HIGHCONTRASTON, HIGHCONTRASTW, MSAA_MENU_SIG, MSAAMENUINFO,
-};
+use windows_sys::Win32::UI::Accessibility::{MSAA_MENU_SIG, MSAAMENUINFO};
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_SPACE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    VK_END, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use super::{appearance::Theme, menu_style::Style, wide};
+use super::{
+    appearance::{Theme, high_contrast},
+    menu_style::{RowKind, Style},
+    wide,
+};
 
 pub(super) const APPLY: u32 = WM_APP + 1;
 pub(super) const DISMISS: u32 = WM_APP + 4;
 pub(super) const FRAME: u32 = WM_APP + 5;
+
+// Valores de ícones cabem em u16.
+const TEXT_BLOCK: usize = u16::MAX as usize + 1;
+const CENTERED_ITEM: usize = TEXT_BLOCK + 1;
+const SLIDER_FIRST: usize = CENTERED_ITEM + 1;
+const SWATCH_FIRST: usize = 0x0100_0000;
+const TEXT_BLOCK_SEPARATOR: &str = " · ";
 
 #[repr(u16)]
 #[derive(Clone, Copy)]
@@ -37,6 +48,19 @@ pub(super) enum Icon {
     Dropdown = 0xe70d,
     Page = 0xe8a5,
     About = 0xea1f,
+    Update = 0xe72c,
+    Error = 0xe783,
+    Move = 0xe7c2,
+    Layers = 0xe81e,
+    Split = 0xe89a,
+    Color = 0xe790,
+    Undo = 0xe7a7,
+    Pin = 0xe718,
+    Pinned = 0xe842,
+    Power = 0xe7e8,
+    Minimize = 0xe921,
+    Maximize = 0xe922,
+    Restore = 0xe923,
     Close = 0xe8bb,
 }
 
@@ -53,17 +77,53 @@ impl Menu {
             MF_STRING | if checked { MF_CHECKED } else { 0 },
             id,
             label,
-            None,
+            0,
         );
     }
 
     pub(super) fn item_icon(&self, id: usize, label: &str, icon: Icon) {
-        self.append(MF_STRING, id, label, Some(icon));
+        self.item_icon_checked(id, label, icon, false);
+    }
+
+    pub(super) fn item_icon_checked(&self, id: usize, label: &str, icon: Icon, checked: bool) {
+        self.append(
+            MF_STRING | if checked { MF_CHECKED } else { 0 },
+            id,
+            label,
+            icon as usize,
+        );
+    }
+
+    pub(super) fn item_swatch(&self, id: usize, label: &str, color: COLORREF) {
+        self.append(MF_STRING, id, label, SWATCH_FIRST + color as usize);
     }
 
     pub(super) fn label(&self, label: &str) {
-        let label = wide(label);
-        unsafe { AppendMenuW(self.0, MF_STRING | MF_GRAYED, 0, label.as_ptr()) };
+        self.append(MF_STRING | MF_GRAYED, 0, label, 0);
+    }
+
+    pub(super) fn label_icon(&self, label: &str, icon: Icon) {
+        self.append(MF_STRING | MF_GRAYED, 0, label, icon as usize);
+    }
+
+    pub(super) fn text_block(&self, lines: &[&str]) {
+        // O menu nativo de alto contraste mantém uma legenda de uma linha.
+        let label = lines.join(TEXT_BLOCK_SEPARATOR);
+        self.append(MF_STRING | MF_GRAYED, 0, &label, TEXT_BLOCK);
+    }
+
+    pub(super) fn centered_item(&self, id: usize, label: &str) {
+        self.append(MF_STRING, id, label, CENTERED_ITEM);
+    }
+
+    pub(super) fn slider(&self, id: usize, value: u8) {
+        // Reserve os 101 IDs seguintes para as escolhas de 0% a 100%.
+        self.append(
+            MF_STRING,
+            id,
+            &format!("{value}%"),
+            SLIDER_FIRST + usize::from(value),
+        );
     }
 
     pub(super) fn separator(&self) {
@@ -82,23 +142,28 @@ impl Menu {
         let Some(submenu) = Self::new() else { return };
         items(&submenu);
         // Uma inclusão bem-sucedida transfere o submenu para o menu pai.
-        if self.append(MF_POPUP, submenu.0 as usize, label, icon) {
+        if self.append(
+            MF_POPUP,
+            submenu.0 as usize,
+            label,
+            icon.map_or(0, |icon| icon as usize),
+        ) {
             std::mem::forget(submenu);
         }
     }
 
-    fn append(&self, flags: u32, id: usize, label: &str, icon: Option<Icon>) -> bool {
+    fn append(&self, flags: u32, id: usize, label: &str, data: usize) -> bool {
         let label = wide(label);
         if unsafe { AppendMenuW(self.0, flags, id, label.as_ptr()) } == 0 {
             return false;
         }
-        if let Some(icon) = icon {
+        if data != 0 {
             let position = unsafe { GetMenuItemCount(self.0) } - 1;
             if let Ok(position) = u32::try_from(position) {
                 let info = MENUITEMINFOW {
                     cbSize: size_of::<MENUITEMINFOW>() as u32,
                     fMask: MIIM_DATA,
-                    dwItemData: icon as usize,
+                    dwItemData: data,
                     ..Default::default()
                 };
                 unsafe { SetMenuItemInfoW(self.0, position, 1, &info) };
@@ -115,7 +180,15 @@ impl Menu {
         theme: Theme,
         dpi: u32,
     ) -> usize {
-        let skin = MenuSkin::new(self.0, theme, dpi);
+        let menu_hook = unsafe {
+            SetWindowsHookExW(WH_MSGFILTER, Some(filter), null_mut(), GetCurrentThreadId())
+        };
+        let skin = (!menu_hook.is_null())
+            .then(|| MenuSkin::new(self.0, theme, dpi))
+            .flatten();
+        if skin.is_none() {
+            use_native_sliders(self.0);
+        }
         TRACKING.with_borrow_mut(|slot| {
             *slot = Some(Tracking {
                 owner,
@@ -124,14 +197,12 @@ impl Menu {
                 keep_open,
                 selected: None,
                 pressed: None,
+                slider_drag: None,
                 owner_buttons: 0,
                 dismiss_pending: false,
                 skin,
             });
         });
-        let menu_hook = unsafe {
-            SetWindowsHookExW(WH_MSGFILTER, Some(filter), null_mut(), GetCurrentThreadId())
-        };
         // Menus abertos pela faixa não ativam o ARGOS. Nesse caso, o Windows pode
         // entregar o clique externo ao jogo sem encerrar o menu.
         let mouse_hook = unsafe {
@@ -177,9 +248,25 @@ struct Tracking {
     keep_open: fn(usize) -> bool,
     selected: Option<usize>,
     pressed: Option<(u32, usize)>,
+    slider_drag: Option<SliderDrag>,
     owner_buttons: u8,
     dismiss_pending: bool,
     skin: Option<MenuSkin>,
+}
+
+#[derive(Clone, Copy)]
+struct SliderDrag {
+    row: usize,
+    popup: HWND,
+    bounds: RECT,
+    release: u32,
+    initial: u8,
+}
+
+enum MenuInput {
+    Consume,
+    Apply(usize),
+    Redraw(HWND),
 }
 
 struct MenuSkin {
@@ -196,6 +283,7 @@ struct StyledRow {
     menu: HMENU,
     position: u32,
     item_type: u32,
+    id: usize,
     state: u32,
     submenu: bool,
     original_data: usize,
@@ -217,6 +305,25 @@ impl StyledRow {
 
     fn separator(&self) -> bool {
         self.item_type & MFT_SEPARATOR != 0
+    }
+
+    fn kind(&self) -> RowKind {
+        if self.separator() {
+            return RowKind::Separator;
+        }
+        match self.original_data {
+            TEXT_BLOCK => RowKind::TextBlock,
+            CENTERED_ITEM => RowKind::CenteredItem,
+            data if (SWATCH_FIRST..2 * SWATCH_FIRST).contains(&data) => {
+                RowKind::Swatch((data - SWATCH_FIRST) as COLORREF)
+            }
+            data => slider_value(data).map_or(RowKind::Item, RowKind::Slider),
+        }
+    }
+
+    fn set_slider(&mut self, value: u8) {
+        self.original_data = SLIDER_FIRST + usize::from(value);
+        self.set_label(wide(&format!("{value}%")));
     }
 
     fn configure(&self, styled: bool) -> bool {
@@ -281,17 +388,24 @@ fn collect_rows(menu: HMENU, rows: &mut Vec<StyledRow>) -> Option<()> {
     let count = u32::try_from(unsafe { GetMenuItemCount(menu) }).ok()?;
     for position in 0..count {
         let item = item_info(menu, position, true)?;
-        let label = item_label(menu, position, MF_BYPOSITION).unwrap_or_default();
+        let mut label = item_label(menu, position, MF_BYPOSITION).unwrap_or_default();
         let mut row = StyledRow {
             accessible: MSAAMENUINFO::default(),
             label: Vec::new(),
             menu,
             position,
             item_type: item.fType,
+            id: item.wID as usize,
             state: item.fState,
             submenu: !item.hSubMenu.is_null(),
             original_data: item.dwItemData,
         };
+        if row.kind() == RowKind::TextBlock
+            && let Some(text) = label.strip_suffix(&[0])
+        {
+            let text = String::from_utf16_lossy(text).replace(TEXT_BLOCK_SEPARATOR, "\n\n");
+            label = wide(&text);
+        }
         row.set_label(label);
         rows.push(row);
         if !item.hSubMenu.is_null() {
@@ -312,20 +426,42 @@ fn set_background(menu: HMENU, brush: HBRUSH, style: u32) -> bool {
     unsafe { SetMenuInfo(menu, &info) != 0 }
 }
 
-fn high_contrast() -> bool {
-    let mut contrast = HIGHCONTRASTW {
-        cbSize: size_of::<HIGHCONTRASTW>() as u32,
-        ..Default::default()
-    };
-    let read = unsafe {
-        SystemParametersInfoW(
-            SPI_GETHIGHCONTRAST,
-            contrast.cbSize,
-            (&raw mut contrast).cast(),
-            0,
-        )
-    };
-    read != 0 && contrast.dwFlags & HCF_HIGHCONTRASTON != 0
+fn slider_value(data: usize) -> Option<u8> {
+    (SLIDER_FIRST..=SLIDER_FIRST + 100)
+        .contains(&data)
+        .then(|| (data - SLIDER_FIRST) as u8)
+}
+
+fn use_native_sliders(menu: HMENU) {
+    for position in (0..unsafe { GetMenuItemCount(menu) }).rev() {
+        let position = position as u32;
+        let Some(item) = item_info(menu, position, true) else {
+            continue;
+        };
+        if !item.hSubMenu.is_null() {
+            use_native_sliders(item.hSubMenu);
+        } else if let Some(current) = slider_value(item.dwItemData)
+            && unsafe { DeleteMenu(menu, position, MF_BYPOSITION) } != 0
+        {
+            let values = (0..=100)
+                .rev()
+                .filter(|value| value % 10 == 0 || *value == current);
+            for (offset, value) in values.enumerate() {
+                let label = wide(&format!("{value}%"));
+                let flags =
+                    MF_BYPOSITION | MF_STRING | if value == current { MF_CHECKED } else { 0 };
+                unsafe {
+                    InsertMenuW(
+                        menu,
+                        position + offset as u32,
+                        flags,
+                        item.wID as usize + 1 + usize::from(value),
+                        label.as_ptr(),
+                    )
+                };
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -337,7 +473,7 @@ pub(super) fn measure(owner: HWND, item: &mut MEASUREITEMSTRUCT) -> bool {
         return false;
     }
     with_style_row(owner, item.itemData, |style, row| {
-        style.measure(item, &row.label, row.separator());
+        style.measure(item, &row.label, row.kind());
     })
 }
 
@@ -349,7 +485,7 @@ pub(super) fn draw(owner: HWND, item: &DRAWITEMSTRUCT) -> bool {
         let glyph = u16::try_from(row.original_data)
             .ok()
             .filter(|glyph| *glyph != 0);
-        style.draw(item, &row.label, row.separator(), row.submenu, glyph);
+        style.draw(item, &row.label, row.kind(), row.submenu, glyph);
     })
 }
 
@@ -418,7 +554,15 @@ pub(super) fn notify(owner: HWND, msg: u32, wp: WPARAM, lp: LPARAM) {
         };
         match msg {
             WM_INITMENUPOPUP if !tracking.menus.contains(&menu) => tracking.menus.push(menu),
-            WM_UNINITMENUPOPUP => tracking.menus.retain(|&open| open != menu),
+            WM_UNINITMENUPOPUP => {
+                tracking.menus.retain(|&open| open != menu);
+                if let (Some(drag), Some(skin)) = (tracking.slider_drag, &mut tracking.skin)
+                    && skin.rows[drag.row].menu == menu
+                {
+                    skin.rows[drag.row].set_slider(drag.initial);
+                    tracking.slider_drag = None;
+                }
+            }
             WM_MENUSELECT => {
                 let flags = (wp >> 16) as u32;
                 tracking.selected = (tracking.menus.contains(&menu)
@@ -449,13 +593,19 @@ pub(super) fn frame(owner: HWND, root: usize) {
 unsafe extern "system" fn filter(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code == MSGF_MENU as i32
         && let Some(msg) = unsafe { (lp as *const MSG).as_ref() }
-        && let Some((owner, choice)) = TRACKING.with_borrow_mut(|slot| {
+        && let Some((owner, input)) = TRACKING.with_borrow_mut(|slot| {
             let tracking = slot.as_mut()?;
             Some((tracking.owner, tracking.input(msg)?))
         })
     {
-        if let Some(choice) = choice {
-            unsafe { SendMessageW(owner, APPLY, choice, 0) };
+        match input {
+            MenuInput::Consume => {}
+            MenuInput::Apply(choice) => unsafe {
+                SendMessageW(owner, APPLY, choice, 0);
+            },
+            MenuInput::Redraw(popup) => unsafe {
+                RedrawWindow(popup, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
+            },
         }
         return 1;
     }
@@ -552,8 +702,10 @@ impl Tracking {
         (true, false)
     }
 
-    // Some(None) consome a mensagem sem executar uma opção.
-    fn input(&mut self, msg: &MSG) -> Option<Option<usize>> {
+    fn input(&mut self, msg: &MSG) -> Option<MenuInput> {
+        if let Some(input) = self.slider_input(msg) {
+            return Some(input);
+        }
         match msg.message {
             WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
                 let choice = self.command_at(msg.pt).filter(|&id| (self.keep_open)(id))?;
@@ -563,21 +715,125 @@ impl Tracking {
                     WM_RBUTTONUP
                 };
                 self.pressed = Some((release, choice));
-                Some(None)
+                Some(MenuInput::Consume)
             }
             WM_LBUTTONUP | WM_RBUTTONUP => {
                 let (_, choice) = self
                     .pressed
                     .filter(|&(release, _)| release == msg.message)?;
                 self.pressed = None;
-                Some((self.command_at(msg.pt) == Some(choice)).then_some(choice))
+                Some(if self.command_at(msg.pt) == Some(choice) {
+                    MenuInput::Apply(choice)
+                } else {
+                    MenuInput::Consume
+                })
             }
             WM_KEYDOWN if matches!(msg.wParam as u16, VK_RETURN | VK_SPACE) => {
                 let choice = self.selected.filter(|&id| (self.keep_open)(id))?;
-                Some((msg.lParam & (1 << 30) == 0).then_some(choice))
+                Some(if msg.lParam & (1 << 30) == 0 {
+                    MenuInput::Apply(choice)
+                } else {
+                    MenuInput::Consume
+                })
             }
             _ => None,
         }
+    }
+
+    fn slider_input(&mut self, msg: &MSG) -> Option<MenuInput> {
+        let skin = self.skin.as_mut()?;
+        let (index, value, commit, popup) = match msg.message {
+            WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP => {
+                let drag = self.slider_drag?;
+                let commit = msg.message == drag.release;
+                if commit {
+                    self.slider_drag = None;
+                } else if msg.message != WM_MOUSEMOVE {
+                    return None;
+                }
+                (
+                    drag.row,
+                    skin.style.slider_value(drag.bounds, msg.pt.x),
+                    commit,
+                    drag.popup,
+                )
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
+                let popup = unsafe { WindowFromPoint(msg.pt) };
+                let menu = popup_menu(popup)?;
+                if !self.menus.contains(&menu) {
+                    return None;
+                }
+                let position =
+                    u32::try_from(unsafe { MenuItemFromPoint(null_mut(), menu, msg.pt) }).ok()?;
+                let index = skin.rows.iter().position(|row| {
+                    row.menu == menu
+                        && row.position == position
+                        && matches!(row.kind(), RowKind::Slider(_))
+                })?;
+                let mut bounds = RECT::default();
+                if unsafe { GetMenuItemRect(null_mut(), menu, position, &mut bounds) } == 0 {
+                    return None;
+                }
+                let release = if matches!(msg.message, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+                    WM_LBUTTONUP
+                } else {
+                    WM_RBUTTONUP
+                };
+                let row = &skin.rows[index];
+                let initial = slider_value(row.original_data)?;
+                self.slider_drag = Some(SliderDrag {
+                    row: index,
+                    popup,
+                    bounds,
+                    release,
+                    initial,
+                });
+                self.selected = Some(row.id);
+                (
+                    index,
+                    skin.style.slider_value(bounds, msg.pt.x),
+                    false,
+                    popup,
+                )
+            }
+            WM_KEYDOWN if self.slider_drag.is_none() => {
+                let selected = self.selected?;
+                let (index, current) = skin.rows.iter().enumerate().find_map(|(index, row)| {
+                    let RowKind::Slider(current) = row.kind() else {
+                        return None;
+                    };
+                    (row.id == selected && self.menus.contains(&row.menu))
+                        .then_some((index, current))
+                })?;
+                let value = match msg.wParam as u16 {
+                    VK_LEFT => current.saturating_sub(1),
+                    VK_RIGHT => (current + 1).min(100),
+                    VK_HOME => 0,
+                    VK_END => 100,
+                    VK_RETURN | VK_SPACE => return Some(MenuInput::Consume),
+                    _ => return None,
+                };
+                if value == current {
+                    return Some(MenuInput::Consume);
+                }
+                (index, value, true, null_mut())
+            }
+            _ => return None,
+        };
+
+        let row = &mut skin.rows[index];
+        let changed = row.kind() != RowKind::Slider(value);
+        if changed {
+            row.set_slider(value);
+        }
+        Some(if commit {
+            MenuInput::Apply(row.id + 1 + usize::from(value))
+        } else if changed {
+            MenuInput::Redraw(popup)
+        } else {
+            MenuInput::Consume
+        })
     }
 
     fn command_at(&self, point: POINT) -> Option<usize> {
@@ -605,6 +861,13 @@ fn item_info(menu: HMENU, item: u32, by_position: bool) -> Option<MENUITEMINFOW>
 }
 
 pub(super) fn sync(root: HMENU, updated: &Menu, theme: Theme) {
+    let native = TRACKING.with_borrow(|slot| {
+        slot.as_ref()
+            .is_some_and(|tracking| tracking.skin.is_none())
+    });
+    if native {
+        use_native_sliders(updated.0);
+    }
     let background = TRACKING.with_borrow_mut(|slot| {
         let skin = slot.as_mut()?.skin.as_mut()?;
         if skin.theme == theme {
@@ -646,9 +909,12 @@ fn update_items(menu: HMENU, updated: HMENU) {
                 item.fState = (item.fState & !mask) | state;
             }
             if let Some(label) = label.as_mut()
-                && sync_label(item.dwItemData, label).unwrap_or_else(|| {
-                    item_label(menu, index, MF_BYPOSITION).as_ref() != Some(label)
-                })
+                && sync_row(
+                    item.dwItemData,
+                    label,
+                    desired.map_or(0, |info| info.dwItemData),
+                )
+                .unwrap_or_else(|| item_label(menu, index, MF_BYPOSITION).as_ref() != Some(label))
             {
                 item.fMask |= MIIM_STRING;
                 item.dwTypeData = label.as_mut_ptr();
@@ -660,11 +926,12 @@ fn update_items(menu: HMENU, updated: HMENU) {
     }
 }
 
-fn sync_label(data: usize, label: &[u16]) -> Option<bool> {
+fn sync_row(data: usize, label: &[u16], original_data: usize) -> Option<bool> {
     TRACKING.with_borrow_mut(|slot| {
         let skin = slot.as_mut()?.skin.as_mut()?;
         let index = skin.row_index(data)?;
         let row = &mut skin.rows[index];
+        row.original_data = original_data;
         let changed = row.label != label;
         if changed {
             row.set_label(label.to_vec());
@@ -763,6 +1030,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slider_previews_drag_and_applies_the_final_value() {
+        let menu = Menu::new().unwrap();
+        let id = 800;
+        menu.slider(id, 50);
+        let mut rows = Vec::new();
+        collect_rows(menu.0, &mut rows).unwrap();
+        let theme = Theme::Dark;
+        let mut tracking = Tracking {
+            owner: null_mut(),
+            root: menu.0,
+            menus: vec![menu.0],
+            keep_open: |_| false,
+            selected: Some(id),
+            pressed: None,
+            slider_drag: Some(SliderDrag {
+                row: 0,
+                popup: null_mut(),
+                bounds: RECT {
+                    left: 0,
+                    right: 200,
+                    top: 0,
+                    bottom: 56,
+                },
+                release: WM_LBUTTONUP,
+                initial: 50,
+            }),
+            owner_buttons: 0,
+            dismiss_pending: false,
+            skin: Some(MenuSkin {
+                theme,
+                style: Style::new(theme, 96).unwrap(),
+                rows: rows.into_boxed_slice(),
+            }),
+        };
+        let mut message = MSG {
+            message: WM_MOUSEMOVE,
+            pt: POINT { x: 200, y: 50 },
+            ..Default::default()
+        };
+        assert!(matches!(
+            tracking.input(&message),
+            Some(MenuInput::Redraw(_))
+        ));
+        assert_eq!(tracking.skin.as_ref().unwrap().rows[0].label, wide("100%"));
+
+        message.message = WM_LBUTTONUP;
+        message.pt.x = 100;
+        assert!(
+            matches!(tracking.input(&message), Some(MenuInput::Apply(choice)) if choice == id + 1 + 50)
+        );
+        assert!(tracking.slider_drag.is_none());
+
+        message.message = WM_KEYDOWN;
+        message.wParam = usize::from(VK_RIGHT);
+        assert!(
+            matches!(tracking.input(&message), Some(MenuInput::Apply(choice)) if choice == id + 1 + 51)
+        );
+        assert_eq!(tracking.skin.as_ref().unwrap().rows[0].label, wide("51%"));
+    }
+
+    #[test]
+    fn informational_text_is_one_disabled_item_with_room_for_each_line() {
+        let menu = Menu::new().unwrap();
+        let description = "Monitor de hardware para Windows";
+        menu.text_block(&["ARGOS 0.3.0", description, "Licença MIT"]);
+        menu.centered_item(338, "Guia do painel");
+
+        let native = item_info(menu.0, 0, true).unwrap();
+        assert_eq!(native.wID, 0);
+        assert_ne!(native.fState & MFS_DISABLED, 0);
+        assert_eq!(
+            item_label(menu.0, 0, MF_BYPOSITION).unwrap(),
+            wide("ARGOS 0.3.0 · Monitor de hardware para Windows · Licença MIT"),
+        );
+
+        let mut rows = Vec::new();
+        collect_rows(menu.0, &mut rows).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row = &rows[0];
+        assert!(row.kind() == RowKind::TextBlock);
+        assert_eq!(
+            row.label,
+            wide("ARGOS 0.3.0\n\nMonitor de hardware para Windows\n\nLicença MIT"),
+        );
+        let command = item_info(menu.0, 1, true).unwrap();
+        assert!(rows[1].kind() == RowKind::CenteredItem);
+        assert_eq!(command.wID, 338);
+        assert_eq!(command.fState & MFS_DISABLED, 0);
+
+        let style = Style::new(Theme::Dark, 96).unwrap();
+        let mut block = MEASUREITEMSTRUCT::default();
+        let mut single_line = MEASUREITEMSTRUCT::default();
+        style.measure(&mut block, &row.label, RowKind::TextBlock);
+        style.measure(&mut single_line, &wide(description), RowKind::TextBlock);
+        assert_eq!(block.itemWidth, single_line.itemWidth);
+        assert!(block.itemHeight > single_line.itemHeight);
+    }
+
+    #[test]
     fn outside_presses_dismiss_without_eating_another_apps_click() {
         let owner = 1_usize as HWND;
         let root = 2_usize as HMENU;
@@ -774,6 +1140,7 @@ mod tests {
             keep_open: |_| false,
             selected: None,
             pressed: None,
+            slider_drag: None,
             owner_buttons: 0,
             dismiss_pending: false,
             skin: None,

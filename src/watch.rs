@@ -101,7 +101,7 @@ const FRAME_SENSORS: [Sensor; frames::SENSOR_COUNT] = [
         "present-fps",
         "FPS do aplicativo",
         " FPS",
-        Axis::Fixed(360.0),
+        Axis::Fixed(DEFAULT_FPS_CEILING as f64),
     ),
     (
         "present-frametime",
@@ -138,6 +138,7 @@ const GPU_VIDEO_START: usize = GPU_SENSORS.len() + GPM_COUNT;
 pub(crate) const CPU_USAGE_INDEX: usize = GPU_VIDEO_START + GPU_VIDEO_SENSORS.len();
 pub(crate) const RAM_USED_INDEX: usize = CPU_USAGE_INDEX + 1;
 pub(crate) const FRAME_SENSOR_START: usize = CPU_USAGE_INDEX + SYSTEM_SENSORS.len();
+pub(crate) const DEFAULT_FPS_CEILING: u16 = 360;
 pub(crate) const CPU_TEMPERATURE_INDEX: usize = FRAME_SENSOR_START + FRAME_SENSORS.len();
 pub(crate) const CPU_POWER_INDEX: usize = CPU_TEMPERATURE_INDEX + 1;
 const GPU: &str = "GPU / NVML";

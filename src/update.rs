@@ -87,6 +87,13 @@ impl Updater {
         }
     }
 
+    pub(crate) fn installed_directory(&self) -> Option<&Path> {
+        match &self.mode {
+            Some(Mode::Installed(directory)) => Some(directory),
+            _ => None,
+        }
+    }
+
     pub(crate) fn check(&mut self, manual: bool) -> Result<(), String> {
         if self.mode.is_none() {
             return Err("Abra o ARGOS pelo instalador ou pelo menu Iniciar para atualizar.".into());

@@ -1,29 +1,17 @@
-use std::ptr::null;
-
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
 use super::board::DropdownHotkey;
+use super::dialog::Template;
 
 const INSTRUCTIONS: i32 = 100;
 const SUBCLASS: usize = 1;
 
 pub(super) fn choose(owner: HWND) -> Option<DropdownHotkey> {
-    let template = template();
-    // SAFETY: o modelo está alinhado em DWORD e permanece vivo durante o diálogo modal.
-    let result = unsafe {
-        DialogBoxIndirectParamW(
-            GetModuleHandleW(null()),
-            template.as_ptr().cast(),
-            owner,
-            Some(dialog_proc),
-            0,
-        )
-    };
+    let result = template().show(owner, Some(dialog_proc), 0);
     let encoded = u32::try_from(result).ok()?;
     DropdownHotkey::new(encoded >> 16, encoded & 0xffff)
 }
@@ -163,56 +151,21 @@ unsafe extern "system" fn capture_proc(
     }
 }
 
-fn template() -> Vec<u32> {
-    let style =
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | (DS_CENTER | DS_MODALFRAME | DS_SETFONT) as u32;
-    // DLGTEMPLATE seguido de menu, classe, título, tamanho e nome da fonte.
-    let mut words = vec![
-        style as u16,
-        (style >> 16) as u16,
-        0,
-        0,
-        2,
-        0,
-        0,
-        239,
-        57,
-        0,
-        0,
-    ];
-    words.extend("Atalho global do dropdown".encode_utf16().chain([0]));
-    words.push(9);
-    words.extend("Segoe UI".encode_utf16().chain([0]));
-    add_control(
-        &mut words,
+fn template() -> Template {
+    let mut template = Template::new("Atalho global do dropdown", [239, 57]);
+    template.add_control(
         0x0082, // STATIC
         INSTRUCTIONS as u16,
         0,
         [10, 9, 220, 22],
         "Pressione Ctrl, Alt, Shift ou Win junto com outra tecla.\r\nPressione Esc para cancelar.",
     );
-    add_control(
-        &mut words,
+    template.add_control(
         0x0080, // BUTTON
         IDCANCEL as u16,
         WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         [174, 34, 55, 14],
         "Cancelar",
     );
-    // Um Vec<u32> garante o alinhamento do modelo ao passá-lo ao Windows.
-    words
-        .chunks(2)
-        .map(|pair| u32::from(pair[0]) | (u32::from(*pair.get(1).unwrap_or(&0)) << 16))
-        .collect()
-}
-
-fn add_control(words: &mut Vec<u16>, class: u16, id: u16, style: u32, rect: [u16; 4], title: &str) {
-    if !words.len().is_multiple_of(2) {
-        words.push(0);
-    }
-    let style = style | WS_CHILD | WS_VISIBLE;
-    words.extend([style as u16, (style >> 16) as u16, 0, 0]);
-    words.extend(rect);
-    words.extend([id, 0xffff, class]);
-    words.extend(title.encode_utf16().chain([0, 0]));
+    template
 }

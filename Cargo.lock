@@ -4,8 +4,9 @@ version = 4
 
 [[package]]
 name = "argos"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "find-msvc-tools",
  "hex",
  "ring",
  "semver",

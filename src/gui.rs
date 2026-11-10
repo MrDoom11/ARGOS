@@ -41,23 +41,30 @@ use crate::watch::{
 };
 
 mod appearance;
+mod autostart;
 mod board;
 mod chart;
+mod dialog;
 mod dropdown;
 mod dropdown_mode;
+mod fps_scale;
 mod hotkey;
 mod input_strip;
 mod menu;
 mod menu_style;
+mod scrollbar;
 mod startup;
 mod surface;
+mod tray;
 
-use appearance::{OPACITIES, Palette, Theme};
+use appearance::{Palette, Theme};
 use board::{Board, MAX_COLUMNS, MAX_ROWS, MAX_SLOTS};
 use menu::{Icon, Menu};
 use surface::{Background, Surface};
 
+const ARGOS_ICON: *const u16 = std::ptr::without_provenance(1);
 const TIMER: usize = 1;
+const TRAY_RETRY_TIMER: usize = 3;
 const PERIOD_FIRST: usize = 201;
 const RESET_SENSORS: usize = 205;
 const COLUMNS_FIRST: usize = 301;
@@ -68,8 +75,13 @@ const MOVE_WINDOW: usize = 331;
 const MINIMIZE_WINDOW: usize = 333;
 const MAXIMIZE_WINDOW: usize = 334;
 const CLOSE_WINDOW: usize = 335;
-const CLOSE_MENU: usize = 336;
+const TRAY_SHOW: usize = 336;
 const ABOUT_RELEASES: usize = 337;
+const ABOUT_GUIDE: usize = 338;
+const ABOUT_TWITCH: usize = 339;
+const START_WITH_WINDOWS: usize = 340;
+const ABOUT_GUIDE_URL: &str = "https://github.com/MrDoom11/ARGOS#janela-de-monitoramento";
+const ABOUT_TWITCH_URL: &str = "https://www.twitch.tv/mr_doom11";
 const UPDATE_CHECK: usize = 341;
 const UPDATE_RESTART: usize = 342;
 const UPDATE_SCHEDULE: usize = 343;
@@ -84,7 +96,7 @@ const DROPDOWN_ALIGNMENT_FIRST: usize = 360;
 const DROPDOWN_WIDTH_FIRST: usize = 370;
 const THEME_DARK: usize = 380;
 const THEME_LIGHT: usize = 381;
-const OPACITY_FIRST: usize = 390;
+const FPS_CEILING_EDIT: usize = 382;
 const DROPDOWN_ALIGNMENTS: [(u8, &str); 5] = [
     (0, "Esquerda"),
     (25, "Entre esquerda e centro"),
@@ -100,6 +112,8 @@ const DROPDOWN_MONITOR_LIMIT: usize = 64;
 const GPU_AUTO: usize = 700;
 const GPU_FIRST: usize = 701;
 const GPU_LIMIT: usize = 64;
+const OPACITY_SLIDER: usize = 800;
+const OPACITY_FIRST: usize = OPACITY_SLIDER + 1;
 const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 10000;
 const COLOR_FIRST: usize = 10100;
@@ -162,6 +176,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
+        hIcon: unsafe { LoadIconW(instance, ARGOS_ICON) },
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
         lpszClassName: WINDOW_CLASS,
         ..Default::default()
@@ -175,7 +190,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     // SAFETY: o estado em Box permanece no mesmo endereço até a destruição de hwnd.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_APPWINDOW,
+            WS_EX_TOOLWINDOW,
             WINDOW_CLASS,
             WINDOW_TITLE,
             WS_POPUP
@@ -198,6 +213,8 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         return Err(window_error("criar a janela"));
     }
     let hwnd_guard = OwnedWindow(hwnd);
+    state.borrow_mut().tray = Some(tray::Tray::new(hwnd, class.hIcon));
+    refresh_tray(hwnd, &state);
     let placed = saved_bounds.is_some_and(|bounds| restore_window_bounds(hwnd, bounds));
     let window_dpi = unsafe { GetDpiForWindow(hwnd) };
     if window_dpi != 0 && window_dpi != dpi {
@@ -275,6 +292,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         let Some(state) = ptr.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
+        if msg >= 0xc000
+            && state.try_borrow().is_ok_and(|app| {
+                app.tray
+                    .as_ref()
+                    .is_some_and(|tray| tray.is_taskbar_created(msg))
+            })
+        {
+            refresh_tray(hwnd, state);
+            return 0;
+        }
         match msg {
             WM_CREATE => {
                 let scrollbar = CreateWindowExW(
@@ -436,6 +463,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 dropdown_mode::tick(hwnd, state);
                 0
             }
+            WM_TIMER if wp == TRAY_RETRY_TIMER => {
+                refresh_tray(hwnd, state);
+                0
+            }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
                 if state
                     .try_borrow()
@@ -450,7 +481,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             instance::REVEAL_PANEL => {
-                dropdown_mode::reveal(hwnd, state, false);
+                reveal_panel(hwnd, state);
+                0
+            }
+            tray::CALLBACK => {
+                handle_tray_event(hwnd, state, wp, lp);
                 0
             }
             WM_HOTKEY => {
@@ -465,6 +500,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 SC_MOVE | SC_SIZE | SC_MAXIMIZE => 0,
                 _ => DefWindowProcW(hwnd, msg, wp, lp),
             },
+            WM_SYSCOMMAND
+                if wp as u32 & 0xfff0 == SC_MINIMIZE
+                    && state.try_borrow().is_ok_and(|app| app.has_tray()) =>
+            {
+                ShowWindow(hwnd, SW_HIDE);
+                0
+            }
             WM_CLOSE => {
                 if let Ok(mut app) = state.try_borrow_mut() {
                     if !app.dropdown.active()
@@ -610,6 +652,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 cancel_drag(hwnd, state);
                 KillTimer(hwnd, TIMER);
                 KillTimer(hwnd, dropdown_mode::TIMER);
+                KillTimer(hwnd, TRAY_RETRY_TIMER);
+                let tray = state.borrow_mut().tray.take();
+                drop(tray);
                 dropdown_mode::unbind(hwnd, state);
                 PostQuitMessage(0);
                 0
@@ -926,6 +971,7 @@ struct ScrollbarState {
     visible_rows: usize,
     first_row: usize,
     interactive: bool,
+    theme: Theme,
 }
 
 fn scrollbar_bounds(bounds: RECT, dpi: u32) -> RECT {
@@ -954,6 +1000,7 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
             visible_rows: app.board.rows,
             first_row: app.scroll_row,
             interactive: !appearance::is_click_through(hwnd),
+            theme: app.board.appearance.theme,
         }
     });
     let previous = app.scrollbar_state;
@@ -965,6 +1012,9 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
 
     unsafe {
         if let Some(next) = next {
+            if previous.is_none_or(|previous| previous.theme != next.theme) {
+                scrollbar::set_theme(scrollbar, next.theme);
+            }
             let info = SCROLLINFO {
                 cbSize: size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -974,7 +1024,7 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
                 nPos: next.first_row as i32,
                 nTrackPos: 0,
             };
-            SetScrollInfo(scrollbar, SB_CTL, &info, i32::from(next.interactive));
+            SetScrollInfo(scrollbar, SB_CTL, &info, 0);
             if previous.is_none_or(|previous| {
                 previous.interactive != next.interactive || previous.position != next.position
             }) {
@@ -994,6 +1044,9 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
                             SWP_HIDEWINDOW
                         },
                 );
+            }
+            if next.interactive {
+                InvalidateRect(scrollbar, null(), 0);
             }
         } else {
             ShowWindow(scrollbar, SW_HIDE);
@@ -1100,7 +1153,7 @@ fn keep_menu_open(choice: usize) -> bool {
     matches!(
         choice,
         RESET_SENSORS | RESET_COLORS | GPU_AUTO | THEME_DARK | THEME_LIGHT
-    ) || (OPACITY_FIRST..OPACITY_FIRST + OPACITIES.len()).contains(&choice)
+    ) || (OPACITY_FIRST..=OPACITY_FIRST + 100).contains(&choice)
         || (GPU_FIRST..GPU_FIRST + GPU_LIMIT).contains(&choice)
         || (PERIOD_FIRST..PERIOD_FIRST + PERIODS.len()).contains(&choice)
         || (COLUMNS_FIRST..COLUMNS_FIRST + MAX_COLUMNS).contains(&choice)
@@ -1158,21 +1211,27 @@ fn options_menu(
                 dropdown_menu(items, app, displays)
             });
             match app.updater.status() {
-                Status::Idle => menu.item(UPDATE_CHECK, "Verificar nova versão do ARGOS", false),
-                Status::Checking => menu.label("Verificando nova versão do ARGOS…"),
+                Status::Idle => {
+                    menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update)
+                }
+                Status::Checking => menu.label_icon("Buscando por atualizações…", Icon::Update),
                 Status::Ready(version, scheduled) => {
-                    menu.group(&format!("ARGOS {version} disponível"), |items| {
-                        items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
-                        if scheduled {
-                            items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
-                        } else {
-                            items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
-                        }
-                    });
+                    menu.group_icon(
+                        &format!("ARGOS {version} disponível"),
+                        Icon::Update,
+                        |items| {
+                            items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
+                            if scheduled {
+                                items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
+                            } else {
+                                items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
+                            }
+                        },
+                    );
                 }
             }
             if update::last_error().is_some() {
-                menu.item(UPDATE_ERROR, "Ver erro da última atualização", false);
+                menu.item_icon(UPDATE_ERROR, "Ver erro da última atualização", Icon::Error);
             }
             if app.page_count() > 1 {
                 menu.group_icon("Página", Icon::Page, |items| {
@@ -1194,29 +1253,46 @@ fn options_menu(
         && let Some(snapshot) = &app.snapshot
     {
         menu.separator();
-        app.panel_menu(&menu, snapshot, index);
+        app.panel_menu(&menu, snapshot, index, !appearance::is_click_through(hwnd));
     }
     if matches!(section, MenuSection::All) {
         menu.separator();
         menu.group_icon("Sobre o ARGOS", Icon::About, |items| {
-            items.label(concat!("ARGOS ", env!("CARGO_PKG_VERSION")));
-            items.label("Monitor de hardware para Windows");
-            items.label(concat!("Licença ", env!("CARGO_PKG_LICENSE")));
+            items.text_block(&[
+                concat!("ARGOS ", env!("CARGO_PKG_VERSION")),
+                "Acompanhe CPU, GPU, memória, FPS e outros recursos no Windows em um painel personalizável com gráficos em tempo real e histórico.",
+                concat!("Licença ", env!("CARGO_PKG_LICENSE")),
+            ]);
             items.separator();
-            items.item(ABOUT_RELEASES, "Versões no GitHub", false);
+            items.centered_item(ABOUT_GUIDE, "Guia do painel");
+            items.centered_item(ABOUT_TWITCH, "Canal na Twitch");
+            items.centered_item(ABOUT_RELEASES, "Versões no GitHub");
         });
-        if app.dropdown.active() {
-            menu.item(DROPDOWN_PIN, "Fixar aberto", app.dropdown.pinned());
-        } else if unsafe { IsZoomed(hwnd) } != 0 {
-            menu.label("Mover janela");
-            menu.item(MAXIMIZE_WINDOW, "Restaurar", false);
-            menu.item(MINIMIZE_WINDOW, "Minimizar", false);
+        if let Some(directory) = app.startup_directory() {
+            let enabled = autostart::enabled(directory).unwrap_or(false);
+            let label = if enabled {
+                "Iniciar com o Windows (ativado)"
+            } else {
+                "Iniciar com o Windows"
+            };
+            menu.item_icon_checked(START_WITH_WINDOWS, label, Icon::Power, enabled);
         } else {
-            menu.item(MOVE_WINDOW, "Mover janela", false);
-            menu.item(MAXIMIZE_WINDOW, "Maximizar", false);
-            menu.item(MINIMIZE_WINDOW, "Minimizar", false);
+            menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
         }
-        menu.item(CLOSE_MENU, "Fechar menu", false);
+        if app.dropdown.active() {
+            let pinned = app.dropdown.pinned();
+            let icon = if pinned { Icon::Pinned } else { Icon::Pin };
+            menu.item_icon_checked(DROPDOWN_PIN, "Fixar aberto", icon, pinned);
+        } else {
+            if unsafe { IsZoomed(hwnd) } != 0 {
+                menu.label_icon("Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Restaurar", Icon::Restore);
+            } else {
+                menu.item_icon(MOVE_WINDOW, "Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Maximizar", Icon::Maximize);
+            }
+            menu.item_icon(MINIMIZE_WINDOW, "Minimizar", Icon::Minimize);
+        }
         menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
     }
     Some(menu)
@@ -1263,8 +1339,10 @@ fn apply_option(
     displays: &[dropdown::Display],
 ) {
     match choice {
-        CLOSE_MENU => {}
-        ABOUT_RELEASES => open_release_page(hwnd),
+        ABOUT_RELEASES => open_about_link(hwnd, update::RELEASES_URL),
+        ABOUT_GUIDE => open_about_link(hwnd, ABOUT_GUIDE_URL),
+        ABOUT_TWITCH => open_about_link(hwnd, ABOUT_TWITCH_URL),
+        START_WITH_WINDOWS => toggle_autostart(hwnd, state),
         THEME_DARK | THEME_LIGHT => {
             edit_board(hwnd, state, |app| {
                 let theme = if choice == THEME_DARK {
@@ -1277,9 +1355,20 @@ fn apply_option(
             });
             sync_appearance(hwnd, state);
         }
-        choice if (OPACITY_FIRST..OPACITY_FIRST + OPACITIES.len()).contains(&choice) => {
+        FPS_CEILING_EDIT => {
+            let (current, theme) = {
+                let app = state.borrow();
+                (app.board.fps_ceiling, app.board.appearance.theme)
+            };
+            if let Some(ceiling) = fps_scale::choose(hwnd, current, theme) {
+                edit_board(hwnd, state, |app| {
+                    std::mem::replace(&mut app.board.fps_ceiling, ceiling) != ceiling
+                });
+            }
+        }
+        choice if (OPACITY_FIRST..=OPACITY_FIRST + 100).contains(&choice) => {
             edit_board(hwnd, state, |app| {
-                let opacity = OPACITIES[choice - OPACITY_FIRST];
+                let opacity = (choice - OPACITY_FIRST) as u8;
                 let previous = std::mem::replace(&mut app.board.appearance.opacity, opacity);
                 previous != opacity
             });
@@ -1338,7 +1427,12 @@ fn apply_option(
             }
         }
         MINIMIZE_WINDOW => {
-            unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+            let command = if state.borrow().has_tray() {
+                SW_HIDE
+            } else {
+                SW_MINIMIZE
+            };
+            unsafe { ShowWindow(hwnd, command) };
         }
         MAXIMIZE_WINDOW => {
             unsafe {
@@ -1387,16 +1481,14 @@ fn apply_option(
                 update_notice(hwnd, &error);
             }
         }
-        choice if (PAGE_FIRST..SENSOR_FIRST).contains(&choice) => {
+        choice if (PAGE_FIRST..PAGE_FIRST + MAX_SLOTS).contains(&choice) => {
             if let Ok(mut app) = state.try_borrow_mut() {
                 app.show_page(choice - PAGE_FIRST);
             }
             invalidate(hwnd);
         }
         choice if (COLOR_FIRST..MOVE_PANEL_FIRST).contains(&choice) => {
-            if let Some(panel) = panel {
-                choose_series_color(hwnd, state, panel, choice - COLOR_FIRST);
-            }
+            choose_series_color(hwnd, state, choice - COLOR_FIRST);
         }
         choice if choice >= FRAME_TARGET_FOREGROUND => {
             let target = match choice {
@@ -1589,8 +1681,8 @@ fn choose_dropdown_hotkey(hwnd: HWND, state: &RefCell<Window>) {
     }
 }
 
-fn open_release_page(hwnd: HWND) {
-    let url = wide(update::RELEASES_URL);
+fn open_about_link(hwnd: HWND, url: &str) {
+    let url = wide(url);
     unsafe {
         let initialized = CoInitializeEx(
             null(),
@@ -1610,11 +1702,35 @@ fn open_release_page(hwnd: HWND) {
         if result as isize <= 32 {
             MessageBoxW(
                 hwnd,
-                w!("Não foi possível abrir a página de versões no navegador."),
+                w!("Não foi possível abrir o link no navegador."),
                 w!("Sobre o ARGOS"),
                 MB_OK | MB_ICONWARNING,
             );
         }
+    }
+}
+
+fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
+    let result = {
+        let app = state.borrow();
+        let Some(directory) = app.startup_directory() else {
+            return;
+        };
+        autostart::enabled(directory)
+            .and_then(|enabled| autostart::set_enabled(directory, !enabled))
+    };
+    if let Err(error) = result {
+        let message = wide(&format!(
+            "Não foi possível alterar a inicialização do ARGOS. {error}"
+        ));
+        unsafe {
+            MessageBoxW(
+                hwnd,
+                message.as_ptr(),
+                w!("Iniciar com o Windows"),
+                MB_OK | MB_ICONWARNING,
+            )
+        };
     }
 }
 
@@ -1631,17 +1747,19 @@ fn update_notice(hwnd: HWND, message: &str) {
     };
 }
 
-fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, panel: usize, sensor: usize) {
+fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, sensor: usize) {
     let (initial, mut custom) = {
         let Ok(app) = state.try_borrow() else { return };
-        let Some(panel) = app.board.panels.get(panel) else {
-            return;
-        };
-        let Some(position) = panel.iter().position(|&index| index == sensor) else {
+        let Some((position, series_count)) = app.board.panels.iter().find_map(|series| {
+            series
+                .iter()
+                .position(|&index| index == sensor)
+                .map(|position| (position, series.len()))
+        }) else {
             return;
         };
         (
-            app.series_color(sensor, position, panel.len()),
+            app.series_color(sensor, position, series_count),
             app.custom_colors,
         )
     };
@@ -1719,6 +1837,7 @@ struct Window {
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
     dropdown: dropdown_mode::Runtime,
+    tray: Option<tray::Tray>,
     save_failed: bool,
     custom_colors: [COLORREF; 16],
     open_menu: Option<Rc<OpenMenu>>,
@@ -1743,6 +1862,7 @@ impl Window {
             snapshot: None,
             board,
             dropdown: dropdown_mode::Runtime::default(),
+            tray: None,
             save_failed: false,
             custom_colors: SERIES,
             open_menu: None,
@@ -1765,6 +1885,16 @@ impl Window {
             self.dpi = dpi;
             self.chart_fonts = chart::ChartFonts::new(dpi);
         }
+    }
+
+    fn startup_directory(&self) -> Option<&std::path::Path> {
+        self.updater
+            .installed_directory()
+            .filter(|directory| directory.join("argos-gui.exe").is_file())
+    }
+
+    fn has_tray(&self) -> bool {
+        self.tray.as_ref().is_some_and(tray::Tray::available)
     }
 
     fn refresh(&mut self) -> bool {
@@ -2004,16 +2134,21 @@ impl Window {
         menu.item(THEME_DARK, "Tema escuro", appearance.theme == Theme::Dark);
         menu.item(THEME_LIGHT, "Tema claro", appearance.theme == Theme::Light);
         menu.separator();
-        menu.label("Opacidade do fundo");
-        for (index, &opacity) in OPACITIES.iter().enumerate() {
-            menu.item(
-                OPACITY_FIRST + index,
-                &format!("{opacity}%"),
-                appearance.opacity == opacity,
-            );
-        }
+        menu.group("Opacidade", |items| {
+            items.slider(OPACITY_SLIDER, appearance.opacity)
+        });
         if appearance.translucent() && !appearance::is_click_through(hwnd) {
             menu.label("Transparência indisponível nesta janela");
+        }
+        if let Some(snapshot) = &self.snapshot
+            && self.board.panels.iter().any(|series| !series.is_empty())
+        {
+            menu.separator();
+            menu.group_icon("Cor dos gráficos", Icon::Color, |items| {
+                for series in &self.board.panels {
+                    self.curve_color_items(items, snapshot, series);
+                }
+            });
         }
     }
 
@@ -2197,6 +2332,11 @@ impl Window {
                 .unwrap_or("Aguardando a coleta de quadros")
         };
         menu.label(status);
+        menu.item_icon(
+            FPS_CEILING_EDIT,
+            &format!("Teto do gráfico · {} FPS…", self.board.fps_ceiling),
+            Icon::Fps,
+        );
         if let Some(snapshot) = &self.snapshot {
             menu.separator();
             menu.label("Gráficos exibidos");
@@ -2231,8 +2371,8 @@ impl Window {
         }
     }
 
-    fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize) {
-        menu.group("Mover painel para", |positions| {
+    fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize, contextual_colors: bool) {
+        menu.group_icon("Mover painel para", Icon::Move, |positions| {
             if self.page_count() == 1 {
                 self.position_menu(positions, snapshot, panel, 0);
             } else {
@@ -2251,7 +2391,7 @@ impl Window {
             .filter(|(index, _)| self.board.can_merge(*index, panel))
             .collect();
         if !targets.is_empty() {
-            menu.group("Mesclar com", |items| {
+            menu.group_icon("Mesclar com", Icon::Layers, |items| {
                 for (index, target) in targets {
                     items.item(
                         MERGE_FIRST + index,
@@ -2263,26 +2403,32 @@ impl Window {
         }
         let series = &self.board.panels[panel];
         if series.len() > 1 {
-            menu.item(SPLIT_PANEL, "Separar gráficos", false);
+            menu.item_icon(SPLIT_PANEL, "Separar gráficos", Icon::Split);
         }
-        menu.group("Cor da curva", |items| {
-            for &index in series {
-                if index < MOVE_PANEL_FIRST - COLOR_FIRST
-                    && let Some(name) = self.series_title(snapshot, index)
-                {
-                    items.item(
-                        COLOR_FIRST + index,
-                        &name,
-                        self.board.color(index).is_some(),
-                    );
-                }
-            }
-        });
+        if contextual_colors {
+            menu.group_icon("Cor da curva", Icon::Color, |items| {
+                self.curve_color_items(items, snapshot, series);
+            });
+        }
         if series
             .iter()
             .any(|&index| self.board.color(index).is_some())
         {
-            menu.item(RESET_COLORS, "Restaurar cores padrão", false);
+            menu.item_icon(RESET_COLORS, "Restaurar cores padrão", Icon::Undo);
+        }
+    }
+
+    fn curve_color_items(&self, menu: &Menu, snapshot: &Snapshot, series: &[usize]) {
+        for (position, &index) in series.iter().enumerate() {
+            if index < MOVE_PANEL_FIRST - COLOR_FIRST
+                && let Some(name) = self.series_title(snapshot, index)
+            {
+                menu.item_swatch(
+                    COLOR_FIRST + index,
+                    &name,
+                    self.series_color(index, position, series.len()),
+                );
+            }
         }
     }
 
@@ -2505,6 +2651,9 @@ impl Window {
                     chart::PaintStyle {
                         fonts: &self.chart_fonts,
                         palette,
+                        axis_ceiling: panel
+                            .contains(&FRAME_SENSOR_START)
+                            .then(|| f64::from(self.board.fps_ceiling.get())),
                     },
                 );
             }
@@ -2784,6 +2933,139 @@ fn dropdown_active(state: &RefCell<Window>) -> bool {
     state.try_borrow().is_ok_and(|app| app.dropdown.active())
 }
 
+fn taskbar_style(style: isize, tray_available: bool) -> isize {
+    let mask = (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW) as isize;
+    let presentation = if tray_available {
+        WS_EX_TOOLWINDOW
+    } else {
+        WS_EX_APPWINDOW
+    };
+    (style & !mask) | presentation as isize
+}
+
+fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
+    let (available, was_available, dropdown) = {
+        let Ok(mut app) = state.try_borrow_mut() else {
+            return;
+        };
+        let Some(tray) = app.tray.as_mut() else {
+            return;
+        };
+        let was_available = tray.available();
+        let available = tray.register();
+        let dropdown = app.dropdown.update_normal_taskbar_style(available);
+        (available, was_available, dropdown)
+    };
+
+    unsafe {
+        if available {
+            KillTimer(hwnd, TRAY_RETRY_TIMER);
+        } else {
+            SetTimer(hwnd, TRAY_RETRY_TIMER, 3_000, None);
+        }
+        if dropdown {
+            return;
+        }
+        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = taskbar_style(current, available);
+        if style == current {
+            return;
+        }
+
+        let visible = IsWindowVisible(hwnd) != 0;
+        let minimized = IsIconic(hwnd) != 0;
+        // O Shell reaplica a apresentação na barra de tarefas ao mostrar a janela.
+        if visible {
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+        let show = if visible && !(available && minimized) {
+            SWP_SHOWWINDOW
+        } else {
+            0
+        };
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | show,
+        );
+        if !available && was_available && !visible {
+            ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+        }
+    }
+}
+
+fn reveal_panel(hwnd: HWND, state: &RefCell<Window>) {
+    if unsafe { IsWindowEnabled(hwnd) } == 0 {
+        unsafe { SetForegroundWindow(GetLastActivePopup(hwnd)) };
+        return;
+    }
+    if dropdown_active(state) {
+        dropdown_mode::reveal(hwnd, state, false);
+        return;
+    }
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        } else if IsWindowVisible(hwnd) == 0 {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+fn handle_tray_event(hwnd: HWND, state: &RefCell<Window>, wp: WPARAM, lp: LPARAM) {
+    let event = state.try_borrow().ok().and_then(|app| {
+        if app.open_menu.is_some() {
+            return None;
+        }
+        app.tray.as_ref()?.event(wp, lp)
+    });
+    match event {
+        Some(tray::Event::Show) => reveal_panel(hwnd, state),
+        Some(tray::Event::Menu(point)) if unsafe { IsWindowEnabled(hwnd) } != 0 => {
+            show_tray_menu(hwnd, state, point);
+        }
+        _ => {}
+    }
+}
+
+fn show_tray_menu(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
+    let Some(menu) = Menu::new() else { return };
+    menu.item_icon(TRAY_SHOW, "Mostrar ARGOS", Icon::Restore);
+    menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
+    let (theme, dpi) = {
+        let mut app = state.borrow_mut();
+        app.open_menu = Some(Rc::new(OpenMenu {
+            root: menu.0,
+            section: MenuSection::All,
+            processes: Vec::new(),
+            displays: Vec::new(),
+            panel_sensors: Vec::new(),
+        }));
+        (app.board.appearance.theme, app.dpi)
+    };
+    unsafe { SetForegroundWindow(hwnd) };
+    let choice = menu.track(hwnd, point, |_| false, theme, dpi);
+    state.borrow_mut().open_menu = None;
+    unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
+    match choice {
+        TRAY_SHOW => reveal_panel(hwnd, state),
+        CLOSE_WINDOW => {
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+        }
+        _ => {
+            if let Some(tray) = &state.borrow().tray {
+                tray.return_focus();
+            }
+        }
+    }
+}
+
 fn show_normal(hwnd: HWND) {
     unsafe {
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -2873,6 +3155,15 @@ fn window_error(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_presentation_preserves_other_window_styles() {
+        let layered = appearance::LAYERED_STYLES as isize;
+        let normal = layered | WS_EX_APPWINDOW as isize;
+        let in_tray = layered | WS_EX_TOOLWINDOW as isize;
+        assert_eq!(taskbar_style(normal, true), in_tray);
+        assert_eq!(taskbar_style(in_tray, false), normal);
+    }
     use windows_sys::w;
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::watch::{MetricSnapshot, RAM_USED_INDEX};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_SHIFT, VK_F9, VK_F10};
 use windows_sys::w;
 
@@ -10,13 +11,14 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     let display = displays().into_iter().next().expect("monitor disponível");
     let start = initial_bounds(Some(display.work), dpi);
-    let mut board = Board::new([CPU_USAGE_INDEX, CPU_USAGE_INDEX + 1]);
+    let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX]);
     board.columns = 1;
     let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
     board.dropdown.enabled = true;
     board.dropdown.monitor = Some(display.id.clone());
     let trigger = display.trigger(board.dropdown.alignment, board.dropdown.width);
     let state = RefCell::new(Window::new(monitor, board, dpi, Source::PortableExact));
+    assert!(state.borrow().startup_directory().is_none());
     let module = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
@@ -135,6 +137,9 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     state.borrow_mut().board.appearance.theme = Theme::Light;
     change_opacity(0);
     assert_translucent_input();
+    if !appearance::high_contrast() {
+        assert_scrollbar_background(&state.borrow(), Theme::Light);
+    }
     press(VK_F10);
     assert!(!visible());
     assert!(!strip_visible());
@@ -146,12 +151,26 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
 
     change_opacity(50);
     assert_translucent_input();
+    if !appearance::high_contrast() {
+        assert_scrollbar_background(&state.borrow(), Theme::Light);
+        state.borrow_mut().board.appearance.theme = Theme::Dark;
+        sync_appearance(hwnd, &state);
+        assert_scrollbar_background(&state.borrow(), Theme::Dark);
+    }
+    assert_translucent_color_menu(hwnd, &mut state.borrow_mut());
     change_opacity(100);
     assert!(visible());
     assert!(!appearance::is_layered(hwnd));
     assert!(!appearance::is_click_through(hwnd));
     assert!(!strip_visible());
     assert_eq!(hit_at_height(10), hwnd);
+    sync_scrollbar(hwnd, &state);
+    let scrollbar = state.borrow().scrollbar;
+    assert_ne!(unsafe { IsWindowVisible(scrollbar) }, 0);
+    send(WM_VSCROLL, SB_LINEDOWN as WPARAM, scrollbar as LPARAM);
+    assert_eq!(state.borrow().scroll_row, 1);
+    send(WM_VSCROLL, SB_LINEUP as WPARAM, scrollbar as LPARAM);
+    assert_eq!(state.borrow().scroll_row, 0);
     change_opacity(0);
     assert_translucent_input();
 
@@ -174,6 +193,68 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     );
     drop(guard);
     assert_ne!(unsafe { UnregisterClassW(class.lpszClassName, module) }, 0);
+}
+
+fn assert_scrollbar_background(app: &Window, theme: Theme) {
+    assert_eq!(unsafe { IsWindowVisible(app.scrollbar) }, 0);
+    let [x, y, w, h] = app.scrollbar_state.unwrap().position;
+    let mut surface = Surface::default();
+    let dc = surface.target(null_mut(), x + w, y + h).unwrap();
+    assert!(app.paint_scrollbar(dc).is_some());
+    let colors = theme.menu_colors();
+    assert_eq!(unsafe { GetPixel(dc, x, y) }, colors.background);
+    let mut info = SCROLLBARINFO {
+        cbSize: size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    assert_ne!(
+        unsafe { GetScrollBarInfo(app.scrollbar, OBJID_CLIENT, &mut info) },
+        0
+    );
+    assert!(info.xyThumbBottom > info.xyThumbTop);
+    let thumb = unsafe {
+        GetPixel(
+            dc,
+            x + w / 2,
+            y + (info.xyThumbTop + info.xyThumbBottom) / 2,
+        )
+    };
+    assert!(thumb == colors.disabled || thumb == colors.accent);
+}
+
+fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
+    assert_eq!(app.first_slot(), 0);
+    assert_eq!(app.slots(), 1);
+    assert!(app.board.set_color(RAM_USED_INDEX, Some(SERIES[0])));
+    let previous = app.snapshot.replace(Arc::new(Snapshot {
+        at: Instant::now(),
+        notice: String::new(),
+        metrics: (0..=RAM_USED_INDEX)
+            .map(|_| MetricSnapshot {
+                name: "Métrica de teste",
+                unit: "",
+                source: "",
+                interval: Duration::from_secs(1),
+                axis_max: 100.0,
+                points: Vec::new(),
+            })
+            .collect(),
+        gpu_devices: Arc::from([]),
+        gpu_selections: Vec::new(),
+        gpus: Vec::new(),
+        frame_target: FrameTarget::Off,
+        frame_status: None,
+        cpu_temperature_status: None,
+        cpu_power_status: None,
+    }));
+    let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
+    let color_item =
+        |sensor| unsafe { GetMenuState(menu.0, (COLOR_FIRST + sensor) as u32, MF_BYCOMMAND) };
+    assert_ne!(color_item(CPU_USAGE_INDEX), u32::MAX);
+    let next_page = color_item(RAM_USED_INDEX);
+    assert_ne!(next_page, u32::MAX);
+    assert_eq!(next_page & (MF_CHECKED | MF_GRAYED), 0);
+    app.snapshot = previous;
 }
 
 fn rect(hwnd: HWND) -> RECT {

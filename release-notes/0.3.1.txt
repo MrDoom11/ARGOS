@@ -1,0 +1,9 @@
+• Área de notificação — o ícone do ARGOS fica perto do relógio. Clique para mostrar o painel ou use o botão direito para fechá-lo.
+
+• Inicialização — na versão instalada, a opção Iniciar com o Windows abre o ARGOS ao entrar na conta.
+
+• Aparência — ajuste a opacidade com um controle deslizante. A barra de rolagem acompanha o tema, e as amostras mostram a cor de cada curva. Use Aparência → Cor dos gráficos para trocar as cores com o painel transparente.
+
+• FPS — configure e salve o teto da escala em FPS → Teto do gráfico. A janela de ajuste acompanha o tema do painel.
+
+• Menus e ícone — o menu principal ganhou ícones e a opção Buscar por atualizações. Sobre o ARGOS reúne o guia do painel, o canal na Twitch e as versões no GitHub. O aplicativo e o instalador usam o novo ícone do ARGOS.
