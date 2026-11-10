@@ -4,12 +4,12 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateFontIndirectW, CreateFontW,
-    CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER,
-    DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject,
-    DrawTextW, FW_NORMAL, FillRect, GGI_MARK_NONEXISTING_GLYPHS, GetGlyphIndicesW, GetStockObject,
-    GetTextFaceW, HBRUSH, HDC, HFONT, HGDIOBJ, IntersectClipRect, NULL_PEN, OUT_DEFAULT_PRECIS,
-    PS_SOLID, Polyline, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    CreatePen, CreateSolidBrush, DC_BRUSH, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_HIDEPREFIX, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC,
+    DeleteObject, DrawTextW, FW_NORMAL, FillRect, GGI_MARK_NONEXISTING_GLYPHS, GetGlyphIndicesW,
+    GetStockObject, GetTextFaceW, HBRUSH, HDC, HFONT, HGDIOBJ, IntersectClipRect, NULL_PEN,
+    OUT_DEFAULT_PRECIS, PS_SOLID, Polyline, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode,
+    SetDCBrushColor, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_CHECKED, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED,
@@ -21,10 +21,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::w;
 
-use super::appearance::Theme;
+use super::appearance::{MenuColors, Theme};
 use super::chart::rgb;
 
 const LABEL_INSET: i32 = 32;
+const TEXT_BLOCK_INSET: i32 = 12;
+const VERTICAL_PADDING: i32 = 5;
+const TEXT_BLOCK_WIDTH: i32 = 270;
+const SLIDER_WIDTH: i32 = 200;
+const SLIDER_HEIGHT: i32 = 56;
+const SLIDER_INSET: i32 = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowKind {
+    Item,
+    Separator,
+    TextBlock,
+    CenteredItem,
+    Slider(u8),
+    Swatch(COLORREF),
+}
 
 pub(super) struct Style {
     // The font is selected into this DC, which is dropped first.
@@ -79,8 +95,13 @@ impl Style {
         self.palette().arrow_badge.as_ref().map(|brush| brush.0)
     }
 
-    pub(super) fn measure(&self, item: &mut MEASUREITEMSTRUCT, label: &[u16], separator: bool) {
-        if separator {
+    pub(super) fn measure(&self, item: &mut MEASUREITEMSTRUCT, label: &[u16], kind: RowKind) {
+        if matches!(kind, RowKind::Slider(_)) {
+            item.itemWidth = px(self.dpi, SLIDER_WIDTH) as u32;
+            item.itemHeight = px(self.dpi, SLIDER_HEIGHT) as u32;
+            return;
+        }
+        if kind == RowKind::Separator {
             item.itemWidth = 0;
             item.itemHeight = px(self.dpi, 8) as u32;
             return;
@@ -89,27 +110,40 @@ impl Style {
         let mut bounds = RECT::default();
         let count = text_len(label);
         if count != 0 {
+            let flags = match kind {
+                RowKind::TextBlock => {
+                    bounds.right = px(self.dpi, TEXT_BLOCK_WIDTH);
+                    DT_WORDBREAK | DT_NOPREFIX
+                }
+                _ => DT_SINGLELINE | DT_HIDEPREFIX,
+            };
             unsafe {
                 DrawTextW(
                     self.measure_dc.0,
                     label.as_ptr(),
                     count,
                     &mut bounds,
-                    DT_CALCRECT | DT_SINGLELINE | DT_HIDEPREFIX,
+                    DT_CALCRECT | flags,
                 );
             }
         }
         let width = (bounds.right - bounds.left).clamp(0, px(self.dpi, 480));
-        item.itemWidth = (width + px(self.dpi, LABEL_INSET) + self.right_gutter) as u32;
+        let horizontal_padding = if matches!(kind, RowKind::TextBlock | RowKind::CenteredItem) {
+            2 * px(self.dpi, TEXT_BLOCK_INSET)
+        } else {
+            px(self.dpi, LABEL_INSET) + self.right_gutter
+        };
+        item.itemWidth = (width + horizontal_padding) as u32;
         let height = bounds.bottom - bounds.top;
-        item.itemHeight = (height + px(self.dpi, 10)).max(px(self.dpi, 28)) as u32;
+        item.itemHeight =
+            (height + px(self.dpi, 2 * VERTICAL_PADDING)).max(px(self.dpi, 28)) as u32;
     }
 
     pub(super) fn draw(
         &self,
         item: &DRAWITEMSTRUCT,
         label: &[u16],
-        separator: bool,
+        kind: RowKind,
         submenu: bool,
         glyph: Option<u16>,
     ) {
@@ -128,7 +162,7 @@ impl Style {
             IntersectClipRect(dc, bounds.left, bounds.top, bounds.right, bounds.bottom);
             FillRect(dc, &bounds, palette.background.0);
         }
-        if separator {
+        if kind == RowKind::Separator {
             let middle = bounds.top + (bounds.bottom - bounds.top) / 2;
             let line = RECT {
                 left: bounds.left + px(self.dpi, 11),
@@ -137,20 +171,121 @@ impl Style {
                 bottom: middle + px(self.dpi, 1),
             };
             unsafe { FillRect(dc, &line, palette.separator.0) };
+        } else if let RowKind::Slider(value) = kind {
+            self.draw_slider(item, palette, label, value);
+        } else if kind == RowKind::TextBlock {
+            self.draw_text_block(item, palette, label);
         } else {
-            self.draw_row(item, palette, label, submenu, glyph);
+            self.draw_row(item, palette, label, submenu, glyph, kind);
         }
         unsafe { RestoreDC(dc, state) };
     }
 
-    fn draw_row(
-        &self,
-        item: &DRAWITEMSTRUCT,
-        palette: &Palette,
-        label: &[u16],
-        submenu: bool,
-        glyph: Option<u16>,
-    ) {
+    fn slider_track(&self, bounds: RECT) -> (i32, i32) {
+        let inset = px(self.dpi, SLIDER_INSET).min((bounds.right - bounds.left) / 2);
+        (bounds.left + inset, bounds.right - inset)
+    }
+
+    pub(super) fn slider_value(&self, bounds: RECT, x: i32) -> u8 {
+        let (left, right) = self.slider_track(bounds);
+        let length = right - left;
+        if length == 0 {
+            return 0;
+        }
+        let offset = x.clamp(left, right) - left;
+        ((offset * 100 + length / 2) / length) as u8
+    }
+
+    fn draw_slider(&self, item: &DRAWITEMSTRUCT, palette: &Palette, label: &[u16], value: u8) {
+        self.draw_selection(item, palette);
+        let dc = item.hDC;
+        let bounds = item.rcItem;
+        let dip = |value| px(self.dpi, value);
+        let (left, right) = self.slider_track(bounds);
+        let thumb = left + ((right - left) * i32::from(value.min(100)) + 50) / 100;
+        let y = bounds.bottom - dip(17);
+        let track_radius = dip(2);
+        let thumb_radius = dip(7);
+        let mut text = RECT {
+            top: bounds.top + dip(3),
+            bottom: y - thumb_radius,
+            ..bounds
+        };
+        unsafe {
+            SelectObject(dc, self.font.0);
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, palette.text);
+            DrawTextW(
+                dc,
+                label.as_ptr(),
+                text_len(label),
+                &mut text,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+            );
+
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(dc, palette.disabled);
+            RoundRect(
+                dc,
+                left,
+                y - track_radius,
+                right,
+                y + track_radius,
+                dip(4),
+                dip(4),
+            );
+            SetDCBrushColor(dc, palette.accent);
+            if thumb > left {
+                RoundRect(
+                    dc,
+                    left,
+                    y - track_radius,
+                    thumb,
+                    y + track_radius,
+                    dip(4),
+                    dip(4),
+                );
+            }
+            RoundRect(
+                dc,
+                thumb - thumb_radius,
+                y - thumb_radius,
+                thumb + thumb_radius,
+                y + thumb_radius,
+                dip(14),
+                dip(14),
+            );
+        }
+    }
+
+    fn draw_text_block(&self, item: &DRAWITEMSTRUCT, palette: &Palette, label: &[u16]) {
+        let dc = item.hDC;
+        let bounds = item.rcItem;
+        let inset = px(self.dpi, TEXT_BLOCK_INSET);
+        let extra =
+            (bounds.right - bounds.left - 2 * inset - px(self.dpi, TEXT_BLOCK_WIDTH)).max(0);
+        let mut text = RECT {
+            left: bounds.left + inset + extra / 2,
+            right: bounds.right - inset - (extra - extra / 2),
+            top: bounds.top + px(self.dpi, VERTICAL_PADDING),
+            bottom: bounds.bottom,
+        };
+        unsafe {
+            SelectObject(dc, self.font.0);
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, palette.text);
+            DrawTextW(
+                dc,
+                label.as_ptr(),
+                text_len(label),
+                &mut text,
+                DT_WORDBREAK | DT_CENTER | DT_NOPREFIX,
+            );
+        }
+    }
+
+    fn draw_selection(&self, item: &DRAWITEMSTRUCT, palette: &Palette) {
         let dc = item.hDC;
         let state = item.itemState;
         let bounds = item.rcItem;
@@ -171,6 +306,23 @@ impl Style {
                 );
             }
         }
+    }
+
+    fn draw_row(
+        &self,
+        item: &DRAWITEMSTRUCT,
+        palette: &Palette,
+        label: &[u16],
+        submenu: bool,
+        glyph: Option<u16>,
+        kind: RowKind,
+    ) {
+        self.draw_selection(item, palette);
+        let dc = item.hDC;
+        let state = item.itemState;
+        let bounds = item.rcItem;
+        let dip = |value| px(self.dpi, value);
+        let centered = kind == RowKind::CenteredItem;
 
         if submenu && let Some(badge) = &palette.arrow_badge {
             let middle = bounds.top + (bounds.bottom - bounds.top) / 2;
@@ -196,7 +348,9 @@ impl Style {
         } else {
             palette.text
         };
-        if state & ODS_CHECKED != 0 {
+        if let RowKind::Swatch(color) = kind {
+            self.draw_swatch(dc, bounds, color, palette.border);
+        } else if state & ODS_CHECKED != 0 && glyph.is_none() {
             let x = bounds.left + dip(11);
             let y = bounds.top + (bounds.bottom - bounds.top) / 2;
             let points = [
@@ -242,14 +396,25 @@ impl Style {
             return;
         }
         let mut text = RECT {
-            left: bounds.left + dip(LABEL_INSET),
+            left: bounds.left
+                + dip(if centered {
+                    TEXT_BLOCK_INSET
+                } else {
+                    LABEL_INSET
+                }),
             // Windows paints the submenu arrow after WM_DRAWITEM.
-            right: bounds.right - if submenu { self.right_gutter } else { dip(12) },
+            right: bounds.right
+                - if submenu {
+                    self.right_gutter
+                } else {
+                    dip(TEXT_BLOCK_INSET)
+                },
             ..bounds
         };
         let flags = DT_SINGLELINE
             | DT_VCENTER
             | DT_END_ELLIPSIS
+            | if centered { DT_CENTER } else { 0 }
             | if state & ODS_NOACCEL != 0 {
                 DT_HIDEPREFIX
             } else {
@@ -260,6 +425,32 @@ impl Style {
             SetBkMode(dc, TRANSPARENT as i32);
             SetTextColor(dc, text_color);
             DrawTextW(dc, label.as_ptr(), count, &mut text, flags);
+        }
+    }
+
+    fn draw_swatch(&self, dc: HDC, bounds: RECT, color: COLORREF, border: COLORREF) {
+        let dip = |value| px(self.dpi, value);
+        let left = bounds.left + dip(8);
+        let right = left + dip(16);
+        let height = dip(12);
+        let top = bounds.top + (bounds.bottom - bounds.top - height) / 2;
+        let bottom = top + height;
+        let inset = dip(1);
+        unsafe {
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(dc, border);
+            RoundRect(dc, left, top, right, bottom, dip(4), dip(4));
+            SetDCBrushColor(dc, color);
+            RoundRect(
+                dc,
+                left + inset,
+                top + inset,
+                right - inset,
+                bottom - inset,
+                dip(2),
+                dip(2),
+            );
         }
     }
 
@@ -304,6 +495,7 @@ struct Palette {
     check: Object,
     disabled_check: Object,
     arrow_badge: Option<Object>,
+    accent: COLORREF,
     border: COLORREF,
     text: COLORREF,
     disabled: COLORREF,
@@ -312,28 +504,16 @@ struct Palette {
 
 impl Palette {
     fn new(theme: Theme, dpi: u32) -> Option<Self> {
-        let (background, selected, separator, border, accent, text, disabled, icon) = match theme {
-            Theme::Dark => (
-                rgb(32, 32, 32),
-                rgb(47, 47, 47),
-                rgb(63, 63, 63),
-                rgb(74, 74, 74),
-                rgb(96, 205, 255),
-                rgb(244, 244, 244),
-                rgb(160, 160, 160),
-                rgb(213, 213, 213),
-            ),
-            Theme::Light => (
-                rgb(249, 249, 249),
-                rgb(236, 236, 236),
-                rgb(221, 221, 221),
-                rgb(210, 210, 210),
-                rgb(0, 103, 192),
-                rgb(26, 26, 26),
-                rgb(103, 103, 103),
-                rgb(62, 62, 62),
-            ),
-        };
+        let MenuColors {
+            background,
+            selected,
+            separator,
+            border,
+            accent,
+            text,
+            disabled,
+            icon,
+        } = theme.menu_colors();
         Some(Self {
             background: Object::new(unsafe { CreateSolidBrush(background) })?,
             selected: Object::new(unsafe { CreateSolidBrush(selected) })?,
@@ -347,6 +527,7 @@ impl Palette {
             } else {
                 None
             },
+            accent,
             border,
             text,
             disabled,
@@ -453,5 +634,28 @@ impl Object {
 impl Drop for Object {
     fn drop(&mut self) {
         unsafe { DeleteObject(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slider_uses_the_drawn_track_endpoints() {
+        for dpi in [96, 144] {
+            let style = Style::new(Theme::Dark, dpi).unwrap();
+            let bounds = RECT {
+                left: -240,
+                right: -240 + px(dpi, SLIDER_WIDTH),
+                ..Default::default()
+            };
+            let (left, right) = style.slider_track(bounds);
+            assert_eq!(style.slider_value(bounds, left - 1), 0);
+            assert_eq!(style.slider_value(bounds, left), 0);
+            assert_eq!(style.slider_value(bounds, (left + right) / 2), 50);
+            assert_eq!(style.slider_value(bounds, right), 100);
+            assert_eq!(style.slider_value(bounds, right + 1), 100);
+        }
     }
 }

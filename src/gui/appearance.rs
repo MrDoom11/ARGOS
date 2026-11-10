@@ -1,12 +1,13 @@
 use windows_sys::Win32::Foundation::{COLORREF, HWND};
+use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    GWL_EXSTYLE, GetWindowLongPtrW, SPI_GETHIGHCONTRAST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, SystemParametersInfoW,
+    WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 
 use super::chart::rgb;
 
-pub(super) const OPACITIES: [u8; 11] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0];
 pub(super) const LAYERED_STYLES: u32 = WS_EX_LAYERED | WS_EX_TRANSPARENT;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,7 +57,44 @@ pub(super) struct Palette {
     pub(super) text_outline: Option<COLORREF>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct MenuColors {
+    pub(super) background: COLORREF,
+    pub(super) selected: COLORREF,
+    pub(super) separator: COLORREF,
+    pub(super) border: COLORREF,
+    pub(super) accent: COLORREF,
+    pub(super) text: COLORREF,
+    pub(super) disabled: COLORREF,
+    pub(super) icon: COLORREF,
+}
+
 impl Theme {
+    pub(super) fn menu_colors(self) -> MenuColors {
+        match self {
+            Self::Dark => MenuColors {
+                background: rgb(32, 32, 32),
+                selected: rgb(47, 47, 47),
+                separator: rgb(63, 63, 63),
+                border: rgb(74, 74, 74),
+                accent: rgb(96, 205, 255),
+                text: rgb(244, 244, 244),
+                disabled: rgb(160, 160, 160),
+                icon: rgb(213, 213, 213),
+            },
+            Self::Light => MenuColors {
+                background: rgb(249, 249, 249),
+                selected: rgb(236, 236, 236),
+                separator: rgb(221, 221, 221),
+                border: rgb(210, 210, 210),
+                accent: rgb(0, 103, 192),
+                text: rgb(26, 26, 26),
+                disabled: rgb(103, 103, 103),
+                icon: rgb(62, 62, 62),
+            },
+        }
+    }
+
     pub(super) fn palette(self) -> Palette {
         match self {
             Self::Dark => Palette {
@@ -79,6 +117,22 @@ impl Theme {
             },
         }
     }
+}
+
+pub(super) fn high_contrast() -> bool {
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            (&raw mut contrast).cast(),
+            0,
+        )
+    };
+    read != 0 && contrast.dwFlags & HCF_HIGHCONTRASTON != 0
 }
 
 pub(super) fn is_layered(hwnd: HWND) -> bool {

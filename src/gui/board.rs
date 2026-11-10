@@ -2,16 +2,17 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
-use super::appearance::{Appearance, OPACITIES, Theme};
+use super::appearance::{Appearance, Theme};
 use crate::watch::{
-    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CpuMetrics, FRAME_SENSOR_START,
-    GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
+    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CpuMetrics, DEFAULT_FPS_CEILING,
+    FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
 };
 
 pub(super) const MAX_COLUMNS: usize = 6;
@@ -171,6 +172,7 @@ pub(super) struct Board {
     pub(super) rows: usize,
     pub(super) period: usize,
     pub(super) refresh_ms: u32,
+    pub(super) fps_ceiling: NonZeroU16,
     pub(super) panels: Vec<Vec<usize>>,
     pub(super) window_bounds: Option<[i32; 4]>,
     pub(super) gpu_ids: Vec<String>,
@@ -187,6 +189,7 @@ impl Board {
             rows: 1,
             period: 1,
             refresh_ms: DEFAULT_REFRESH_MS,
+            fps_ceiling: const { NonZeroU16::new(DEFAULT_FPS_CEILING).unwrap() },
             panels: Vec::new(),
             window_bounds: None,
             gpu_ids: Vec::new(),
@@ -470,11 +473,12 @@ impl Board {
             Theme::Light => "light",
         };
         let mut text = format!(
-            "{VERSION}\ncolumns={}\nrows={}\nperiod={}\nrefresh_ms={}\ntheme={theme}\nopacity={}\n",
+            "{VERSION}\ncolumns={}\nrows={}\nperiod={}\nrefresh_ms={}\nfps_ceiling={}\ntheme={theme}\nopacity={}\n",
             self.columns,
             self.rows,
             PERIOD_SECONDS[self.period],
             self.refresh_ms,
+            self.fps_ceiling,
             self.appearance.opacity,
         );
         if let Some([left, top, right, bottom]) = self.window_bounds {
@@ -563,15 +567,18 @@ impl Board {
                         board.refresh_ms = refresh_ms;
                     }
                 }
+                "fps_ceiling" => {
+                    if let Ok(ceiling) = value.parse() {
+                        board.fps_ceiling = ceiling;
+                    }
+                }
                 "theme" => match value {
                     "dark" => board.appearance.theme = Theme::Dark,
                     "light" => board.appearance.theme = Theme::Light,
                     _ => {}
                 },
                 "opacity" => {
-                    if let Ok(opacity) = value.parse()
-                        && OPACITIES.contains(&opacity)
-                    {
+                    if let Ok(opacity @ 0..=100) = value.parse() {
                         board.appearance.opacity = opacity;
                     }
                 }
@@ -1091,6 +1098,18 @@ mod tests {
     }
 
     #[test]
+    fn fps_ceiling_round_trips_and_defaults_for_legacy_configuration() {
+        let mut board = Board::decode("version=1\npanel=present-fps\n").unwrap();
+        assert_eq!(board.fps_ceiling.get(), DEFAULT_FPS_CEILING);
+
+        board.fps_ceiling = NonZeroU16::new(144).unwrap();
+        let text = board.encode();
+        assert!(text.contains("fps_ceiling=144\n"));
+        let invalid = format!("{text}fps_ceiling=0\nfps_ceiling=65536\nfps_ceiling=-1\n");
+        assert_eq!(Board::decode(&invalid), Some(board));
+    }
+
+    #[test]
     fn appearance_round_trips_and_rejects_unknown_values() {
         let legacy = "version=1\npanel=cpu-usage\n";
         let mut board = Board::decode(legacy).unwrap();
@@ -1098,10 +1117,11 @@ mod tests {
         assert_eq!(board.appearance.opacity, 100);
 
         board.appearance.theme = Theme::Light;
-        board.appearance.opacity = 0;
+        board.appearance.opacity = 75;
         let text = board.encode();
-        assert!(text.contains("theme=light\nopacity=0\n"));
-        let malformed = format!("{text}theme=unknown\nopacity=75\nopacity=256\n");
+        assert!(text.contains("theme=light\nopacity=75\n"));
+        assert_eq!(Board::decode(&text).as_ref(), Some(&board));
+        let malformed = format!("{text}theme=unknown\nopacity=101\nopacity=256\n");
         assert_eq!(Board::decode(&malformed), Some(board));
     }
 

@@ -23,6 +23,7 @@ pub(super) const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 pub(super) struct PaintStyle<'a> {
     pub(super) fonts: &'a ChartFonts,
     pub(super) palette: Palette,
+    pub(super) axis_ceiling: Option<f64>,
 }
 
 pub(super) fn paint(
@@ -32,7 +33,11 @@ pub(super) fn paint(
     series: &[(&MetricSnapshot, COLORREF, Option<&str>)],
     at: Instant,
     window: Duration,
-    PaintStyle { fonts, palette }: PaintStyle<'_>,
+    PaintStyle {
+        fonts,
+        palette,
+        axis_ceiling,
+    }: PaintStyle<'_>,
 ) {
     let Some(&(first, _, _)) = series.first() else {
         return;
@@ -69,7 +74,11 @@ pub(super) fn paint(
             }
         })
         .collect();
-    let scale = Scale::fixed(series.iter().map(|(metric, _, _)| metric.axis_max));
+    let scale = if let Some(ceiling) = axis_ceiling {
+        Scale::fixed([ceiling].into_iter())
+    } else {
+        Scale::fixed(series.iter().map(|(metric, _, _)| metric.axis_max))
+    };
     // Restaurar o contexto evita que uma fonte continue selecionada após o desenho.
     let Some(_state) = SavedDc::new(dc) else {
         return;

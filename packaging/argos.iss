@@ -14,6 +14,7 @@ AppName=ARGOS
 AppVersion={#AppVersion}
 DefaultDirName={userpf}\ARGOS
 DisableProgramGroupPage=yes
+SetupIconFile=..\assets\argos.ico
 UninstallDisplayIcon={app}\argos.exe
 PrivilegesRequired=lowest
 CloseApplications=no
@@ -47,6 +48,8 @@ Filename: "{app}\argos-gui.exe"; WorkingDir: "{app}"; Description: "Abrir o pain
 [Code]
 const
   ArgosUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#ArgosAppId}_is1';
+  ArgosStartupKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  ArgosStartupValue = 'ARGOS (MrDoom11)';
   SensorKey = 'Software\ARGOS\CpuSensor';
   RequiredSensorMetricsRevision = 2;
   SensorServiceKey = 'SYSTEM\CurrentControlSet\Services\ArgosCpuSensor';
@@ -60,6 +63,7 @@ const
 
 var
   LaunchLock: THandle;
+  PreviousStartupCommand: String;
 
 function CreateFile(const FileName: String; Access, ShareMode: DWORD;
   SecurityAttributes: UINT_PTR; CreationDisposition, FlagsAndAttributes: DWORD;
@@ -109,6 +113,26 @@ begin
   Version := '';
   if Result then
     RegQueryStringValue(HKCU64, ArgosUninstallKey, 'DisplayVersion', Version);
+end;
+
+function StartupCommand(const Directory: String): String;
+begin
+  Result := '"' + AddBackslash(Directory) + 'argos-gui.exe"';
+end;
+
+procedure PreserveStartup;
+var
+  Current, Command: String;
+begin
+  if PreviousStartupCommand = '' then
+    Exit;
+  Command := StartupCommand(ExpandConstant('{app}'));
+  if (CompareText(PreviousStartupCommand, Command) = 0) or (Length(Command) > 260) then
+    Exit;
+  if RegQueryStringValue(HKCU64, ArgosStartupKey, ArgosStartupValue, Current) and
+    (CompareText(Current, PreviousStartupCommand) = 0) then
+    if not RegWriteStringValue(HKCU64, ArgosStartupKey, ArgosStartupValue, Command) then
+      Log('Não foi possível atualizar o caminho da inicialização do ARGOS.');
 end;
 
 function PanelIsOpen: Boolean;
@@ -303,11 +327,18 @@ begin
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  PreviousLocation: String;
 begin
+  PreviousStartupCommand := '';
   try
     Result := AcquireLaunchLock;
     if Result = '' then
       Result := CheckInstallation;
+    if (Result = '') and
+      RegQueryStringValue(HKCU64, ArgosUninstallKey, 'InstallLocation', PreviousLocation) and
+      (PreviousLocation <> '') then
+      PreviousStartupCommand := StartupCommand(PreviousLocation);
   except
     Result := 'Falha ao preparar a instalação do ARGOS. ' + GetExceptionMessage;
   end;
@@ -352,6 +383,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    PreserveStartup;
     try
       ProvisionCpuSensor;
     except
@@ -359,6 +391,18 @@ begin
     end;
     ReleaseLaunchLock;
   end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Command: String;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    Exit;
+  if RegQueryStringValue(HKCU64, ArgosStartupKey, ArgosStartupValue, Command) and
+    (CompareText(Command, StartupCommand(ExpandConstant('{app}'))) = 0) then
+    if not RegDeleteValue(HKCU64, ArgosStartupKey, ArgosStartupValue) then
+      Log('Não foi possível remover a entrada de inicialização do ARGOS.');
 end;
 
 procedure DeinitializeSetup;
