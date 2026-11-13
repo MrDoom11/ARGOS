@@ -1,6 +1,8 @@
 use super::*;
 use crate::watch::{MetricSnapshot, RAM_USED_INDEX};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_CONTROL, MOD_SHIFT, VK_F9, VK_F10};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, MOD_CONTROL, MOD_SHIFT, VK_F9, VK_F10,
+};
 use windows_sys::w;
 
 #[test]
@@ -11,7 +13,7 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     let display = displays().into_iter().next().expect("monitor disponível");
     let start = initial_bounds(Some(display.work), dpi);
-    let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX]);
+    let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX, CPU_POWER_INDEX]);
     board.columns = 1;
     let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
     board.dropdown.enabled = true;
@@ -59,6 +61,12 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
             .map(|strip| strip.hwnd())
     };
     let strip_visible = || strip().is_some_and(|strip| unsafe { IsWindowVisible(strip) != 0 });
+    let (overlay, control) = {
+        let app = state.borrow();
+        let overlay = app.scrollbar_overlay.as_ref().unwrap();
+        (overlay.hwnd(), overlay.control)
+    };
+    let overlay_visible = || unsafe { IsWindowVisible(overlay) != 0 };
     let change_opacity = |opacity| {
         state.borrow_mut().board.appearance.opacity = opacity;
         sync_appearance(hwnd, &state);
@@ -88,25 +96,43 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
         let assert_passthrough = |hit| {
             assert_ne!(hit, hwnd);
             assert_ne!(hit, strip);
+            assert_ne!(hit, overlay);
+            assert_ne!(hit, control);
             assert_eq!(unsafe { IsChild(hwnd, hit) }, 0);
         };
         assert_passthrough(hit_at_height(10));
 
-        // A barra de rolagem permanece opaca na imagem, inclusive a 0%.
+        // A barra recebe os cliques no mesmo retângulo usado para desenhá-la.
         let [x, y, w, h] = state.borrow().scrollbar_state.unwrap().position;
-        let mut scrollbar = POINT {
-            x: x + w / 2,
-            y: y + h / 2,
-        };
-        assert!(scrollbar.y >= 10);
-        assert_ne!(unsafe { ClientToScreen(hwnd, &mut scrollbar) }, 0);
-        assert_passthrough(unsafe { WindowFromPoint(scrollbar) });
+        let mut origin = POINT { x, y };
+        assert_ne!(unsafe { ClientToScreen(hwnd, &mut origin) }, 0);
+        assert!(overlay_visible());
+        assert_eq!(
+            coords(rect(overlay)),
+            [origin.x, origin.y, origin.x + w, origin.y + h],
+        );
+        assert_eq!(
+            unsafe {
+                WindowFromPoint(POINT {
+                    x: origin.x + w / 2,
+                    y: origin.y + h / 2,
+                })
+            },
+            control,
+        );
+        assert_passthrough(unsafe {
+            WindowFromPoint(POINT {
+                x: origin.x - 1,
+                y: origin.y + h / 2,
+            })
+        });
     };
 
     send(RECONFIGURE, 0, 0);
     assert!(state.borrow().dropdown.active());
     assert!(!visible());
     assert!(!strip_visible());
+    assert!(!overlay_visible());
 
     let key = DropdownHotkey::new(MOD_CONTROL | MOD_SHIFT, u32::from(VK_F10)).unwrap();
     // Exercita o despacho de WM_HOTKEY sem reservar uma combinação global no desktop.
@@ -137,12 +163,49 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     state.borrow_mut().board.appearance.theme = Theme::Light;
     change_opacity(0);
     assert_translucent_input();
+    let scroll = |command, row: usize| unsafe {
+        SendMessageW(
+            overlay,
+            WM_VSCROLL,
+            command as usize | (row << 16),
+            control as LPARAM,
+        );
+    };
+    scroll(SB_LINEDOWN, 0);
+    assert_eq!(state.borrow().scroll_row, 1);
+    scroll(SB_THUMBTRACK, 2);
+    assert_eq!(state.borrow().scroll_row, 2);
+    scroll(SB_PAGEUP, 0);
+    assert_eq!(state.borrow().scroll_row, 1);
+    scroll(SB_TOP, 0);
+    assert_eq!(state.borrow().scroll_row, 0);
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut info = SCROLLBARINFO {
+        cbSize: size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    assert_ne!(
+        unsafe { GetScrollBarInfo(control, OBJID_CLIENT, &mut info) },
+        0
+    );
+    let x = width(info.rcScrollBar) / 2;
+    let y = height(info.rcScrollBar) - info.dxyLineButton / 2;
+    let arrow = (x | (y << 16)) as LPARAM;
+    unsafe {
+        assert_ne!(PostMessageW(control, WM_LBUTTONUP, 0, arrow), 0);
+        SendMessageW(control, WM_LBUTTONDOWN, 1, arrow);
+    }
+    assert_eq!(state.borrow().scroll_row, 1);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    unsafe { SendMessageW(control, WM_MOUSEWHEEL, (WHEEL_DELTA as usize) << 16, 0) };
+    assert_eq!(state.borrow().scroll_row, 0);
     if !appearance::high_contrast() {
         assert_scrollbar_background(&state.borrow(), Theme::Light);
     }
     press(VK_F10);
     assert!(!visible());
     assert!(!strip_visible());
+    assert!(!overlay_visible());
     send(instance::REVEAL_PANEL, 0, 0);
     assert!(visible());
     assert!(state.borrow().dropdown.pinned());
@@ -163,6 +226,7 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     assert!(!appearance::is_layered(hwnd));
     assert!(!appearance::is_click_through(hwnd));
     assert!(!strip_visible());
+    assert!(!overlay_visible());
     assert_eq!(hit_at_height(10), hwnd);
     sync_scrollbar(hwnd, &state);
     let scrollbar = state.borrow().scrollbar;
@@ -191,6 +255,18 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
         unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST,
         0
     );
+    assert_translucent_input();
+    unsafe { EnableWindow(hwnd, 0) };
+    assert!(!overlay_visible());
+    unsafe { EnableWindow(hwnd, 1) };
+    assert_translucent_input();
+    unsafe { ShowWindow(hwnd, SW_HIDE) };
+    assert!(!overlay_visible());
+    show_normal(hwnd);
+    assert_translucent_input();
+    state.borrow_mut().board.rows = 3;
+    sync_scrollbar(hwnd, &state);
+    assert!(!overlay_visible());
     drop(guard);
     assert_ne!(unsafe { UnregisterClassW(class.lpszClassName, module) }, 0);
 }
