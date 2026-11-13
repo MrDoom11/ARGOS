@@ -304,24 +304,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         match msg {
             WM_CREATE => {
-                let scrollbar = CreateWindowExW(
-                    0,
-                    windows_sys::w!("SCROLLBAR"),
-                    null(),
-                    WS_CHILD | SBS_VERT as u32,
-                    0,
-                    0,
-                    0,
-                    0,
-                    hwnd,
-                    null_mut(),
-                    (*(lp as *const CREATESTRUCTW)).hInstance,
-                    null(),
-                );
+                let scrollbar = scrollbar::create(hwnd);
                 if scrollbar.is_null() {
                     return -1;
                 }
-                state.borrow_mut().scrollbar = scrollbar;
+                let overlay = scrollbar::Overlay::new(hwnd);
+                let mut app = state.borrow_mut();
+                app.scrollbar = scrollbar;
+                app.scrollbar_overlay = overlay;
                 0
             }
             WM_NCHITTEST => {
@@ -420,7 +410,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_WINDOWPOSCHANGED => {
                 let result = DefWindowProcW(hwnd, msg, wp, lp);
                 sync_input_strip(hwnd, state);
+                sync_scrollbar(hwnd, state);
                 result
+            }
+            WM_ENABLE => {
+                sync_scrollbar_overlay(hwnd, state);
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_SIZE => {
                 cancel_drag(hwnd, state);
@@ -970,7 +965,7 @@ struct ScrollbarState {
     total_rows: usize,
     visible_rows: usize,
     first_row: usize,
-    interactive: bool,
+    layered: bool,
     theme: Theme,
 }
 
@@ -992,19 +987,25 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
         return;
     };
     let scrollbar = app.scrollbar;
-    let next = (app.scroll_limit() > 0).then(|| {
-        let bounds = scrollbar_bounds(app.content_bounds(client(hwnd)), app.dpi);
+    let overlay = app
+        .scrollbar_overlay
+        .as_ref()
+        .map(|overlay| overlay.control);
+    let bounds = scrollbar_bounds(app.content_bounds(client(hwnd)), app.dpi);
+    let next = (app.scroll_limit() > 0 && width(bounds) > 0 && height(bounds) > 0).then(|| {
         ScrollbarState {
             position: [bounds.left, bounds.top, width(bounds), height(bounds)],
             total_rows: app.total_rows(),
             visible_rows: app.board.rows,
             first_row: app.scroll_row,
-            interactive: !appearance::is_click_through(hwnd),
+            layered: appearance::is_click_through(hwnd),
             theme: app.board.appearance.theme,
         }
     });
     let previous = app.scrollbar_state;
     if previous == next {
+        drop(app);
+        sync_scrollbar_overlay(hwnd, state);
         return;
     }
     app.scrollbar_state = next;
@@ -1012,9 +1013,6 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
 
     unsafe {
         if let Some(next) = next {
-            if previous.is_none_or(|previous| previous.theme != next.theme) {
-                scrollbar::set_theme(scrollbar, next.theme);
-            }
             let info = SCROLLINFO {
                 cbSize: size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
@@ -1024,34 +1022,52 @@ fn sync_scrollbar(hwnd: HWND, state: &RefCell<Window>) {
                 nPos: next.first_row as i32,
                 nTrackPos: 0,
             };
-            SetScrollInfo(scrollbar, SB_CTL, &info, 0);
-            if previous.is_none_or(|previous| {
-                previous.interactive != next.interactive || previous.position != next.position
-            }) {
-                let [x, y, w, h] = next.position;
-                SetWindowPos(
-                    scrollbar,
-                    null_mut(),
-                    x,
-                    y,
-                    w,
-                    h,
-                    SWP_NOACTIVATE
-                        | SWP_NOZORDER
-                        | if next.interactive {
-                            SWP_SHOWWINDOW
-                        } else {
-                            SWP_HIDEWINDOW
-                        },
-                );
-            }
-            if next.interactive {
-                InvalidateRect(scrollbar, null(), 0);
+            let [x, y, w, h] = next.position;
+            for (control, x, y, show) in std::iter::once((scrollbar, x, y, !next.layered))
+                .chain(overlay.map(|control| (control, 0, 0, true)))
+            {
+                if previous.is_none_or(|previous| previous.theme != next.theme) {
+                    scrollbar::set_theme(control, next.theme);
+                }
+                SetScrollInfo(control, SB_CTL, &info, 0);
+                if previous.is_none_or(|previous| {
+                    previous.layered != next.layered || previous.position != next.position
+                }) {
+                    SetWindowPos(
+                        control,
+                        null_mut(),
+                        x,
+                        y,
+                        w,
+                        h,
+                        SWP_NOACTIVATE
+                            | SWP_NOZORDER
+                            | if show { SWP_SHOWWINDOW } else { SWP_HIDEWINDOW },
+                    );
+                }
+                if show {
+                    invalidate(control);
+                }
             }
         } else {
             ShowWindow(scrollbar, SW_HIDE);
         }
     }
+    sync_scrollbar_overlay(hwnd, state);
+}
+
+fn sync_scrollbar_overlay(hwnd: HWND, state: &RefCell<Window>) {
+    let Some((overlay, position)) = state.try_borrow().ok().and_then(|app| {
+        Some((
+            app.scrollbar_overlay.as_ref()?.hwnd(),
+            app.scrollbar_state
+                .filter(|scrollbar| scrollbar.layered && appearance::is_click_through(hwnd))
+                .map(|scrollbar| scrollbar.position),
+        ))
+    }) else {
+        return;
+    };
+    scrollbar::sync_overlay(overlay, hwnd, position);
 }
 
 fn sync_input_strip(hwnd: HWND, state: &RefCell<Window>) {
@@ -1843,6 +1859,7 @@ struct Window {
     open_menu: Option<Rc<OpenMenu>>,
     scroll_row: usize,
     scrollbar: HWND,
+    scrollbar_overlay: Option<scrollbar::Overlay>,
     scrollbar_state: Option<ScrollbarState>,
     input_strip: Option<input_strip::Strip>,
     wheel_remainder: i32,
@@ -1868,6 +1885,7 @@ impl Window {
             open_menu: None,
             scroll_row: 0,
             scrollbar: null_mut(),
+            scrollbar_overlay: None,
             scrollbar_state: None,
             input_strip: None,
             wheel_remainder: 0,

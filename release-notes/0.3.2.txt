@@ -1,0 +1,1 @@
+• A barra de rolagem volta a aceitar cliques e arrastes com o painel transparente.
