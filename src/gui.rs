@@ -16,9 +16,6 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::Dialogs::{
-    CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW,
-};
 use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
 use windows_sys::Win32::UI::HiDpi::*;
@@ -34,7 +31,7 @@ use crate::cli::GpuIndex;
 use crate::frames::{FrameTarget, Process, SENSOR_COUNT, visible_processes};
 use crate::gpu::Selection;
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
-use crate::update::{self, Source, Status, Updater};
+use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS,
     Monitor, Snapshot,
@@ -44,6 +41,7 @@ mod appearance;
 mod autostart;
 mod board;
 mod chart;
+mod color_picker;
 mod dialog;
 mod dropdown;
 mod dropdown_mode;
@@ -87,6 +85,8 @@ const UPDATE_RESTART: usize = 342;
 const UPDATE_SCHEDULE: usize = 343;
 const UPDATE_CANCEL: usize = 344;
 const UPDATE_ERROR: usize = 345;
+const UPDATE_CHECK_DETAILS: usize = 346;
+const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const DROPDOWN_TOGGLE: usize = 350;
 const DROPDOWN_PREVIEW: usize = 351;
 const DROPDOWN_PIN: usize = 352;
@@ -250,7 +250,8 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     panel_instance.ready();
     let _ = state.borrow_mut().updater.check(false);
     if let Some(notice) = startup_notice {
-        notice.show(hwnd);
+        let theme = state.borrow().board.appearance.theme;
+        notice.show(hwnd, theme);
         dropdown_mode::sync(hwnd, &state);
     }
 
@@ -414,6 +415,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 result
             }
             WM_ENABLE => {
+                sync_input_strip(hwnd, state);
                 sync_scrollbar_overlay(hwnd, state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -425,30 +427,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_TIMER if wp == TIMER => {
-                let notice = state.try_borrow_mut().ok().and_then(|mut app| {
-                    let notice = app.updater.poll();
-                    if app.dropdown.active()
-                        && (IsWindowVisible(hwnd) == 0 || IsWindowEnabled(hwnd) == 0)
-                    {
-                        if notice.is_some() {
-                            app.dropdown.notice = notice;
-                        }
-                        None
-                    } else {
-                        notice.or_else(|| app.dropdown.notice.take())
+                if let Ok(mut app) = state.try_borrow_mut() {
+                    if let Some(result) = app.updater.poll() {
+                        app.update_notice = Some(UpdateNotice::new(result));
                     }
-                });
-                if let Some(notice) = notice {
-                    EndMenu();
-                    update_notice(hwnd, &notice);
-                }
-                if IsIconic(hwnd) == 0
-                    && IsWindowVisible(hwnd) != 0
-                    && let Ok(mut app) = state.try_borrow_mut()
-                {
-                    let redraw = app.refresh() || app.snapshot_is_stale(Instant::now());
-                    drop(app);
-                    if redraw {
+                    let drawable = IsIconic(hwnd) == 0 && IsWindowVisible(hwnd) != 0;
+                    let can_show = drawable
+                        && IsWindowEnabled(hwnd) != 0
+                        && app.open_menu.is_none()
+                        && GetCapture().is_null();
+                    let now = Instant::now();
+                    let notice_changed = app
+                        .update_notice
+                        .as_mut()
+                        .is_some_and(|notice| notice.tick(now, can_show));
+                    if drawable && (app.refresh() || app.snapshot_is_stale(now) || notice_changed) {
+                        drop(app);
                         invalidate(hwnd);
                     }
                 }
@@ -1108,9 +1102,10 @@ impl OpenMenu {
 }
 
 fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: MenuSection) {
-    if state
-        .try_borrow()
-        .map_or(true, |app| app.open_menu.is_some())
+    if unsafe { IsWindowEnabled(hwnd) } == 0
+        || state
+            .try_borrow()
+            .map_or(true, |app| app.open_menu.is_some())
     {
         return;
     }
@@ -1228,7 +1223,16 @@ fn options_menu(
             });
             match app.updater.status() {
                 Status::Idle => {
-                    menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update)
+                    menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update);
+                    match app.update_notice.as_ref().map(|notice| &notice.result) {
+                        Some(CheckNotice::Current) => menu.label("O ARGOS está atualizado"),
+                        Some(CheckNotice::Failed(_)) => menu.item_icon(
+                            UPDATE_CHECK_DETAILS,
+                            "Ver erro da busca por atualizações",
+                            Icon::Error,
+                        ),
+                        _ => {}
+                    }
                 }
                 Status::Checking => menu.label_icon("Buscando por atualizações…", Icon::Update),
                 Status::Ready(version, scheduled) => {
@@ -1355,9 +1359,9 @@ fn apply_option(
     displays: &[dropdown::Display],
 ) {
     match choice {
-        ABOUT_RELEASES => open_about_link(hwnd, update::RELEASES_URL),
-        ABOUT_GUIDE => open_about_link(hwnd, ABOUT_GUIDE_URL),
-        ABOUT_TWITCH => open_about_link(hwnd, ABOUT_TWITCH_URL),
+        ABOUT_RELEASES => open_about_link(hwnd, state, update::RELEASES_URL),
+        ABOUT_GUIDE => open_about_link(hwnd, state, ABOUT_GUIDE_URL),
+        ABOUT_TWITCH => open_about_link(hwnd, state, ABOUT_TWITCH_URL),
         START_WITH_WINDOWS => toggle_autostart(hwnd, state),
         THEME_DARK | THEME_LIGHT => {
             edit_board(hwnd, state, |app| {
@@ -1466,13 +1470,14 @@ fn apply_option(
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         }
         UPDATE_CHECK => {
-            let result = state
-                .try_borrow_mut()
-                .ok()
-                .map(|mut app| app.updater.check(true));
-            if let Some(Err(error)) = result {
-                update_notice(hwnd, &error);
+            if let Ok(mut app) = state.try_borrow_mut() {
+                app.update_notice = app
+                    .updater
+                    .check(true)
+                    .err()
+                    .map(|error| UpdateNotice::new(CheckNotice::Failed(error)));
             }
+            invalidate(hwnd);
         }
         UPDATE_RESTART => {
             let result = state
@@ -1483,7 +1488,7 @@ fn apply_option(
                 Some(Ok(true)) => {
                     unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
                 }
-                Some(Err(error)) => update_notice(hwnd, &error),
+                Some(Err(error)) => show_notice(hwnd, state, "Atualização do ARGOS", &error),
                 _ => {}
             }
         }
@@ -1494,7 +1499,19 @@ fn apply_option(
         }
         UPDATE_ERROR => {
             if let Some(error) = update::last_error() {
-                update_notice(hwnd, &error);
+                show_notice(hwnd, state, "Atualização do ARGOS", &error);
+            }
+        }
+        UPDATE_CHECK_DETAILS => {
+            let error = state.borrow().update_notice.as_ref().and_then(|notice| {
+                if let CheckNotice::Failed(error) = &notice.result {
+                    Some(error.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(error) = error {
+                show_notice(hwnd, state, "Atualização do ARGOS", &error);
             }
         }
         choice if (PAGE_FIRST..PAGE_FIRST + MAX_SLOTS).contains(&choice) => {
@@ -1666,7 +1683,8 @@ fn change_dropdown(state: &RefCell<Window>, change: impl FnOnce(&mut board::Drop
 
 fn choose_dropdown_hotkey(hwnd: HWND, state: &RefCell<Window>) {
     dropdown_mode::unbind(hwnd, state);
-    let chosen = hotkey::choose(hwnd);
+    let theme = state.borrow().board.appearance.theme;
+    let chosen = hotkey::choose(hwnd, theme);
     if let Some(key) = chosen
         && dropdown_mode::bind(hwnd, state, key)
     {
@@ -1683,23 +1701,18 @@ fn choose_dropdown_hotkey(hwnd: HWND, state: &RefCell<Window>) {
         dropdown_mode::bind(hwnd, state, previous);
     }
     if chosen.is_some() {
-        let title = wide("Atalho global do ARGOS");
-        let message =
-            wide("O Windows não aceitou essa combinação. Escolha outra nas opções do dropdown.");
-        unsafe {
-            MessageBoxW(
-                hwnd,
-                message.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONWARNING,
-            )
-        };
+        show_notice(
+            hwnd,
+            state,
+            "Atalho global do ARGOS",
+            "O Windows não aceitou essa combinação. Escolha outra nas opções do dropdown.",
+        );
     }
 }
 
-fn open_about_link(hwnd: HWND, url: &str) {
+fn open_about_link(hwnd: HWND, state: &RefCell<Window>, url: &str) {
     let url = wide(url);
-    unsafe {
+    let result = unsafe {
         let initialized = CoInitializeEx(
             null(),
             (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
@@ -1715,14 +1728,15 @@ fn open_about_link(hwnd: HWND, url: &str) {
         if initialized {
             CoUninitialize();
         }
-        if result as isize <= 32 {
-            MessageBoxW(
-                hwnd,
-                w!("Não foi possível abrir o link no navegador."),
-                w!("Sobre o ARGOS"),
-                MB_OK | MB_ICONWARNING,
-            );
-        }
+        result
+    };
+    if result as isize <= 32 {
+        show_notice(
+            hwnd,
+            state,
+            "Sobre o ARGOS",
+            "Não foi possível abrir o link no navegador.",
+        );
     }
 }
 
@@ -1736,35 +1750,22 @@ fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
             .and_then(|enabled| autostart::set_enabled(directory, !enabled))
     };
     if let Err(error) = result {
-        let message = wide(&format!(
-            "Não foi possível alterar a inicialização do ARGOS. {error}"
-        ));
-        unsafe {
-            MessageBoxW(
-                hwnd,
-                message.as_ptr(),
-                w!("Iniciar com o Windows"),
-                MB_OK | MB_ICONWARNING,
-            )
-        };
+        show_notice(
+            hwnd,
+            state,
+            "Iniciar com o Windows",
+            &format!("Não foi possível alterar a inicialização do ARGOS. {error}"),
+        );
     }
 }
 
-fn update_notice(hwnd: HWND, message: &str) {
-    let message = wide(message);
-    let title = wide("Atualização do ARGOS");
-    unsafe {
-        MessageBoxW(
-            hwnd,
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        )
-    };
+fn show_notice(hwnd: HWND, state: &RefCell<Window>, title: &str, message: &str) {
+    let theme = state.borrow().board.appearance.theme;
+    dialog::notice(hwnd, theme, title, message);
 }
 
 fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, sensor: usize) {
-    let (initial, mut custom) = {
+    let (initial, mut custom, theme) = {
         let Ok(app) = state.try_borrow() else { return };
         let Some((position, series_count)) = app.board.panels.iter().find_map(|series| {
             series
@@ -1777,20 +1778,13 @@ fn choose_series_color(hwnd: HWND, state: &RefCell<Window>, sensor: usize) {
         (
             app.series_color(sensor, position, series_count),
             app.custom_colors,
+            app.board.appearance.theme,
         )
     };
-    let mut dialog = CHOOSECOLORW {
-        lStructSize: size_of::<CHOOSECOLORW>() as u32,
-        hwndOwner: hwnd,
-        rgbResult: initial,
-        lpCustColors: custom.as_mut_ptr(),
-        Flags: CC_RGBINIT | CC_FULLOPEN,
-        ..Default::default()
-    };
-    if unsafe { ChooseColorW(&mut dialog) } != 0 {
+    if let Some(color) = color_picker::choose(hwnd, initial, &mut custom, theme) {
         edit_board(hwnd, state, |app| {
             app.custom_colors = custom;
-            app.board.set_color(sensor, Some(dialog.rgbResult))
+            app.board.set_color(sensor, Some(color))
         });
     }
 }
@@ -1847,9 +1841,53 @@ fn sync_appearance(hwnd: HWND, state: &RefCell<Window>) {
     invalidate(hwnd);
 }
 
+enum NoticeVisibility {
+    Pending,
+    Showing(Instant),
+    Seen,
+}
+
+struct UpdateNotice {
+    result: CheckNotice,
+    visibility: NoticeVisibility,
+}
+
+impl UpdateNotice {
+    fn new(result: CheckNotice) -> Self {
+        Self {
+            result,
+            visibility: NoticeVisibility::Pending,
+        }
+    }
+
+    fn tick(&mut self, now: Instant, can_show: bool) -> bool {
+        self.visibility = match self.visibility {
+            NoticeVisibility::Pending if can_show => {
+                NoticeVisibility::Showing(now + UPDATE_NOTICE_DURATION)
+            }
+            NoticeVisibility::Showing(until) if now >= until => NoticeVisibility::Seen,
+            _ => return false,
+        };
+        true
+    }
+
+    fn text(&self) -> std::borrow::Cow<'static, str> {
+        match &self.result {
+            CheckNotice::Ready(version) => {
+                format!("ARGOS {version} pronto para atualizar. Abra o menu do painel.").into()
+            }
+            CheckNotice::Current => "O ARGOS está atualizado.".into(),
+            CheckNotice::Failed(_) => {
+                "Falha na busca por atualizações. Veja os detalhes no menu.".into()
+            }
+        }
+    }
+}
+
 struct Window {
     monitor: Monitor,
     updater: Updater,
+    update_notice: Option<UpdateNotice>,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
     dropdown: dropdown_mode::Runtime,
@@ -1876,6 +1914,7 @@ impl Window {
         Self {
             monitor,
             updater: Updater::new(source),
+            update_notice: None,
             snapshot: None,
             board,
             dropdown: dropdown_mode::Runtime::default(),
@@ -2548,10 +2587,17 @@ impl Window {
             return false;
         };
         let mut palette = self.board.appearance.layered_palette();
+        let notice_colors = self.board.appearance.theme.menu_colors();
         let alpha = ((u16::from(self.board.appearance.opacity) * 255 + 50) / 100) as u8;
         let foreground = |color| {
             [palette.border, palette.text, palette.muted, palette.grid].contains(&color)
                 || palette.text_outline == Some(color)
+                || [
+                    notice_colors.background,
+                    notice_colors.border,
+                    notice_colors.text,
+                ]
+                .contains(&color)
                 || SERIES.contains(&color)
                 || self
                     .board
@@ -2730,6 +2776,50 @@ impl Window {
                 }
             }
         }
+        if let Some(notice) = &self.update_notice
+            && matches!(notice.visibility, NoticeVisibility::Showing(_))
+        {
+            self.paint_update_notice(dc, bounds, &notice.text());
+        }
+    }
+
+    fn paint_update_notice(&self, dc: HDC, bounds: RECT, message: &str) {
+        let colors = self.board.appearance.theme.menu_colors();
+        let mut content = self.content_bounds(bounds);
+        if self.scroll_limit() > 0 {
+            content.right = scrollbar_bounds(content, self.dpi).left;
+        }
+        let margin = scale(12, self.dpi);
+        let inset_x = margin + (bounds.right - content.right);
+        let inset_y = margin + (content.top - bounds.top);
+        let notice_width = (width(bounds) - 2 * inset_x).min(scale(460, self.dpi));
+        let notice_height = (height(bounds) - 2 * inset_y).min(scale(34, self.dpi));
+        if notice_width <= 0 || notice_height <= 0 {
+            return;
+        }
+        let left = bounds.left + (width(bounds) - notice_width) / 2;
+        let top = bounds.top + (height(bounds) - notice_height) / 2;
+        let rect = area(left, top, left + notice_width, top + notice_height);
+        unsafe {
+            let brush = GetStockObject(DC_BRUSH);
+            let previous = SetDCBrushColor(dc, colors.background);
+            FillRect(dc, &rect, brush);
+            SetDCBrushColor(dc, colors.border);
+            FrameRect(dc, &rect, brush);
+            SetDCBrushColor(dc, previous);
+        }
+        draw_text(
+            dc,
+            message,
+            area(
+                rect.left + margin,
+                rect.top,
+                rect.right - margin,
+                rect.bottom,
+            ),
+            colors.text,
+            None,
+        );
     }
 }
 

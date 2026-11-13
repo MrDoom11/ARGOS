@@ -163,6 +163,58 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     state.borrow_mut().board.appearance.theme = Theme::Light;
     change_opacity(0);
     assert_translucent_input();
+
+    let foreground_before_notice = unsafe { GetForegroundWindow() };
+    state
+        .borrow_mut()
+        .updater
+        .complete_manual_check_for_test(semver::Version::new(0, 3, 99));
+    let menu = Menu::new().unwrap();
+    state.borrow_mut().open_menu = Some(Rc::new(OpenMenu {
+        root: menu.0,
+        section: MenuSection::All,
+        processes: Vec::new(),
+        displays: Vec::new(),
+        panel_sensors: Vec::new(),
+    }));
+    send(WM_TIMER, super::super::TIMER, 0);
+    {
+        let app = state.borrow();
+        assert!(app.open_menu.is_some());
+        assert!(matches!(app.updater.status(), Status::Ready(_, false)));
+        assert!(matches!(
+            app.update_notice.as_ref().unwrap().visibility,
+            NoticeVisibility::Pending,
+        ));
+    }
+    state.borrow_mut().open_menu = None;
+    drop(menu);
+    send(WM_TIMER, super::super::TIMER, 0);
+    assert!(matches!(
+        state.borrow().update_notice.as_ref().unwrap().visibility,
+        NoticeVisibility::Showing(_),
+    ));
+    assert_ne!(unsafe { IsWindowEnabled(hwnd) }, 0);
+    assert_eq!(unsafe { GetForegroundWindow() }, foreground_before_notice);
+    // Uma ferramenta externa pode tirar o foco e cancelar a interação em curso.
+    send(WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+    send(WM_CANCELMODE, 0, 0);
+    assert_ne!(unsafe { IsWindowEnabled(hwnd) }, 0);
+    assert_translucent_input();
+    {
+        let app = state.borrow();
+        let bounds = client(hwnd);
+        let mut surface = Surface::default();
+        let dc = surface
+            .target(null_mut(), width(bounds), height(bounds))
+            .unwrap();
+        app.paint_update_notice(dc, bounds, "");
+        assert_eq!(
+            unsafe { GetPixel(dc, width(bounds) / 2, height(bounds) / 2) },
+            app.board.appearance.theme.menu_colors().background,
+        );
+    }
+
     let scroll = |command, row: usize| unsafe {
         SendMessageW(
             overlay,
@@ -227,6 +279,10 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     assert!(!appearance::is_click_through(hwnd));
     assert!(!strip_visible());
     assert!(!overlay_visible());
+    assert!(matches!(
+        state.borrow().update_notice.as_ref().unwrap().visibility,
+        NoticeVisibility::Showing(_),
+    ));
     assert_eq!(hit_at_height(10), hwnd);
     sync_scrollbar(hwnd, &state);
     let scrollbar = state.borrow().scrollbar;
@@ -258,6 +314,7 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     assert_translucent_input();
     unsafe { EnableWindow(hwnd, 0) };
     assert!(!overlay_visible());
+    assert!(!strip_visible());
     unsafe { EnableWindow(hwnd, 1) };
     assert_translucent_input();
     unsafe { ShowWindow(hwnd, SW_HIDE) };

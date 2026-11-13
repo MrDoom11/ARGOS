@@ -4,14 +4,17 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
+use super::appearance::Theme;
 use super::board::DropdownHotkey;
-use super::dialog::Template;
+use super::dialog::{DIALOG_USER, DialogStyle, Template};
 
 const INSTRUCTIONS: i32 = 100;
 const SUBCLASS: usize = 1;
 
-pub(super) fn choose(owner: HWND) -> Option<DropdownHotkey> {
-    let result = template().show(owner, Some(dialog_proc), 0);
+pub(super) fn choose(owner: HWND, theme: Theme) -> Option<DropdownHotkey> {
+    let style = DialogStyle::new(theme);
+    let result =
+        template(style.is_some()).show(owner, Some(dialog_proc), (&raw const style) as LPARAM);
     let encoded = u32::try_from(result).ok()?;
     DropdownHotkey::new(encoded >> 16, encoded & 0xffff)
 }
@@ -63,11 +66,16 @@ fn pressed_modifiers() -> u32 {
     modifiers
 }
 
-unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _: LPARAM) -> isize {
+unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
     // SAFETY: os HWNDs são do diálogo e de seus controles na mesma thread.
     unsafe {
         match msg {
             WM_INITDIALOG => {
+                let style = &*(lp as *const Option<DialogStyle>);
+                SetWindowLongPtrW(hwnd, DIALOG_USER, lp);
+                if let Some(style) = style {
+                    style.apply(hwnd, IDCANCEL, &[IDCANCEL]);
+                }
                 let button = GetDlgItem(hwnd, IDCANCEL);
                 if button.is_null()
                     || SetWindowSubclass(button, Some(capture_proc), SUBCLASS, 0) == 0
@@ -84,7 +92,10 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, _: LPARA
                 EndDialog(hwnd, 0);
                 1
             }
-            _ => 0,
+            _ => (GetWindowLongPtrW(hwnd, DIALOG_USER) as *const Option<DialogStyle>)
+                .as_ref()
+                .and_then(Option::as_ref)
+                .map_or(0, |style| style.paint(msg, wp, lp, None)),
         }
     }
 }
@@ -151,7 +162,7 @@ unsafe extern "system" fn capture_proc(
     }
 }
 
-fn template() -> Template {
+fn template(themed: bool) -> Template {
     let mut template = Template::new("Atalho global do dropdown", [239, 57]);
     template.add_control(
         0x0082, // STATIC
@@ -160,10 +171,15 @@ fn template() -> Template {
         [10, 9, 220, 22],
         "Pressione Ctrl, Alt, Shift ou Win junto com outra tecla.\r\nPressione Esc para cancelar.",
     );
+    let button = if themed {
+        BS_OWNERDRAW
+    } else {
+        BS_DEFPUSHBUTTON
+    };
     template.add_control(
         0x0080, // BUTTON
         IDCANCEL as u16,
-        WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+        WS_TABSTOP | button as u32,
         [174, 34, 55, 14],
         "Cancelar",
     );

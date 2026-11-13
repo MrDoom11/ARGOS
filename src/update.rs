@@ -55,6 +55,12 @@ pub(crate) enum Status<'a> {
     Ready(&'a Version, bool),
 }
 
+pub(crate) enum CheckNotice {
+    Ready(Version),
+    Current,
+    Failed(String),
+}
+
 pub(crate) struct Updater {
     mode: Option<Mode>,
     phase: Phase,
@@ -116,7 +122,7 @@ impl Updater {
         Ok(())
     }
 
-    pub(crate) fn poll(&mut self) -> Option<String> {
+    pub(crate) fn poll(&mut self) -> Option<CheckNotice> {
         let Phase::Checking { result, manual } = &self.phase else {
             return None;
         };
@@ -129,18 +135,28 @@ impl Updater {
         self.phase = Phase::Idle;
         match update {
             Ok(Some(update)) => {
-                let notice = manual.then(|| {
-                    format!(
-                        "O ARGOS {} está pronto. Abra o menu do painel para atualizar.",
-                        update.version
-                    )
-                });
+                let notice = manual.then(|| CheckNotice::Ready(update.version.clone()));
                 self.phase = Phase::Ready(update);
                 notice
             }
-            Ok(None) => manual.then(|| "Nenhuma versão mais recente está disponível.".into()),
-            Err(error) => manual.then_some(error),
+            Ok(None) => manual.then_some(CheckNotice::Current),
+            Err(error) => manual.then_some(CheckNotice::Failed(error)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_manual_check_for_test(&mut self, version: Version) {
+        let (sender, result) = mpsc::channel();
+        sender
+            .send(Ok(Some(Staged {
+                directory: PathBuf::new(),
+                version,
+            })))
+            .unwrap();
+        self.phase = Phase::Checking {
+            result,
+            manual: true,
+        };
     }
 
     pub(crate) fn schedule(&mut self, enabled: bool) {
