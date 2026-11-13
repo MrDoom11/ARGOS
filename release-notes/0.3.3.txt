@@ -1,0 +1,5 @@
+• O resultado da busca por atualizações aparece no centro da janela sem bloquear os cliques no painel.
+
+• O seletor de cores, o atalho do dropdown e os avisos do painel seguem o tema claro ou escuro do ARGOS.
+
+• No seletor de cores, use o espectro, os campos RGB ou o código hexadecimal e confira a prévia antes de aplicar.

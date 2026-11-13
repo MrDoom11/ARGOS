@@ -4,11 +4,8 @@ use std::path::PathBuf;
 
 use semver::Version;
 use windows_sys::Win32::Foundation::HWND;
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
-};
 
-use super::{board, wide};
+use super::{appearance::Theme, board, dialog};
 
 const WELCOME: &str = "Clique com o botão direito no painel para abrir o menu.\n\n\
     Use Sensores e Grade para escolher os gráficos. Arraste um gráfico para mudar a ordem.\n\n\
@@ -59,7 +56,7 @@ pub(super) fn prepare(previous: Option<&Version>, restored_board: bool) -> Optio
 }
 
 impl StartupNotice {
-    pub(super) fn show(self, hwnd: HWND) {
+    pub(super) fn show(self, hwnd: HWND, theme: Theme) {
         let Self {
             notice,
             current,
@@ -72,17 +69,7 @@ impl StartupNotice {
                 RELEASE_NOTES.trim(),
             ),
         };
-        let title = wide(&title);
-        let message = wide(message);
-        let dismissed = unsafe {
-            MessageBoxW(
-                hwnd,
-                message.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-            )
-        };
-        if dismissed != 0
+        if dialog::notice(hwnd, theme, &title, message)
             && let Some(path) = path
         {
             let _ = board::replace_file(&path, current.to_string().as_bytes());

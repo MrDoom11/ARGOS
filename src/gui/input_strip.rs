@@ -5,6 +5,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BeginPaint, ClientToScreen, EndPaint, FillRect, GetStockObject, PAINTSTRUCT,
     ScreenToClient,
 };
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
@@ -62,6 +63,7 @@ pub(super) fn sync(hwnd: HWND, owner: HWND, enabled: bool) {
         || unsafe {
             IsWindowVisible(owner) == 0
                 || IsIconic(owner) != 0
+                || IsWindowEnabled(owner) == 0
                 || GetWindowRect(owner, &mut bounds) == 0
         }
         || width(bounds) <= 0
@@ -115,6 +117,12 @@ unsafe extern "system" fn strip_proc(
             WM_NCHITTEST => HTCLIENT as LRESULT,
             WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
             WM_ERASEBKGND => 1,
+            WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU
+            | WM_MOUSEWHEEL
+                if IsWindowEnabled(owner) == 0 =>
+            {
+                0
+            }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);

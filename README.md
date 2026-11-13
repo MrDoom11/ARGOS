@@ -42,7 +42,7 @@ O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
 
 ### Atualizações pelo painel
 
-O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do painel, use **Buscar por atualizações** para consultar novamente. Quando o pacote estiver pronto, escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. O painel mostra as novidades na primeira abertura depois da atualização. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
+O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do painel, use **Buscar por atualizações** para consultar novamente. O resultado aparece no centro da janela e o painel continua recebendo cliques. Quando o pacote estiver pronto, escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. O painel mostra as novidades na primeira abertura depois da atualização. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
 
 ## Janela de monitoramento
 

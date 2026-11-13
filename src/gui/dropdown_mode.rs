@@ -21,7 +21,6 @@ pub(super) struct Runtime {
     registered: Option<DropdownHotkey>,
     preview: Option<(Preview, Instant)>,
     fresh_until: Option<Instant>,
-    pub(super) notice: Option<String>,
     pub(super) save_failed: bool,
 }
 
