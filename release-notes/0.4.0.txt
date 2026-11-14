@@ -5,3 +5,5 @@
 • FancyZones — use Mover janela e arraste o painel para uma zona configurada no PowerToys.
 
 • Rede — selecione uma interface e acompanhe as taxas de download e upload em Mbps, com a escala ajustada à velocidade do link.
+
+• Armazenamento — configure por volume os gráficos de leitura, escrita, atividade e espaço ocupado. Acompanhe vários volumes ao mesmo tempo.

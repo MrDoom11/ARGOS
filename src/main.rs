@@ -29,6 +29,10 @@ mod nvml;
 #[cfg(windows)]
 mod probe;
 #[cfg(windows)]
+mod storage;
+#[cfg(windows)]
+mod storage_worker;
+#[cfg(windows)]
 mod system;
 #[cfg(windows)]
 mod telemetry;

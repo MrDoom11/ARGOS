@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -12,10 +12,11 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use super::appearance::{Appearance, Theme};
 use super::ping_targets::normalize_target;
 use crate::game_network::custom_ping::MAX_TARGETS;
+use crate::storage;
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, CpuMetrics,
     DEFAULT_FPS_CEILING, FRAME_SENSOR_START, GUI_INTERVALS_MS, NETWORK_DOWNLOAD_INDEX,
-    NETWORK_UPLOAD_INDEX, RAM_USED_INDEX, sensor_catalog,
+    NETWORK_UPLOAD_INDEX, RAM_USED_INDEX, STORAGE_SENSOR_COUNT, STORAGE_SENSORS, sensor_catalog,
 };
 
 pub(super) const MAX_COLUMNS: usize = 6;
@@ -35,6 +36,7 @@ const DROPDOWN_CONFIG: &str = "dropdown.conf";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_DROPDOWN_CONFIG_BYTES: u64 = 8192;
 const MAX_GPU_BINDINGS: usize = MAX_SLOTS * CPU_USAGE_INDEX;
+const MAX_STORAGE_BINDINGS: usize = MAX_SLOTS * STORAGE_SENSOR_COUNT;
 const PERIOD_SECONDS: [u32; 4] = [30, 60, 120, 300];
 const DEFAULT_REFRESH_MS: u32 = 1000;
 const MAX_COLORREF: u32 = 0x00ff_ffff;
@@ -170,6 +172,12 @@ struct GpuSensor {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum DeviceSensor {
+    Gpu(GpuSensor),
+    Storage { id: String, metric: usize },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct Board {
     pub(super) columns: usize,
     pub(super) rows: usize,
@@ -184,7 +192,7 @@ pub(super) struct Board {
     pub(super) appearance: Appearance,
     pub(super) dropdown: DropdownSettings,
     colors: Vec<Option<u32>>,
-    gpu_sensors: Vec<GpuSensor>,
+    device_sensors: Vec<DeviceSensor>,
 }
 
 impl Board {
@@ -203,7 +211,7 @@ impl Board {
             appearance: Appearance::default(),
             dropdown: DropdownSettings::default(),
             colors: vec![None; sensor_catalog().count()],
-            gpu_sensors: Vec::new(),
+            device_sensors: Vec::new(),
         };
         board.reset_selection(active);
         board
@@ -260,10 +268,10 @@ impl Board {
     }
 
     pub(super) fn gpu_sensor(&self, slot: usize) -> Option<(&str, usize)> {
-        let binding = self
-            .gpu_sensors
-            .get(slot.checked_sub(sensor_catalog().count())?)?;
-        Some((&binding.gpu_id, binding.base))
+        match self.device_sensor(slot)? {
+            DeviceSensor::Gpu(binding) => Some((&binding.gpu_id, binding.base)),
+            DeviceSensor::Storage { .. } => None,
+        }
     }
 
     pub(super) fn gpu_sensor_slot(&self, gpu_id: &str, base: usize) -> Option<usize> {
@@ -279,24 +287,76 @@ impl Board {
     ) -> usize {
         assert!(base < CPU_USAGE_INDEX);
         let persistent = persistent && is_persistent_gpu_id(gpu_id);
-        if let Some(index) = self.gpu_sensor_index(gpu_id, base) {
-            self.gpu_sensors[index].persistent |= persistent;
+        if let Some(index) = self.gpu_sensor_index(gpu_id, base)
+            && let DeviceSensor::Gpu(binding) = &mut self.device_sensors[index]
+        {
+            binding.persistent |= persistent;
             return sensor_catalog().count() + index;
         }
-        let slot = self.colors.len();
-        self.gpu_sensors.push(GpuSensor {
+        self.add_device_sensor(DeviceSensor::Gpu(GpuSensor {
             gpu_id: gpu_id.to_owned(),
             base,
             persistent,
-        });
+        }))
+    }
+
+    fn gpu_sensor_index(&self, gpu_id: &str, base: usize) -> Option<usize> {
+        self.device_sensors.iter().position(|binding| {
+            matches!(binding, DeviceSensor::Gpu(binding)
+                    if binding.base == base && binding.gpu_id == gpu_id)
+        })
+    }
+
+    fn device_sensor(&self, slot: usize) -> Option<&DeviceSensor> {
+        self.device_sensors
+            .get(slot.checked_sub(sensor_catalog().count())?)
+    }
+
+    fn add_device_sensor(&mut self, binding: DeviceSensor) -> usize {
+        let slot = self.colors.len();
+        self.device_sensors.push(binding);
         self.colors.push(None);
         slot
     }
 
-    fn gpu_sensor_index(&self, gpu_id: &str, base: usize) -> Option<usize> {
-        self.gpu_sensors
+    pub(super) fn storage_sensor(&self, slot: usize) -> Option<(&str, usize)> {
+        match self.device_sensor(slot)? {
+            DeviceSensor::Storage { id, metric } => Some((id, *metric)),
+            DeviceSensor::Gpu(_) => None,
+        }
+    }
+
+    pub(super) fn storage_sensor_slot(&self, id: &str, metric: usize) -> Option<usize> {
+        self.device_sensors
             .iter()
-            .position(|binding| binding.base == base && binding.gpu_id == gpu_id)
+            .position(|binding| {
+                matches!(binding, DeviceSensor::Storage { id: disk, metric: stored }
+                    if disk == id && *stored == metric)
+            })
+            .map(|index| sensor_catalog().count() + index)
+    }
+
+    pub(super) fn register_storage_sensor(&mut self, id: &str, metric: usize) -> usize {
+        assert!(metric < STORAGE_SENSOR_COUNT && storage::valid_id(id));
+        self.storage_sensor_slot(id, metric).unwrap_or_else(|| {
+            self.add_device_sensor(DeviceSensor::Storage {
+                id: id.to_owned(),
+                metric,
+            })
+        })
+    }
+
+    pub(super) fn storage_selection(&self) -> Vec<(String, u8)> {
+        let mut selections = BTreeMap::new();
+        for &slot in self.panels.iter().flatten() {
+            if let Some((id, metric)) = self.storage_sensor(slot) {
+                *selections.entry(id).or_insert(0) |= 1 << metric;
+            }
+        }
+        selections
+            .into_iter()
+            .map(|(id, mask)| (id.to_owned(), mask))
+            .collect()
     }
 
     pub(super) fn bind_legacy_gpu(&mut self, gpu_id: &str) -> bool {
@@ -327,6 +387,9 @@ impl Board {
     }
 
     pub(super) fn sensor_unit(&self, slot: usize) -> Option<&'static str> {
+        if let Some((_, metric)) = self.storage_sensor(slot) {
+            return Some(STORAGE_SENSORS[metric].2);
+        }
         let base = self.gpu_sensor(slot).map_or(slot, |(_, base)| base);
         sensor_catalog().nth(base).map(|(_, unit)| unit)
     }
@@ -537,27 +600,54 @@ impl Board {
         if let Some(&(key, _)) = catalog.get(slot) {
             return Some(key.to_owned());
         }
-        let binding = self.gpu_sensors.get(slot.checked_sub(catalog.len())?)?;
-        binding.persistent.then(|| {
-            format!(
-                "{}@{}",
-                catalog[binding.base].0,
-                hex::encode(&binding.gpu_id)
-            )
-        })
+        match self.device_sensor(slot)? {
+            DeviceSensor::Gpu(binding) => binding.persistent.then(|| {
+                format!(
+                    "{}@{}",
+                    catalog[binding.base].0,
+                    hex::encode(&binding.gpu_id)
+                )
+            }),
+            DeviceSensor::Storage { id, metric } => {
+                Some(format!("{}@{id}", STORAGE_SENSORS[*metric].0))
+            }
+        }
     }
 
     fn decode_sensor_key(&mut self, key: &str, catalog: &[(&str, &str)]) -> Option<usize> {
-        let (key, gpu) = key
+        let (key, device_id) = key
             .split_once('@')
-            .map_or((key, None), |(key, gpu)| (key, Some(gpu)));
+            .map_or((key, None), |(key, id)| (key, Some(id)));
+        if let Some(metric) = STORAGE_SENSORS.iter().position(|&(id, _, _)| id == key) {
+            let id = device_id.filter(|id| storage::valid_id(id))?;
+            if self.device_sensors.len() >= MAX_STORAGE_BINDINGS
+                && self
+                    .device_sensors
+                    .iter()
+                    .filter(|binding| matches!(binding, DeviceSensor::Storage { .. }))
+                    .count()
+                    >= MAX_STORAGE_BINDINGS
+            {
+                return self.storage_sensor_slot(id, metric);
+            }
+            return Some(self.register_storage_sensor(id, metric));
+        }
         let base = catalog.iter().position(|(id, _)| *id == key)?;
-        let Some(gpu) = gpu else { return Some(base) };
+        let Some(gpu) = device_id else {
+            return Some(base);
+        };
         if base >= CPU_USAGE_INDEX {
             return None;
         }
         let gpu = decode_persistent_gpu_id(gpu)?;
-        if self.gpu_sensors.len() >= MAX_GPU_BINDINGS {
+        if self.device_sensors.len() >= MAX_GPU_BINDINGS
+            && self
+                .device_sensors
+                .iter()
+                .filter(|binding| matches!(binding, DeviceSensor::Gpu(_)))
+                .count()
+                >= MAX_GPU_BINDINGS
+        {
             return self.gpu_sensor_slot(&gpu, base);
         }
         Some(self.register_gpu_sensor(&gpu, true, base))
@@ -933,6 +1023,46 @@ mod tests {
     }
 
     #[test]
+    fn storage_charts_keep_independent_metrics_and_colors_per_volume() {
+        const FIRST: &str = "11111111-1111-1111-1111-111111111111";
+        const SECOND: &str = "22222222-2222-2222-2222-222222222222";
+        let mut board = Board::new([]);
+        let first_read = board.register_storage_sensor(FIRST, 0);
+        let second_read = board.register_storage_sensor(SECOND, 0);
+        let second_write = board.register_storage_sensor(SECOND, 1);
+        let first_space = board.register_storage_sensor(FIRST, 3);
+        let second_activity = board.register_storage_sensor(SECOND, 2);
+        assert_ne!(first_read, second_read);
+        for slot in [second_read, first_read, first_space, second_activity] {
+            board.toggle(slot, 0);
+        }
+        assert!(board.merge(1, 0));
+        assert!(!board.merge(1, 0));
+        assert!(board.set_color(first_read, Some(0x0012_3456)));
+        assert!(board.set_color(second_read, Some(0x00ab_cdef)));
+        assert!(board.set_color(second_write, Some(0x0011_2233)));
+
+        let encoded = board.encode();
+        let malformed = format!("{encoded}panel=storage-read@invalid,storage-read\n");
+        let reopened = Board::decode(&malformed).unwrap();
+        assert_eq!(
+            reopened.storage_selection(),
+            [(FIRST.into(), 0b1001), (SECOND.into(), 0b0101)]
+        );
+        assert_eq!(reopened.panels.len(), 3);
+        let [second_read, first_read] = reopened.panels[0].as_slice() else {
+            panic!("as duas curvas de leitura devem permanecer no painel");
+        };
+        assert_eq!(reopened.storage_sensor(*first_read), Some((FIRST, 0)));
+        assert_eq!(reopened.storage_sensor(*second_read), Some((SECOND, 0)));
+        assert_eq!(reopened.color(*first_read), Some(0x0012_3456));
+        assert_eq!(reopened.color(*second_read), Some(0x00ab_cdef));
+        let second_write = reopened.storage_sensor_slot(SECOND, 1).unwrap();
+        assert!(!reopened.contains(second_write));
+        assert_eq!(reopened.color(second_write), Some(0x0011_2233));
+    }
+
+    #[test]
     fn binds_legacy_gpu_charts_and_colors_to_the_persistent_device() {
         let mut board = Board::new([0, CPU_USAGE_INDEX]);
         assert!(board.set_color(0, Some(0x0012_3456)));
@@ -974,7 +1104,7 @@ mod tests {
         let reopened = Board::decode(&malformed).unwrap();
         assert!(reopened.gpu_ids.is_empty());
         assert_eq!(reopened.panels, [vec![], vec![CPU_USAGE_INDEX]]);
-        assert!(reopened.gpu_sensors.is_empty());
+        assert!(reopened.device_sensors.is_empty());
     }
 
     #[test]

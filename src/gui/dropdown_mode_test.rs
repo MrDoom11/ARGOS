@@ -1,5 +1,5 @@
 use super::*;
-use crate::watch::{MetricSnapshot, RAM_USED_INDEX};
+use crate::watch::{MetricSnapshot, RAM_USED_INDEX, StorageSnapshot};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, MOD_CONTROL, MOD_SHIFT, VK_F9, VK_F10,
 };
@@ -359,7 +359,62 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
     assert_eq!(app.first_slot(), 0);
     assert_eq!(app.slots(), 1);
     assert!(app.board.set_color(RAM_USED_INDEX, Some(SERIES[0])));
-    let previous = app.snapshot.replace(Arc::new(Snapshot {
+    let previous = app.snapshot.replace(Arc::new(test_snapshot()));
+    let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
+    let color_item =
+        |sensor| unsafe { GetMenuState(menu.0, (COLOR_FIRST + sensor) as u32, MF_BYCOMMAND) };
+    assert_ne!(color_item(CPU_USAGE_INDEX), u32::MAX);
+    let next_page = color_item(RAM_USED_INDEX);
+    assert_ne!(next_page, u32::MAX);
+    assert_eq!(next_page & (MF_CHECKED | MF_GRAYED), 0);
+    app.snapshot = previous;
+}
+
+#[test]
+fn storage_menu_shows_independent_checks_and_drive_names() {
+    let board = Board::new([]);
+    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let mut app = Window::new(monitor, board, 96, Source::PortableExact);
+    let mut snapshot = test_snapshot();
+    let ids = [
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222",
+    ];
+    snapshot.storage = Arc::from(std::array::from_fn::<_, 2, _>(|index| StorageSnapshot {
+        id: ids[index].to_owned(),
+        label: Arc::from(["C: Sistema", "D: Arquivos"][index]),
+        metrics: (0..STORAGE_SENSOR_COUNT)
+            .map(storage_metric_template)
+            .collect(),
+    }));
+    assert!(app.update_snapshot(Some(Arc::new(snapshot))));
+    let system_read = app.board.storage_sensor_slot(ids[0], 0).unwrap();
+    let data_read = app.board.storage_sensor_slot(ids[1], 0).unwrap();
+    let data_write = app.board.storage_sensor_slot(ids[1], 1).unwrap();
+    app.board.toggle(system_read, 0);
+    app.board.toggle(data_write, 0);
+
+    let snapshot = app.snapshot.as_ref().unwrap();
+    assert_eq!(
+        app.series_title(snapshot, system_read).as_deref(),
+        Some("C: · Leitura")
+    );
+    assert_eq!(
+        app.series_title(snapshot, data_write).as_deref(),
+        Some("D: · Escrita")
+    );
+    let menu = options_menu(null_mut(), &app, MenuSection::Sensors, &[], &[], None).unwrap();
+    let state = |slot| unsafe { GetMenuState(menu.0, (SENSOR_FIRST + slot) as u32, MF_BYCOMMAND) };
+    for slot in [system_read, data_read, data_write] {
+        assert_ne!(state(slot), u32::MAX);
+    }
+    assert_ne!(state(system_read) & MF_CHECKED, 0);
+    assert_eq!(state(data_read) & MF_CHECKED, 0);
+    assert_ne!(state(data_write) & MF_CHECKED, 0);
+}
+
+fn test_snapshot() -> Snapshot {
+    Snapshot {
         at: Instant::now(),
         notice: String::new(),
         metrics: (0..=RAM_USED_INDEX)
@@ -387,15 +442,8 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
         network_interfaces: Arc::from([]),
         network_interface: None,
         network_status: None,
-    }));
-    let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
-    let color_item =
-        |sensor| unsafe { GetMenuState(menu.0, (COLOR_FIRST + sensor) as u32, MF_BYCOMMAND) };
-    assert_ne!(color_item(CPU_USAGE_INDEX), u32::MAX);
-    let next_page = color_item(RAM_USED_INDEX);
-    assert_ne!(next_page, u32::MAX);
-    assert_eq!(next_page & (MF_CHECKED | MF_GRAYED), 0);
-    app.snapshot = previous;
+        storage: Arc::from([]),
+    }
 }
 
 fn rect(hwnd: HWND) -> RECT {

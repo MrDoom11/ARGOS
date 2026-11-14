@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -16,6 +17,8 @@ use crate::gpu::{self, GpuInfo, Inventory, Selection};
 use crate::gpu_video;
 use crate::network::{self, Interface};
 use crate::nvml::{Device as NvmlDevice, Error as NvmlError, GPM_METRICS, GpmSampler};
+use crate::storage;
+use crate::storage_worker::{self, SAMPLE_INTERVAL as STORAGE_INTERVAL};
 use crate::system::{self, SystemSampler};
 use crate::telemetry::{Cadence, History};
 
@@ -155,6 +158,19 @@ const NETWORK_SENSORS: [Sensor; 2] = [
     ("network-download", "Download", " Mbps", Axis::Fixed(1.0)),
     ("network-upload", "Upload", " Mbps", Axis::Fixed(1.0)),
 ];
+pub(crate) const STORAGE_SENSOR_COUNT: usize = 4;
+pub(crate) const STORAGE_SENSORS: [(&str, &str, &str); STORAGE_SENSOR_COUNT] = [
+    ("storage-read", "Leitura", " MiB/s"),
+    ("storage-write", "Escrita", " MiB/s"),
+    ("storage-activity", "Atividade", "%"),
+    ("storage-space", "Espaço ocupado", "%"),
+];
+const STORAGE_METRIC_BITS: [u8; STORAGE_SENSOR_COUNT] = [
+    storage::READ,
+    storage::WRITE,
+    storage::ACTIVE,
+    storage::SPACE,
+];
 const GPM_COUNT: usize = GPM_METRICS.len();
 const NVIDIA_MEDIA_FIRST: usize = 9;
 const GPU_SHARED_MEMORY_INDEX: usize = GPU_SENSORS.len() - 1;
@@ -180,6 +196,7 @@ const CPU: &str = "CPU / PawnIO";
 const GAME_NETWORK: &str = "Rede do jogo / Windows";
 const CUSTOM_NETWORK: &str = "Rede / ICMP";
 const NETWORK: &str = "Interface de rede / Windows";
+const STORAGE: &str = "Armazenamento / Windows";
 // A chave persistida independe da tradução e da ordem de exibição do sensor.
 type Sensor = (&'static str, &'static str, &'static str, Axis);
 
@@ -327,6 +344,13 @@ pub(crate) struct Snapshot {
     pub(crate) network_interfaces: Arc<[Interface]>,
     pub(crate) network_interface: Option<u128>,
     pub(crate) network_status: Option<String>,
+    pub(crate) storage: Arc<[StorageSnapshot]>,
+}
+
+pub(crate) struct StorageSnapshot {
+    pub(crate) id: String,
+    pub(crate) label: Arc<str>,
+    pub(crate) metrics: Vec<MetricSnapshot>,
 }
 
 pub(crate) struct GpuSnapshot {
@@ -384,6 +408,7 @@ struct WindowFeed {
     game_latency_enabled: AtomicBool,
     custom_ping_targets: Mutex<Arc<[String]>>,
     network_settings: Mutex<NetworkSettings>,
+    storage_selection: Mutex<StorageSelection>,
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -437,6 +462,7 @@ impl Monitor {
             game_latency_enabled: AtomicBool::new(false),
             custom_ping_targets: Mutex::default(),
             network_settings: Mutex::default(),
+            storage_selection: Mutex::default(),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_feed = Arc::clone(&feed);
@@ -533,6 +559,17 @@ impl Monitor {
             && *current != settings
         {
             *current = settings;
+            drop(current);
+            self.feed.requested.store(true, Ordering::Relaxed);
+            self.wake();
+        }
+    }
+
+    pub(crate) fn set_storage_selection(&self, selection: Vec<(String, u8)>) {
+        if let Ok(mut current) = self.feed.storage_selection.lock()
+            && current.as_ref() != selection
+        {
+            *current = Arc::from(selection);
             drop(current);
             self.feed.requested.store(true, Ordering::Relaxed);
             self.wake();
@@ -708,6 +745,138 @@ struct DashboardReadings {
     game_latency: Option<GameLatencyMonitor>,
     custom_ping: Option<CustomPingMonitor>,
     network: Option<NetworkMonitor>,
+    storage: Option<StorageMonitor>,
+}
+
+type StorageFrame = [Option<Reading>; STORAGE_SENSOR_COUNT];
+type StorageSelection = Arc<[(String, u8)]>;
+
+struct StorageMonitor {
+    worker: storage_worker::Worker,
+    selection: StorageSelection,
+    volumes: Vec<(String, Arc<str>)>,
+    history: HashMap<String, History<StorageFrame>>,
+    latest: Arc<[StorageSnapshot]>,
+}
+
+impl StorageMonitor {
+    fn start() -> Option<Self> {
+        Some(Self {
+            worker: storage_worker::Worker::start(thread::current()).ok()?,
+            selection: Arc::default(),
+            volumes: Vec::new(),
+            history: HashMap::new(),
+            latest: Arc::default(),
+        })
+    }
+
+    fn poll(&mut self, selection: StorageSelection) -> bool {
+        let mut changed = false;
+        if !Arc::ptr_eq(&self.selection, &selection) {
+            if self.selection != selection {
+                self.worker.set_selection(Arc::clone(&selection));
+                self.history
+                    .retain(|id, _| selection.iter().any(|(selected, _)| selected == id));
+                changed = true;
+            }
+            self.selection = selection;
+        }
+        if let Some(volumes) = self.worker.take_inventory() {
+            self.volumes = volumes
+                .into_iter()
+                .map(|volume| (volume.id, Arc::from(volume.label)))
+                .collect();
+            changed = true;
+        }
+        if let Some(batch) = self.worker.take_sample() {
+            for observation in batch.samples {
+                let Some((_, mask)) = self.selection.iter().find(|(id, _)| *id == observation.id)
+                else {
+                    continue;
+                };
+                if *mask != observation.mask {
+                    continue;
+                }
+                let sample = observation.sample;
+                let values = [
+                    sample.read_bytes_per_sec.map(|value| value / BYTES_PER_MIB),
+                    sample
+                        .write_bytes_per_sec
+                        .map(|value| value / BYTES_PER_MIB),
+                    sample.active_percent,
+                    sample.used_percent,
+                ];
+                let frame = std::array::from_fn(|index| {
+                    (mask & STORAGE_METRIC_BITS[index] != 0).then(|| {
+                        values[index]
+                            .filter(|value| value.is_finite())
+                            .map_or(Reading::Unavailable, Reading::Value)
+                    })
+                });
+                self.history
+                    .entry(observation.id)
+                    .or_insert_with(|| {
+                        let capacity = HISTORY_WINDOW.as_secs() / STORAGE_INTERVAL.as_secs();
+                        History::new(HISTORY_WINDOW, capacity as usize)
+                    })
+                    .push(batch.at, frame);
+                changed = true;
+            }
+        }
+        if changed {
+            self.latest = self.snapshot(Instant::now());
+        }
+        changed
+    }
+
+    fn snapshot(&self, at: Instant) -> Arc<[StorageSnapshot]> {
+        self.volumes
+            .iter()
+            .map(|(id, label)| {
+                let mut metrics: Vec<_> = (0..STORAGE_SENSOR_COUNT)
+                    .map(storage_metric_template)
+                    .collect();
+                if let Some(history) = self.history.get(id) {
+                    for (captured, frame) in history.iter() {
+                        if at.saturating_duration_since(captured) >= HISTORY_WINDOW {
+                            continue;
+                        }
+                        for (metric, reading) in metrics.iter_mut().zip(frame) {
+                            if let Some(reading) = reading {
+                                metric.points.push(MetricPoint {
+                                    at: captured,
+                                    reading: *reading,
+                                    interval: STORAGE_INTERVAL,
+                                });
+                            }
+                        }
+                    }
+                    for metric in &mut metrics[..2] {
+                        expand_axis_to_peak(metric);
+                    }
+                }
+                StorageSnapshot {
+                    id: id.clone(),
+                    label: Arc::clone(label),
+                    metrics,
+                }
+            })
+            .collect()
+    }
+}
+
+pub(crate) fn storage_metric_template(index: usize) -> MetricSnapshot {
+    let (_, name, unit) = STORAGE_SENSORS[index];
+    MetricSnapshot {
+        name,
+        address_label: None,
+        remote_ip: None,
+        unit,
+        source: STORAGE,
+        interval: STORAGE_INTERVAL,
+        axis_max: if unit == "%" { 100.0 } else { 1.0 },
+        points: Vec::new(),
+    }
 }
 
 struct NetworkMonitor {
@@ -1404,6 +1573,7 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             .as_ref()
             .map(|_| CpuMonitor::new(start, options.system_interval)),
         network: window.map(|_| NetworkMonitor::new(start)),
+        storage: window.and_then(|_| StorageMonitor::start()),
         ..Default::default()
     };
     let mut skipped_updates = 0;
@@ -1479,6 +1649,13 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                     .lock()
                     .map_or_else(|_| NetworkSettings::default(), |settings| *settings);
                 snapshot_pending |= network.collect(Instant::now(), settings);
+            }
+            if let Some(storage) = &mut dashboard.storage {
+                let selection = feed
+                    .storage_selection
+                    .lock()
+                    .map_or_else(|_| Arc::default(), |selection| Arc::clone(&selection));
+                snapshot_pending |= storage.poll(selection);
             }
         }
         if let Some((elapsed, frame)) =
@@ -1756,17 +1933,7 @@ fn build_snapshot(
                 metric.axis_max = speed as f64 / BITS_PER_MEGABIT;
                 continue;
             }
-            let peak = metric.points.iter().fold(metric.axis_max, |peak, point| {
-                if let Reading::Value(value) = point.reading {
-                    peak.max(value)
-                } else {
-                    peak
-                }
-            });
-            if peak > metric.axis_max {
-                let magnitude = 10.0_f64.powf(peak.log10().floor());
-                metric.axis_max = (peak / magnitude).ceil() * magnitude;
-            }
+            expand_axis_to_peak(metric);
         }
     }
     Arc::new(Snapshot {
@@ -1795,7 +1962,25 @@ fn build_snapshot(
         network_status: network
             .and_then(|network| network.status)
             .map(str::to_owned),
+        storage: dashboard
+            .storage
+            .as_ref()
+            .map_or_else(Arc::default, |storage| Arc::clone(&storage.latest)),
     })
+}
+
+fn expand_axis_to_peak(metric: &mut MetricSnapshot) {
+    let peak = metric.points.iter().fold(metric.axis_max, |peak, point| {
+        if let Reading::Value(value) = point.reading {
+            peak.max(value)
+        } else {
+            peak
+        }
+    });
+    if peak > metric.axis_max {
+        let magnitude = 10.0_f64.powf(peak.log10().floor());
+        metric.axis_max = (peak / magnitude).ceil() * magnitude;
+    }
 }
 
 fn gpu_snapshot(

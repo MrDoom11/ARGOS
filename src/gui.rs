@@ -35,8 +35,9 @@ use crate::network::Interface;
 use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, FRAME_SENSOR_START,
-    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, Monitor, NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX,
-    Snapshot,
+    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, MetricPoint, MetricSnapshot, Monitor,
+    NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX, Reading, STORAGE_SENSOR_COUNT, STORAGE_SENSORS,
+    Snapshot, storage_metric_template,
 };
 
 mod appearance;
@@ -177,6 +178,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     monitor.set_game_latency_enabled(board.contains(GAME_LATENCY_INDEX));
     monitor.set_custom_ping_targets(board.active_ping_targets());
     monitor.set_network_interface(board.network_interface, board.network_enabled());
+    monitor.set_storage_selection(board.storage_selection());
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
@@ -1837,6 +1839,8 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
         .set_custom_ping_targets(app.board.active_ping_targets());
     app.monitor
         .set_network_interface(app.board.network_interface, app.board.network_enabled());
+    app.monitor
+        .set_storage_selection(app.board.storage_selection());
     app.save_failed = app.board.save().is_err();
     drop(app);
     if interval != old_interval {
@@ -1930,6 +1934,7 @@ struct Window {
     custom_colors: [COLORREF; 16],
     open_menu: Option<Rc<OpenMenu>>,
     network_menu_interfaces: Option<Arc<[Interface]>>,
+    unavailable_storage: [MetricSnapshot; STORAGE_SENSOR_COUNT],
     scroll_row: usize,
     scrollbar: HWND,
     scrollbar_overlay: Option<scrollbar::Overlay>,
@@ -1958,6 +1963,15 @@ impl Window {
             custom_colors: SERIES,
             open_menu: None,
             network_menu_interfaces: None,
+            unavailable_storage: std::array::from_fn(|index| {
+                let mut metric = storage_metric_template(index);
+                metric.points.push(MetricPoint {
+                    at: Instant::now(),
+                    reading: Reading::Unavailable,
+                    interval: metric.interval,
+                });
+                metric
+            }),
             scroll_row: 0,
             scrollbar: null_mut(),
             scrollbar_overlay: None,
@@ -2027,6 +2041,20 @@ impl Window {
                     }
                 }
             }
+        }
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|last| !Arc::ptr_eq(&last.storage, &next.storage))
+        {
+            for disk in next.storage.iter() {
+                for index in 0..STORAGE_SENSOR_COUNT {
+                    self.board.register_storage_sensor(&disk.id, index);
+                }
+            }
+        }
+        for metric in &mut self.unavailable_storage {
+            metric.points[0].at = next.at;
         }
         self.snapshot = Some(next);
         true
@@ -2190,7 +2218,18 @@ impl Window {
             && self.board.sensor_unit(index).is_some()
         {
             let first = self.first_slot();
+            let enabling_storage =
+                self.board.storage_sensor(index).is_some() && !self.board.contains(index);
             self.board.toggle(index, first);
+            if enabling_storage
+                && let Some(panel) = self
+                    .board
+                    .panels
+                    .iter()
+                    .position(|series| series.contains(&index))
+            {
+                self.show_panel(panel);
+            }
             return true;
         }
         false
@@ -2319,7 +2358,54 @@ impl Window {
         }
     }
 
+    fn storage_menu(&self, menu: &Menu) {
+        let Some(snapshot) = &self.snapshot else {
+            menu.label("Aguardando a primeira coleta");
+            return;
+        };
+        if snapshot.storage.is_empty() {
+            menu.label("Nenhum volume local disponível");
+        }
+        for disk in snapshot.storage.iter() {
+            menu.group(&disk.label.replace('&', "&&"), |items| {
+                for (index, &(_, name, _)) in STORAGE_SENSORS.iter().enumerate() {
+                    if let Some(slot) = self.board.storage_sensor_slot(&disk.id, index)
+                        && slot < MERGE_FIRST - SENSOR_FIRST
+                    {
+                        items.item(SENSOR_FIRST + slot, name, self.board.contains(slot));
+                    }
+                }
+            });
+        }
+        let unavailable: Vec<_> =
+            self.board
+                .panels
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&slot| {
+                    slot < MERGE_FIRST - SENSOR_FIRST
+                        && self.board.storage_sensor(slot).is_some_and(|(id, _)| {
+                            !snapshot.storage.iter().any(|disk| disk.id == id)
+                        })
+                })
+                .collect();
+        if !unavailable.is_empty() {
+            menu.group("Volumes indisponíveis", |items| {
+                for slot in unavailable {
+                    if let Some(name) = self.series_title(snapshot, slot) {
+                        items.item(SENSOR_FIRST + slot, &name, true);
+                    }
+                }
+            });
+        }
+    }
+
     fn sensor_menu(&self, menu: &Menu) {
+        menu.group_icon("Armazenamento", Icon::Sensors, |items| {
+            self.storage_menu(items)
+        });
+        menu.separator();
         let Some(snapshot) = &self.snapshot else {
             menu.label("Aguardando a primeira coleta");
             return;
@@ -2423,7 +2509,15 @@ impl Window {
         snapshot: &'a Snapshot,
         index: usize,
         selected: &[Selection],
-    ) -> Option<(&'a crate::watch::MetricSnapshot, Option<&'a str>)> {
+    ) -> Option<(&'a MetricSnapshot, Option<&'a str>)> {
+        if let Some((id, index)) = self.board.storage_sensor(index) {
+            if let Some(disk) = snapshot.storage.iter().find(|disk| disk.id == id)
+                && let Some(metric) = disk.metrics.get(index)
+            {
+                return Some((metric, Some(disk.label.get(..2).unwrap_or(&disk.label))));
+            }
+            return Some((&self.unavailable_storage[index], Some(&id[..8])));
+        }
         let (info, base) = if let Some((id, base)) = self.board.gpu_sensor(index) {
             (snapshot.gpu_devices.iter().find(|gpu| gpu.id == id), base)
         } else if index < CPU_USAGE_INDEX {
@@ -2825,11 +2919,11 @@ impl Window {
                         {
                             return None;
                         }
-                        let (metric, gpu) = self.chart_metric(snapshot, sensor, &selected)?;
+                        let (metric, device) = self.chart_metric(snapshot, sensor, &selected)?;
                         Some((
                             metric,
                             self.series_color(sensor, position, panel.len()),
-                            gpu,
+                            device,
                         ))
                     }));
                 }

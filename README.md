@@ -107,6 +107,10 @@ Em **Sensores → Ping personalizado → Editar endereços…**, informe até qu
 
 Escolha o adaptador em **Interfaces de rede**. O painel salva a escolha e oferece os gráficos **Download** e **Upload** em **Sensores**. As curvas mostram, em Mbps, o tráfego total recebido e enviado pela interface selecionada, incluindo transferências na rede local. Cada escala usa a velocidade do link que o Windows informa para a direção correspondente. Quando essa velocidade está indisponível, a escala acompanha o maior valor medido no histórico. A coleta registra uma amostra por segundo e começa um novo histórico quando muda de interface. [Contadores de interface do Windows](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2)
 
+### Armazenamento
+
+Em **Sensores → Armazenamento**, escolha os gráficos de cada volume local, como **C:** ou **D:**. **Leitura** e **Escrita** mostram a taxa em MiB/s com escala automática. **Atividade** mostra a porcentagem de tempo em que o volume esteve ocupado com operações de E/S, e **Espaço ocupado** mostra a porcentagem da capacidade preenchida. O painel salva as seleções por volume e permite acompanhar vários volumes ao mesmo tempo. [Contadores de armazenamento](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntdddisk/ns-ntdddisk-_disk_performance) · [Capacidade do volume](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskspaceinformationw)
+
 ### Sensores de CPU
 
 O painel consulta o sensor de controle (`Tctl`) de AMD Zen das famílias `17h`, `19h` e `1Ah` ou o sensor digital do pacote de CPUs Intel que oferecem essa leitura. A coleta acompanha o intervalo configurado no painel enquanto o gráfico está selecionado.
