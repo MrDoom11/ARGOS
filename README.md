@@ -103,6 +103,10 @@ O IP pode ser de um jogador, de um relay ou de um servidor. A leitura ICMP mede 
 
 Em **Sensores → Ping personalizado → Editar endereços…**, informe até quatro destinos, um por linha. A lista aceita IPv4, IPv6 e nomes de host. O painel salva os endereços e mostra uma curva por destino no mesmo gráfico. As sondagens ICMP rodam em segundo plano uma vez por segundo enquanto o gráfico está ativo. Destinos sem resposta aparecem como lacunas.
 
+### Download e upload
+
+Escolha o adaptador em **Interfaces de rede**. O painel salva a escolha e oferece os gráficos **Download** e **Upload** em **Sensores**. As curvas mostram, em Mbps, o tráfego total recebido e enviado pela interface selecionada, incluindo transferências na rede local. Cada escala usa a velocidade do link que o Windows informa para a direção correspondente. Quando essa velocidade está indisponível, a escala acompanha o maior valor medido no histórico. A coleta registra uma amostra por segundo e começa um novo histórico quando muda de interface. [Contadores de interface do Windows](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2)
+
 ### Sensores de CPU
 
 O painel consulta o sensor de controle (`Tctl`) de AMD Zen das famílias `17h`, `19h` e `1Ah` ou o sensor digital do pacote de CPUs Intel que oferecem essa leitura. A coleta acompanha o intervalo configurado no painel enquanto o gráfico está selecionado.

@@ -14,7 +14,8 @@ use super::ping_targets::normalize_target;
 use crate::game_network::custom_ping::MAX_TARGETS;
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, CpuMetrics,
-    DEFAULT_FPS_CEILING, FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
+    DEFAULT_FPS_CEILING, FRAME_SENSOR_START, GUI_INTERVALS_MS, NETWORK_DOWNLOAD_INDEX,
+    NETWORK_UPLOAD_INDEX, RAM_USED_INDEX, sensor_catalog,
 };
 
 pub(super) const MAX_COLUMNS: usize = 6;
@@ -178,6 +179,7 @@ pub(super) struct Board {
     pub(super) panels: Vec<Vec<usize>>,
     pub(super) window_bounds: Option<[i32; 4]>,
     pub(super) gpu_ids: Vec<String>,
+    pub(super) network_interface: Option<u128>,
     pub(super) ping_targets: Vec<String>,
     pub(super) appearance: Appearance,
     pub(super) dropdown: DropdownSettings,
@@ -196,6 +198,7 @@ impl Board {
             panels: Vec::new(),
             window_bounds: None,
             gpu_ids: Vec::new(),
+            network_interface: None,
             ping_targets: Vec::new(),
             appearance: Appearance::default(),
             dropdown: DropdownSettings::default(),
@@ -341,6 +344,10 @@ impl Board {
         } else {
             &[]
         }
+    }
+
+    pub(super) fn network_enabled(&self) -> bool {
+        self.contains(NETWORK_DOWNLOAD_INDEX) || self.contains(NETWORK_UPLOAD_INDEX)
     }
 
     pub(super) fn color(&self, sensor: usize) -> Option<u32> {
@@ -502,6 +509,9 @@ impl Board {
         for gpu in self.gpu_ids.iter().filter(|id| is_persistent_gpu_id(id)) {
             let _ = writeln!(text, "gpu={}", hex::encode(gpu));
         }
+        if let Some(id) = self.network_interface {
+            let _ = writeln!(text, "network_interface={id:032x}");
+        }
         for target in &self.ping_targets {
             let _ = writeln!(text, "ping_target={target}");
         }
@@ -611,6 +621,15 @@ impl Board {
                         && !board.gpu_ids.contains(&gpu)
                     {
                         board.gpu_ids.push(gpu);
+                    }
+                }
+                "network_interface" => {
+                    if value.len() == 32
+                        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && let Ok(id) = u128::from_str_radix(value, 16)
+                        && id != 0
+                    {
+                        board.network_interface = Some(id);
                     }
                 }
                 "ping_target" => {
@@ -834,6 +853,26 @@ mod tests {
         board.toggle(CUSTOM_PING_INDEX, 0);
         assert!(board.active_ping_targets().is_empty());
         assert_eq!(board.ping_targets.len(), MAX_TARGETS);
+    }
+
+    #[test]
+    fn network_interface_and_graph_selection_survive_a_configuration_round_trip() {
+        let mut board = Board::new(INITIAL_SENSORS);
+        assert_eq!(
+            Board::decode(&board.encode()).unwrap().network_interface,
+            None
+        );
+        assert!(!board.network_enabled());
+
+        board.network_interface = Some(0x0123456789abcdef0123456789abcdef);
+        board.toggle(NETWORK_UPLOAD_INDEX, 0);
+        let restored = Board::decode(&board.encode()).unwrap();
+        assert_eq!(restored, board);
+        assert!(restored.network_enabled());
+        assert!(!restored.contains(NETWORK_DOWNLOAD_INDEX));
+
+        let invalid = format!("{VERSION}\nnetwork_interface=invalid\n");
+        assert_eq!(Board::decode(&invalid).unwrap().network_interface, None);
     }
 
     #[test]

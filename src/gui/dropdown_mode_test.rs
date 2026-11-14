@@ -384,6 +384,9 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
         game_latency_status: None,
         custom_ping_metrics: Vec::new(),
         custom_ping_status: Vec::new(),
+        network_interfaces: Arc::from([]),
+        network_interface: None,
+        network_status: None,
     }));
     let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
     let color_item =

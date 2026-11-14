@@ -23,6 +23,8 @@ mod gui;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
+mod network;
+#[cfg(windows)]
 mod nvml;
 #[cfg(windows)]
 mod probe;

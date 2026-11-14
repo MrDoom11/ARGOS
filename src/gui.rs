@@ -31,10 +31,12 @@ use crate::cli::GpuIndex;
 use crate::frames::{FrameTarget, Process, SENSOR_COUNT, visible_processes};
 use crate::gpu::Selection;
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
+use crate::network::Interface;
 use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, FRAME_SENSOR_START,
-    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, Monitor, Snapshot,
+    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, Monitor, NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX,
+    Snapshot,
 };
 
 mod appearance;
@@ -116,6 +118,9 @@ const GPU_FIRST: usize = 701;
 const GPU_LIMIT: usize = 64;
 const OPACITY_SLIDER: usize = 800;
 const OPACITY_FIRST: usize = OPACITY_SLIDER + 1;
+const NETWORK_AUTO: usize = 910;
+const NETWORK_FIRST: usize = NETWORK_AUTO + 1;
+const NETWORK_LIMIT: usize = 64;
 const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 10000;
 const COLOR_FIRST: usize = 10100;
@@ -171,6 +176,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     let monitor = Monitor::start(selections, refresh_ms, board.cpu_metrics())?;
     monitor.set_game_latency_enabled(board.contains(GAME_LATENCY_INDEX));
     monitor.set_custom_ping_targets(board.active_ping_targets());
+    monitor.set_network_interface(board.network_interface, board.network_enabled());
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
@@ -1064,7 +1070,9 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         (Vec::new(), Vec::new())
     };
     let (menu, panel_sensors, theme, dpi) = {
-        let Ok(app) = state.try_borrow() else { return };
+        let Ok(mut app) = state.try_borrow_mut() else {
+            return;
+        };
         let mut point = screen;
         let panel = if matches!(section, MenuSection::All)
             && unsafe { ScreenToClient(hwnd, &mut point) } != 0
@@ -1077,6 +1085,14 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         } else {
             None
         };
+        // Preserve command IDs while adapter discovery refreshes in the background.
+        app.network_menu_interfaces = if matches!(section, MenuSection::All) {
+            app.snapshot
+                .as_ref()
+                .map(|snapshot| Arc::clone(&snapshot.network_interfaces))
+        } else {
+            None
+        };
         (
             options_menu(hwnd, &app, section, &processes, &displays, panel),
             panel.map_or_else(Vec::new, |index| app.board.panels[index].clone()),
@@ -1084,7 +1100,10 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             app.dpi,
         )
     };
-    let Some(menu) = menu else { return };
+    let Some(menu) = menu else {
+        state.borrow_mut().network_menu_interfaces = None;
+        return;
+    };
     let opened = Rc::new(OpenMenu {
         root: menu.0,
         section,
@@ -1107,14 +1126,16 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             &opened.displays,
         );
     }
+    state.borrow_mut().network_menu_interfaces = None;
 }
 
 fn keep_menu_open(choice: usize) -> bool {
     matches!(
         choice,
-        RESET_SENSORS | RESET_COLORS | GPU_AUTO | THEME_DARK | THEME_LIGHT
+        RESET_SENSORS | RESET_COLORS | GPU_AUTO | NETWORK_AUTO | THEME_DARK | THEME_LIGHT
     ) || (OPACITY_FIRST..=OPACITY_FIRST + 100).contains(&choice)
         || (GPU_FIRST..GPU_FIRST + GPU_LIMIT).contains(&choice)
+        || (NETWORK_FIRST..NETWORK_FIRST + NETWORK_LIMIT).contains(&choice)
         || (PERIOD_FIRST..PERIOD_FIRST + PERIODS.len()).contains(&choice)
         || (COLUMNS_FIRST..COLUMNS_FIRST + MAX_COLUMNS).contains(&choice)
         || (ROWS_FIRST..ROWS_FIRST + MAX_ROWS).contains(&choice)
@@ -1160,6 +1181,9 @@ fn options_menu(
             });
             menu.group_icon("Histórico", Icon::History, |items| app.period_menu(items));
             menu.group_icon("GPUs monitoradas", Icon::Gpu, |items| app.gpu_menu(items));
+            menu.group_icon("Interfaces de rede", Icon::Sensors, |items| {
+                app.network_menu(items)
+            });
             menu.group_icon("Sensores", Icon::Sensors, |items| app.sensor_menu(items));
             menu.group_icon("FPS", Icon::Fps, |items| app.frame_menu(items, processes));
             menu.separator();
@@ -1346,6 +1370,18 @@ fn apply_option(
         GPU_AUTO => choose_gpu(hwnd, state, None),
         choice if (GPU_FIRST..GPU_FIRST + GPU_LIMIT).contains(&choice) => {
             choose_gpu(hwnd, state, Some(choice - GPU_FIRST));
+        }
+        NETWORK_AUTO => choose_network_interface(hwnd, state, None),
+        choice if (NETWORK_FIRST..NETWORK_FIRST + NETWORK_LIMIT).contains(&choice) => {
+            let interface = state
+                .borrow()
+                .network_menu_interfaces
+                .as_ref()
+                .and_then(|interfaces| interfaces.get(choice - NETWORK_FIRST))
+                .map(|interface| interface.id);
+            if interface.is_some() {
+                choose_network_interface(hwnd, state, interface);
+            }
         }
         DROPDOWN_TOGGLE => {
             change_dropdown(state, |settings| settings.enabled = !settings.enabled);
@@ -1573,6 +1609,26 @@ fn choose_gpu(hwnd: HWND, state: &RefCell<Window>, index: Option<usize>) {
     invalidate(hwnd);
 }
 
+fn choose_network_interface(hwnd: HWND, state: &RefCell<Window>, interface: Option<u128>) {
+    edit_board(hwnd, state, |app| {
+        let previous = std::mem::replace(&mut app.board.network_interface, interface);
+        if app.board.network_enabled() {
+            return previous != interface;
+        }
+        let first = app.first_slot();
+        for sensor in [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX] {
+            app.board.toggle(sensor, first);
+        }
+        if let Some(panel) = app.board.panels.iter().position(|panel| {
+            panel.contains(&NETWORK_DOWNLOAD_INDEX) || panel.contains(&NETWORK_UPLOAD_INDEX)
+        }) {
+            app.show_panel(panel);
+            return true;
+        }
+        previous != interface
+    });
+}
+
 fn chosen_display<'a>(
     app: &Window,
     displays: &'a [dropdown::Display],
@@ -1779,6 +1835,8 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
         .set_game_latency_enabled(app.board.contains(GAME_LATENCY_INDEX));
     app.monitor
         .set_custom_ping_targets(app.board.active_ping_targets());
+    app.monitor
+        .set_network_interface(app.board.network_interface, app.board.network_enabled());
     app.save_failed = app.board.save().is_err();
     drop(app);
     if interval != old_interval {
@@ -1871,6 +1929,7 @@ struct Window {
     save_failed: bool,
     custom_colors: [COLORREF; 16],
     open_menu: Option<Rc<OpenMenu>>,
+    network_menu_interfaces: Option<Arc<[Interface]>>,
     scroll_row: usize,
     scrollbar: HWND,
     scrollbar_overlay: Option<scrollbar::Overlay>,
@@ -1898,6 +1957,7 @@ impl Window {
             save_failed: false,
             custom_colors: SERIES,
             open_menu: None,
+            network_menu_interfaces: None,
             scroll_row: 0,
             scrollbar: null_mut(),
             scrollbar_overlay: None,
@@ -2201,6 +2261,61 @@ impl Window {
                 .iter()
                 .any(|selection| gpu.matches_selection(selection));
             menu.item(GPU_FIRST + index, &gpu.label().replace('&', "&&"), checked);
+        }
+    }
+
+    fn network_menu(&self, menu: &Menu) {
+        let selected = self.board.network_interface;
+        let current = self.snapshot.as_ref().and_then(|snapshot| {
+            let id = snapshot.network_interface?;
+            snapshot
+                .network_interfaces
+                .iter()
+                .find(|interface| interface.id == id)
+        });
+        let auto = current.filter(|_| selected.is_none()).map_or_else(
+            || "Automática".to_owned(),
+            |interface| format!("Automática · {}", interface.name.replace('&', "&&")),
+        );
+        menu.item(NETWORK_AUTO, &auto, selected.is_none());
+        if let Some(interfaces) = &self.network_menu_interfaces {
+            for (index, interface) in interfaces.iter().take(NETWORK_LIMIT).enumerate() {
+                let mut name = interface.name.replace('&', "&&");
+                if !interface.connected {
+                    name.push_str(" (desconectada)");
+                }
+                menu.item(NETWORK_FIRST + index, &name, selected == Some(interface.id));
+            }
+            if let Some(id) = selected
+                && !interfaces
+                    .iter()
+                    .take(NETWORK_LIMIT)
+                    .any(|interface| interface.id == id)
+            {
+                menu.label("Interface selecionada indisponível");
+            } else if interfaces.is_empty() {
+                menu.label("Nenhuma interface encontrada");
+            }
+        } else {
+            menu.label("Procurando interfaces…");
+        }
+        if let Some(snapshot) = &self.snapshot {
+            menu.separator();
+            for index in [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX] {
+                if let Some(metric) = snapshot.metrics.get(index) {
+                    menu.item(
+                        SENSOR_FIRST + index,
+                        metric.name,
+                        self.board.contains(index),
+                    );
+                }
+            }
+            if self.board.network_enabled()
+                && selected.is_none_or(|id| Some(id) == snapshot.network_interface)
+                && let Some(status) = snapshot.network_status.as_deref()
+            {
+                menu.label(&status.replace('&', "&&"));
+            }
         }
     }
 
@@ -2671,6 +2786,10 @@ impl Window {
             };
             let period = Duration::from_secs(PERIODS[self.board.period].0);
             let frames_current = snapshot.frame_target == self.monitor.frame_target();
+            let network_current = self
+                .board
+                .network_interface
+                .is_none_or(|id| Some(id) == snapshot.network_interface);
             let selected = self.monitor.gpu_selections();
             let mut series = Vec::new();
             for (slot, panel) in self
@@ -2700,7 +2819,10 @@ impl Window {
                     ));
                 } else {
                     series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
-                        if !frames_current && FRAME_SENSORS.contains(&sensor) {
+                        if (!frames_current && FRAME_SENSORS.contains(&sensor))
+                            || (!network_current
+                                && matches!(sensor, NETWORK_DOWNLOAD_INDEX | NETWORK_UPLOAD_INDEX))
+                        {
                             return None;
                         }
                         let (metric, gpu) = self.chart_metric(snapshot, sensor, &selected)?;
