@@ -4,23 +4,27 @@ mod process;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::mpsc::TryRecvError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
 use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 
 use self::etw::{Capture, PresentEvent, PresentKind, Runtime};
-use self::process::Target;
-pub(crate) use self::process::{Process, foreground_pid, visible_processes};
+pub(crate) use self::process::{
+    Process, Target as ProcessTarget, foreground_pid, process_name, visible_processes,
+};
 
 pub(crate) const SENSOR_COUNT: usize = 3;
 const MAX_PENDING: usize = 64;
 const MAX_STREAMS: usize = 16;
 const MAX_TIMINGS: usize = 2048;
 const MAX_EVENTS_PER_READ: usize = 8192;
+const CAPTURE_RETRY: Duration = Duration::from_secs(5);
 const ACTIVE: &str = "Capturando apresentações DirectX";
 const WAITING: &str = "Aguardando apresentações DirectX do processo";
 const ACCESS_DENIED: &str = "Captura requer administrador ou Performance Log Users";
-const CAPTURE_ENDED: &str = "Captura interrompida. Desative e selecione o processo novamente";
+const CAPTURE_ENDED: &str = "Captura interrompida. Tentando reconectar";
+const PROCESS_ENDED: &str = "O processo selecionado foi encerrado";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum FrameTarget {
@@ -48,72 +52,127 @@ impl FrameTarget {
 pub(crate) enum Sample {
     Measured([Option<f64>; SENSOR_COUNT]),
     Waiting(&'static str),
-    Unavailable(&'static str),
+    Unavailable(CaptureFailure),
 }
 
-pub(crate) struct FrameSampler(Result<ActiveCapture, &'static str>);
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureFailure {
+    Permission,
+    Retryable(&'static str),
+    Other(&'static str),
+}
+
+impl CaptureFailure {
+    fn from_trace_error(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::PermissionDenied => Self::Permission,
+            io::ErrorKind::AlreadyExists => {
+                Self::Retryable("Outra instância do ARGOS já está capturando quadros")
+            }
+            _ if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD as i32) => Self::Permission,
+            _ => Self::Other("Windows não conseguiu iniciar a captura de quadros"),
+        }
+    }
+}
+
+pub(crate) struct FrameSampler {
+    pid: u32,
+    target: Option<ProcessTarget>,
+    capture: Result<ActiveCapture, CaptureFailure>,
+    retry_at: Option<Instant>,
+}
 
 struct ActiveCapture {
     capture: Capture,
-    target: Target,
     presents: Presents,
 }
 
 impl FrameSampler {
     pub(crate) fn start(pid: u32) -> Self {
-        Self(ActiveCapture::start(pid))
+        let target = ProcessTarget::open(pid).ok();
+        let capture = if target.is_some() {
+            ActiveCapture::start(pid)
+        } else {
+            Err(CaptureFailure::Other("Processo indisponível para captura"))
+        };
+        let retry_at = retry_deadline(&capture, Instant::now());
+        Self {
+            pid,
+            target,
+            capture,
+            retry_at,
+        }
     }
 
     pub(crate) fn sample(&mut self, interval: Duration) -> Sample {
-        match &mut self.0 {
+        if self
+            .target
+            .as_ref()
+            .is_some_and(|target| !target.is_running())
+        {
+            self.target = None;
+            self.capture = Err(CaptureFailure::Other(PROCESS_ENDED));
+            self.retry_at = None;
+        }
+        if self.retry_at.is_some_and(|at| Instant::now() >= at) {
+            self.capture = ActiveCapture::start(self.pid);
+            self.retry_at = retry_deadline(&self.capture, Instant::now());
+        }
+        match &mut self.capture {
             Ok(capture) => match capture.sample(interval) {
                 Ok(sample) => sample,
-                Err(reason) => {
-                    self.0 = Err(reason);
-                    Sample::Unavailable(reason)
+                Err(failure) => {
+                    self.capture = Err(failure);
+                    self.retry_at = retry_deadline(&self.capture, Instant::now());
+                    Sample::Unavailable(failure)
                 }
             },
-            Err(reason) => Sample::Unavailable(reason),
+            Err(failure) => Sample::Unavailable(*failure),
         }
     }
+}
+
+fn retry_deadline(
+    capture: &Result<ActiveCapture, CaptureFailure>,
+    now: Instant,
+) -> Option<Instant> {
+    matches!(capture, Err(CaptureFailure::Retryable(_))).then_some(now + CAPTURE_RETRY)
 }
 
 impl Sample {
     pub(crate) fn status(&self) -> &'static str {
         match self {
             Self::Measured(_) => ACTIVE,
-            Self::Waiting(reason) | Self::Unavailable(reason) => reason,
+            Self::Waiting(reason)
+            | Self::Unavailable(
+                CaptureFailure::Retryable(reason) | CaptureFailure::Other(reason),
+            ) => reason,
+            Self::Unavailable(CaptureFailure::Permission) => ACCESS_DENIED,
         }
+    }
+
+    pub(crate) fn requires_admin(&self) -> bool {
+        matches!(self, Self::Unavailable(CaptureFailure::Permission))
     }
 }
 
 impl ActiveCapture {
-    fn start(pid: u32) -> Result<Self, &'static str> {
-        let target = Target::open(pid).map_err(|_| "Processo indisponível para captura")?;
-        let capture = Capture::start(pid).map_err(|error| match error.kind() {
-            io::ErrorKind::PermissionDenied => ACCESS_DENIED,
-            io::ErrorKind::AlreadyExists => "Outra instância do ARGOS já está capturando quadros",
-            _ => "Windows não conseguiu iniciar a captura de quadros",
-        })?;
+    fn start(pid: u32) -> Result<Self, CaptureFailure> {
+        let capture = Capture::start(pid).map_err(CaptureFailure::from_trace_error)?;
         let presents = Presents::new(capture.ticks_per_second());
-        Ok(Self {
-            capture,
-            target,
-            presents,
-        })
+        Ok(Self { capture, presents })
     }
 
-    fn sample(&mut self, interval: Duration) -> Result<Sample, &'static str> {
-        if !self.target.is_running() {
-            return Err("O processo selecionado foi encerrado");
-        }
+    fn sample(&mut self, interval: Duration) -> Result<Sample, CaptureFailure> {
         let mut lost = self.capture.take_loss();
         for _ in 0..MAX_EVENTS_PER_READ {
             match self.capture.try_recv() {
                 Ok(event) if !lost => self.presents.record(event),
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err(CAPTURE_ENDED),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(CaptureFailure::Retryable(CAPTURE_ENDED));
+                }
             }
         }
         lost |= self.capture.take_loss();
@@ -126,7 +185,7 @@ impl ActiveCapture {
         let mut now = 0;
         // SAFETY: `now` is a writable LARGE_INTEGER for the duration of the call.
         if unsafe { QueryPerformanceCounter(&mut now) } == 0 {
-            return Err("Relógio de captura indisponível");
+            return Err(CaptureFailure::Other("Relógio de captura indisponível"));
         }
         Ok(self
             .presents
@@ -288,6 +347,55 @@ mod tests {
     use super::*;
 
     const ONE_SECOND: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn frames_require_administrator_only_after_a_permissions_failure() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS};
+
+        for code in [ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD] {
+            let failure =
+                CaptureFailure::from_trace_error(io::Error::from_raw_os_error(code as i32));
+            let sample = Sample::Unavailable(failure);
+            assert!(sample.requires_admin());
+            assert_eq!(sample.status(), ACCESS_DENIED);
+        }
+        let busy = CaptureFailure::from_trace_error(io::Error::from_raw_os_error(
+            ERROR_ALREADY_EXISTS as i32,
+        ));
+        assert!(!Sample::Unavailable(busy).requires_admin());
+        assert!(!Sample::Waiting(WAITING).requires_admin());
+        assert!(!Sample::Measured([None; SENSOR_COUNT]).requires_admin());
+    }
+
+    #[test]
+    fn retries_busy_and_interrupted_capture_with_a_backoff() {
+        use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+
+        let now = Instant::now();
+        let busy = CaptureFailure::from_trace_error(io::Error::from_raw_os_error(
+            ERROR_ALREADY_EXISTS as i32,
+        ));
+        for failure in [busy, CaptureFailure::Retryable(CAPTURE_ENDED)] {
+            let capture = Err(failure);
+            let mut sampler = FrameSampler {
+                pid: std::process::id(),
+                target: Some(ProcessTarget::open(std::process::id()).unwrap()),
+                retry_at: retry_deadline(&capture, now),
+                capture,
+            };
+            assert_eq!(sampler.retry_at, Some(now + CAPTURE_RETRY));
+            assert!(matches!(
+                sampler.sample(ONE_SECOND),
+                Sample::Unavailable(CaptureFailure::Retryable(_))
+            ));
+            assert_eq!(sampler.retry_at, Some(now + CAPTURE_RETRY));
+        }
+        assert_eq!(retry_deadline(&Err(CaptureFailure::Permission), now), None);
+        assert_eq!(
+            retry_deadline(&Err(CaptureFailure::Other(PROCESS_ENDED)), now),
+            None
+        );
+    }
 
     #[test]
     fn frame_target_follows_focus_without_overriding_manual_modes() {

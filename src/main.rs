@@ -11,7 +11,11 @@ mod cpu_temperature;
 #[cfg(windows)]
 mod desktop;
 #[cfg(windows)]
+mod desktop_child;
+#[cfg(windows)]
 mod frames;
+#[cfg(windows)]
+mod game_network;
 #[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
@@ -21,9 +25,15 @@ mod gui;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
+mod network;
+#[cfg(windows)]
 mod nvml;
 #[cfg(windows)]
 mod probe;
+#[cfg(windows)]
+mod storage;
+#[cfg(windows)]
+mod storage_worker;
 #[cfg(windows)]
 mod system;
 #[cfg(windows)]
@@ -41,6 +51,30 @@ fn main() -> ExitCode {
     if args.peek().is_some_and(|arg| arg == "apply-update") {
         args.next();
         return report_result(update::run_worker(args));
+    }
+    if args.peek().is_some_and(|arg| arg == "open-about-link") {
+        args.next();
+        let page = args.next();
+        return if args.next().is_none()
+            && page
+                .as_deref()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|page| gui::open_public_page(std::ptr::null_mut(), page).is_ok())
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    if args.peek().is_some_and(|arg| arg == "reopen-elevated") {
+        args.next();
+        return match reopen_elevated(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                desktop::show_error(&error);
+                ExitCode::FAILURE
+            }
+        };
     }
     if args
         .peek()
@@ -85,7 +119,7 @@ fn main() -> ExitCode {
         }
         Ok(Command::Probe(options)) => report_result(probe::run(options)),
         Ok(Command::Watch(options)) => report_result(watch::run(options)),
-        Ok(Command::Gui { gpu, source }) => report_result(gui::run(gpu, source)),
+        Ok(Command::Gui { gpu, source }) => report_result(gui::run(gpu, source, None)),
         Ok(Command::PrepareInstall {
             silent,
             installed_version,
@@ -94,6 +128,28 @@ fn main() -> ExitCode {
             eprintln!("ARGOS: {error}\nConsulte argos --help.");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(windows)]
+fn reopen_elevated(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
+    let pid = args
+        .next()
+        .and_then(|arg| arg.to_str()?.parse::<u32>().ok());
+    let created = args
+        .next()
+        .and_then(|arg| arg.to_str()?.parse::<u64>().ok());
+    let (Some(pid), Some(created)) = (
+        pid.filter(|&pid| pid != 0),
+        created.filter(|&time| time != 0),
+    ) else {
+        return Err("Não foi possível identificar o painel do ARGOS a reabrir.".into());
+    };
+    match cli::parse(std::iter::once("gui".into()).chain(args))? {
+        cli::Command::Gui { gpu, source } => {
+            gui::run(gpu, source, Some(instance::RestartSource { pid, created }))
+        }
+        _ => Err("Opções inválidas para reabrir o painel do ARGOS.".into()),
     }
 }
 

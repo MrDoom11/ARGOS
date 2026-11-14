@@ -29,14 +29,6 @@ impl Runtime {
         self.active.is_some()
     }
 
-    pub(super) fn update_normal_taskbar_style(&mut self, tray_available: bool) -> bool {
-        let Some(active) = &mut self.active else {
-            return false;
-        };
-        active.normal_style = super::taskbar_style(active.normal_style, tray_available);
-        true
-    }
-
     pub(super) fn pinned(&self) -> bool {
         self.active
             .as_ref()

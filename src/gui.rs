@@ -1,12 +1,16 @@
 use std::cell::RefCell;
 use std::io;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{
+    COLORREF, ERROR_CANCELLED, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_TIMEOUT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     DwmSetWindowAttribute,
@@ -16,6 +20,7 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
 use windows_sys::Win32::UI::HiDpi::*;
@@ -23,7 +28,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, VK_END, VK_ESCAPE, VK_F2, VK_F3,
     VK_F4, VK_HOME, VK_NEXT, VK_PRIOR,
 };
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::Shell::{
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    ShellExecuteExW, ShellExecuteW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
@@ -31,10 +39,13 @@ use crate::cli::GpuIndex;
 use crate::frames::{FrameTarget, Process, SENSOR_COUNT, visible_processes};
 use crate::gpu::Selection;
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
+use crate::network::Interface;
 use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
-    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS,
-    Monitor, Snapshot,
+    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, FRAME_SENSOR_START,
+    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, MetricPoint, MetricSnapshot, Monitor,
+    NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX, RAM_USED_INDEX, Reading, STORAGE_SENSOR_COUNT,
+    STORAGE_SENSORS, Snapshot, storage_metric_template,
 };
 
 mod appearance;
@@ -50,6 +61,7 @@ mod hotkey;
 mod input_strip;
 mod menu;
 mod menu_style;
+mod ping_targets;
 mod scrollbar;
 mod startup;
 mod surface;
@@ -86,6 +98,8 @@ const UPDATE_SCHEDULE: usize = 343;
 const UPDATE_CANCEL: usize = 344;
 const UPDATE_ERROR: usize = 345;
 const UPDATE_CHECK_DETAILS: usize = 346;
+const EDIT_PING_TARGETS: usize = 347;
+const RUN_AS_ADMIN: usize = 348;
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const DROPDOWN_TOGGLE: usize = 350;
 const DROPDOWN_PREVIEW: usize = 351;
@@ -97,6 +111,7 @@ const DROPDOWN_WIDTH_FIRST: usize = 370;
 const THEME_DARK: usize = 380;
 const THEME_LIGHT: usize = 381;
 const FPS_CEILING_EDIT: usize = 382;
+const CHART_ADMIN_NOTICE: &str = "Abra o ARGOS como administrador";
 const DROPDOWN_ALIGNMENTS: [(u8, &str); 5] = [
     (0, "Esquerda"),
     (25, "Entre esquerda e centro"),
@@ -114,6 +129,9 @@ const GPU_FIRST: usize = 701;
 const GPU_LIMIT: usize = 64;
 const OPACITY_SLIDER: usize = 800;
 const OPACITY_FIRST: usize = OPACITY_SLIDER + 1;
+const NETWORK_AUTO: usize = 910;
+const NETWORK_FIRST: usize = NETWORK_AUTO + 1;
+const NETWORK_LIMIT: usize = 64;
 const SENSOR_FIRST: usize = 1000;
 const MERGE_FIRST: usize = 10000;
 const COLOR_FIRST: usize = 10100;
@@ -142,11 +160,15 @@ const SERIES: [COLORREF; 16] = [
     chart::rgb(255, 162, 178),
 ];
 
-pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
-    if gpu.is_none() && update::launch_cached(source) {
+pub(crate) fn run(
+    gpu: Option<GpuIndex>,
+    source: Source,
+    restart: Option<instance::RestartSource>,
+) -> Result<(), String> {
+    if restart.is_none() && gpu.is_none() && update::launch_cached(source) {
         return Ok(());
     }
-    let Some(mut panel_instance) = instance::enter()? else {
+    let Some(mut panel_instance) = instance::enter(restart)? else {
         return Ok(());
     };
     let saved_board = Board::load();
@@ -167,11 +189,16 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         |index| vec![Selection::Index(index)],
     );
     let monitor = Monitor::start(selections, refresh_ms, board.cpu_metrics())?;
+    monitor.set_game_latency_enabled(board.contains(GAME_LATENCY_INDEX));
+    monitor.set_custom_ping_targets(board.active_ping_targets());
+    monitor.set_network_interface(board.network_interface, board.network_enabled());
+    monitor.set_storage_selection(board.storage_selection());
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     let state = Box::new(RefCell::new(Window::new(monitor, board, dpi, source)));
+    state.borrow_mut().gpu_override = gpu;
     let instance = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
@@ -190,7 +217,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     // SAFETY: o estado em Box permanece no mesmo endereço até a destruição de hwnd.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_APPWINDOW,
             WINDOW_CLASS,
             WINDOW_TITLE,
             WS_POPUP
@@ -213,7 +240,17 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         return Err(window_error("criar a janela"));
     }
     let hwnd_guard = OwnedWindow(hwnd);
-    state.borrow_mut().tray = Some(tray::Tray::new(hwnd, class.hIcon));
+    let elevated = state.borrow().elevated;
+    if elevated {
+        // Keep the reveal-only action available to the normal launcher.
+        unsafe {
+            ChangeWindowMessageFilterEx(hwnd, instance::REVEAL_PANEL, MSGFLT_ALLOW, null_mut());
+        }
+    }
+    let tray = tray::Tray::new(hwnd, class.hIcon);
+    if !elevated || tray.allow_elevated_notifications() {
+        state.borrow_mut().tray = Some(tray);
+    }
     refresh_tray(hwnd, &state);
     let placed = saved_bounds.is_some_and(|bounds| restore_window_bounds(hwnd, bounds));
     let window_dpi = unsafe { GetDpiForWindow(hwnd) };
@@ -254,6 +291,9 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         notice.show(hwnd, theme);
         dropdown_mode::sync(hwnd, &state);
     }
+    if restart.is_none() && state.borrow().should_elevate_on_open() {
+        reopen_as_admin(hwnd, &state);
+    }
 
     let mut message = MSG::default();
     loop {
@@ -273,7 +313,16 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
             DispatchMessageW(&message);
         }
     }
+    let elevated_child = state.borrow_mut().elevated_child.take();
     drop(hwnd_guard);
+    drop(state);
+    drop(panel_instance);
+    if source != Source::Direct
+        && let Some(child) = elevated_child
+    {
+        // The portable installer retains its extracted files while this process lives.
+        unsafe { WaitForSingleObject(child.as_raw_handle(), INFINITE) };
+    }
     Ok(())
 }
 
@@ -327,7 +376,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             WM_MOUSEACTIVATE if dropdown_active(state) => MA_NOACTIVATE as LRESULT,
-            WM_SETCURSOR if u32::from(lp as u16) == HTCLIENT && window_move(state).is_active() => {
+            WM_SETCURSOR
+                if u32::from(lp as u16) == HTCLIENT
+                    && state.try_borrow().is_ok_and(|app| app.move_armed) =>
+            {
                 SetCursor(LoadCursorW(null_mut(), IDC_SIZEALL));
                 1
             }
@@ -547,7 +599,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_LBUTTONDOWN => {
-                start_drag(hwnd, state, message_point(lp));
+                let point = message_point(lp);
+                if cancel_window_move(state) {
+                    if !dropdown_active(state) {
+                        begin_window_move(hwnd, point);
+                    }
+                } else {
+                    start_drag(hwnd, state, point);
+                }
                 0
             }
             WM_MOUSEMOVE => {
@@ -557,7 +616,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_LBUTTONUP => {
                 let mut point = message_point(lp);
                 let clicked_menu = state.try_borrow().is_ok_and(|app| {
-                    !app.window_move.is_active()
+                    !app.move_armed
                         && app.drag.is_none()
                         && appearance::is_click_through(hwnd)
                         && (0..input_strip::HEIGHT).contains(&point.y)
@@ -571,20 +630,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CAPTURECHANGED => {
-                if let Ok(mut app) = state.try_borrow_mut()
-                    && matches!(app.window_move, WindowMove::Dragging { .. })
-                {
-                    app.window_move = WindowMove::Idle;
-                }
                 clear_drag(hwnd, state);
                 0
             }
             WM_ACTIVATE if u32::from(wp as u16) == WA_INACTIVE => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_CANCELMODE => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 cancel_drag(hwnd, state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -625,7 +679,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CONTEXTMENU | WM_NCRBUTTONUP => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 cancel_drag(hwnd, state);
                 // O clique na borda chega como mensagem não cliente, com coordenadas de tela.
                 let point = if lp == -1 {
@@ -637,7 +691,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_DESTROY => {
-                stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 KillTimer(hwnd, TIMER);
                 KillTimer(hwnd, dropdown_mode::TIMER);
@@ -682,6 +735,10 @@ fn message_point(value: LPARAM) -> POINT {
     }
 }
 
+fn packed_point(point: POINT) -> LPARAM {
+    (u32::from(point.x as u16) | (u32::from(point.y as u16) << 16)) as LPARAM
+}
+
 fn current_monitor(hwnd: HWND) -> Option<MONITORINFO> {
     monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
 }
@@ -696,76 +753,24 @@ fn menu_center(hwnd: HWND) -> POINT {
     point
 }
 
-#[derive(Clone, Copy, Default)]
-enum WindowMove {
-    #[default]
-    Idle,
-    Armed,
-    Dragging {
-        original: RECT,
-        anchor: POINT,
-    },
-}
-
-impl WindowMove {
-    fn is_active(self) -> bool {
-        !matches!(self, Self::Idle)
-    }
-
-    fn begin(&mut self, hwnd: HWND, mut anchor: POINT) -> bool {
-        if !matches!(self, Self::Armed) {
-            return false;
+fn begin_window_move(hwnd: HWND, mut point: POINT) {
+    // A movimentação nativa emite os eventos observados pelo FancyZones.
+    unsafe {
+        if ClientToScreen(hwnd, &mut point) != 0 {
+            DefWindowProcW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                HTCAPTION as WPARAM,
+                packed_point(point),
+            );
         }
-        let mut original = RECT::default();
-        *self = if unsafe {
-            GetWindowRect(hwnd, &mut original) != 0 && ClientToScreen(hwnd, &mut anchor) != 0
-        } {
-            Self::Dragging { original, anchor }
-        } else {
-            Self::Idle
-        };
-        true
-    }
-
-    fn apply(self, hwnd: HWND, mut point: POINT) -> bool {
-        let Self::Dragging { original, anchor } = self else {
-            return false;
-        };
-        // O ponto chega em coordenadas de uma janela que já pode ter mudado de lugar.
-        unsafe {
-            if ClientToScreen(hwnd, &mut point) != 0 {
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    original.left + (point.x - anchor.x),
-                    original.top + (point.y - anchor.y),
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-        }
-        true
     }
 }
 
-fn window_move(state: &RefCell<Window>) -> WindowMove {
+fn cancel_window_move(state: &RefCell<Window>) -> bool {
     state
-        .try_borrow()
-        .map_or(WindowMove::Idle, |app| app.window_move)
-}
-
-fn stop_window_move(hwnd: HWND, state: &RefCell<Window>, restore: bool) -> bool {
-    let movement = state.try_borrow_mut().map_or(WindowMove::Idle, |mut app| {
-        std::mem::take(&mut app.window_move)
-    });
-    if let WindowMove::Dragging { original, .. } = movement {
-        release_mouse(hwnd);
-        if restore {
-            position_window(hwnd, original);
-        }
-    }
-    movement.is_active()
+        .try_borrow_mut()
+        .is_ok_and(|mut app| std::mem::take(&mut app.move_armed))
 }
 
 struct PanelDrag {
@@ -791,9 +796,6 @@ impl PanelDrag {
 
 fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
     let started = state.try_borrow_mut().is_ok_and(|mut app| {
-        if app.window_move.begin(hwnd, point) {
-            return app.window_move.is_active();
-        }
         let Some(source) = app.panel_at(client(hwnd), point) else {
             return false;
         };
@@ -812,16 +814,12 @@ fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
         // Alterar a captura pode despachar mensagens, por isso o estado já foi liberado.
         unsafe { SetCapture(hwnd) };
         if unsafe { GetCapture() } != hwnd {
-            stop_window_move(hwnd, state, false);
             clear_drag(hwnd, state);
         }
     }
 }
 
 fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        return;
-    }
     let repaint = state.try_borrow_mut().is_ok_and(|mut app| {
         if app.drag.is_none() {
             return false;
@@ -838,10 +836,6 @@ fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
 }
 
 fn finish_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        stop_window_move(hwnd, state, false);
-        return;
-    }
     let drag = state.try_borrow_mut().ok().and_then(|mut app| {
         let mut drag = app.drag.take()?;
         let target = app.panel_at(client(hwnd), point);
@@ -892,7 +886,7 @@ fn release_mouse(hwnd: HWND) {
 
 fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
     let section = match key {
-        VK_ESCAPE => return stop_window_move(hwnd, state, true) || cancel_drag(hwnd, state),
+        VK_ESCAPE => return cancel_window_move(state) || cancel_drag(hwnd, state),
         VK_F2 => MenuSection::Sensors,
         VK_F3 => MenuSection::Period,
         VK_F4 => MenuSection::Grid,
@@ -908,7 +902,7 @@ fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
         }
         _ => return false,
     };
-    stop_window_move(hwnd, state, false);
+    cancel_window_move(state);
     cancel_drag(hwnd, state);
     show_options(hwnd, state, menu_center(hwnd), section);
     true
@@ -1082,6 +1076,12 @@ enum MenuSection {
     Grid,
 }
 
+impl MenuSection {
+    fn has_sensor_controls(self) -> bool {
+        matches!(self, Self::All | Self::Sensors)
+    }
+}
+
 struct OpenMenu {
     root: HMENU,
     section: MenuSection,
@@ -1109,13 +1109,20 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
     {
         return;
     }
-    let (processes, displays) = if matches!(section, MenuSection::All) {
-        (visible_processes(), dropdown::displays())
+    let processes = if section.has_sensor_controls() {
+        visible_processes()
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
+    };
+    let displays = if matches!(section, MenuSection::All) {
+        dropdown::displays()
+    } else {
+        Vec::new()
     };
     let (menu, panel_sensors, theme, dpi) = {
-        let Ok(app) = state.try_borrow() else { return };
+        let Ok(mut app) = state.try_borrow_mut() else {
+            return;
+        };
         let mut point = screen;
         let panel = if matches!(section, MenuSection::All)
             && unsafe { ScreenToClient(hwnd, &mut point) } != 0
@@ -1128,6 +1135,14 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
         } else {
             None
         };
+        // Preserve command IDs while adapter discovery refreshes in the background.
+        app.network_menu_interfaces = if section.has_sensor_controls() {
+            app.snapshot
+                .as_ref()
+                .map(|snapshot| Arc::clone(&snapshot.network_interfaces))
+        } else {
+            None
+        };
         (
             options_menu(hwnd, &app, section, &processes, &displays, panel),
             panel.map_or_else(Vec::new, |index| app.board.panels[index].clone()),
@@ -1135,7 +1150,10 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             app.dpi,
         )
     };
-    let Some(menu) = menu else { return };
+    let Some(menu) = menu else {
+        state.borrow_mut().network_menu_interfaces = None;
+        return;
+    };
     let opened = Rc::new(OpenMenu {
         root: menu.0,
         section,
@@ -1158,14 +1176,16 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             &opened.displays,
         );
     }
+    state.borrow_mut().network_menu_interfaces = None;
 }
 
 fn keep_menu_open(choice: usize) -> bool {
     matches!(
         choice,
-        RESET_SENSORS | RESET_COLORS | GPU_AUTO | THEME_DARK | THEME_LIGHT
+        RESET_SENSORS | RESET_COLORS | GPU_AUTO | NETWORK_AUTO | THEME_DARK | THEME_LIGHT
     ) || (OPACITY_FIRST..=OPACITY_FIRST + 100).contains(&choice)
         || (GPU_FIRST..GPU_FIRST + GPU_LIMIT).contains(&choice)
+        || (NETWORK_FIRST..NETWORK_FIRST + NETWORK_LIMIT).contains(&choice)
         || (PERIOD_FIRST..PERIOD_FIRST + PERIODS.len()).contains(&choice)
         || (COLUMNS_FIRST..COLUMNS_FIRST + MAX_COLUMNS).contains(&choice)
         || (ROWS_FIRST..ROWS_FIRST + MAX_ROWS).contains(&choice)
@@ -1185,135 +1205,42 @@ fn options_menu(
 ) -> Option<Menu> {
     let menu = Menu::new()?;
     match section {
-        MenuSection::Sensors => app.sensor_menu(&menu),
+        MenuSection::Sensors => app.sensor_menu(&menu, processes),
         MenuSection::Period => app.period_menu(&menu),
         MenuSection::Grid => app.grid_menu(&menu),
         MenuSection::All => {
-            if let Some(snapshot) = &app.snapshot {
-                if app.snapshot_is_stale(Instant::now()) {
-                    menu.label("Coleta atrasada");
-                }
-                if snapshot.gpu_selections == app.monitor.gpu_selections() {
-                    menu.label(&snapshot.notice);
-                } else {
-                    menu.label("Atualizando as GPUs monitoradas…");
-                }
+            if app.snapshot_is_stale(Instant::now()) {
+                menu.label_icon("Coleta atrasada", Icon::Error);
+            }
+            if let Some(index) = panel
+                && let Some(snapshot) = &app.snapshot
+            {
+                menu.group_icon("Gráfico", Icon::Layers, |items| {
+                    app.panel_menu(items, snapshot, index, !appearance::is_click_through(hwnd));
+                });
                 menu.separator();
             }
-            menu.group_icon("Intervalo de amostragem", Icon::Sampling, |items| {
-                for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
-                    items.item(
-                        REFRESH_FIRST + index,
-                        &format!("{ms} ms"),
-                        ms == app.board.refresh_ms,
-                    );
-                }
+            menu.group_icon("Sensores", Icon::Sensors, |items| {
+                app.sensor_menu(items, processes)
             });
-            menu.group_icon("Histórico", Icon::History, |items| app.period_menu(items));
-            menu.group_icon("GPUs monitoradas", Icon::Gpu, |items| app.gpu_menu(items));
-            menu.group_icon("Sensores", Icon::Sensors, |items| app.sensor_menu(items));
-            menu.group_icon("FPS", Icon::Fps, |items| app.frame_menu(items, processes));
+            menu.group_icon("Painel", Icon::Grid, |items| {
+                app.panel_settings_menu(hwnd, items, displays)
+            });
             menu.separator();
-            menu.group_icon("Grade", Icon::Grid, |items| app.grid_menu(items));
-            menu.group_icon("Aparência", Icon::Appearance, |items| {
-                app.appearance_menu(hwnd, items)
+            app.updates_menu(&menu);
+            menu.group_icon("Sobre o ARGOS", Icon::About, |items| {
+                items.text_block(&[
+                    concat!("ARGOS ", env!("CARGO_PKG_VERSION")),
+                    concat!("Licença ", env!("CARGO_PKG_LICENSE")),
+                ]);
+                items.separator();
+                items.centered_item(ABOUT_GUIDE, "Guia do painel");
+                items.centered_item(ABOUT_TWITCH, "Canal na Twitch");
+                items.centered_item(ABOUT_RELEASES, "Versões no GitHub");
             });
-            menu.group_icon("Modo dropdown", Icon::Dropdown, |items| {
-                dropdown_menu(items, app, displays)
-            });
-            match app.updater.status() {
-                Status::Idle => {
-                    menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update);
-                    match app.update_notice.as_ref().map(|notice| &notice.result) {
-                        Some(CheckNotice::Current) => menu.label("O ARGOS está atualizado"),
-                        Some(CheckNotice::Failed(_)) => menu.item_icon(
-                            UPDATE_CHECK_DETAILS,
-                            "Ver erro da busca por atualizações",
-                            Icon::Error,
-                        ),
-                        _ => {}
-                    }
-                }
-                Status::Checking => menu.label_icon("Buscando por atualizações…", Icon::Update),
-                Status::Ready(version, scheduled) => {
-                    menu.group_icon(
-                        &format!("ARGOS {version} disponível"),
-                        Icon::Update,
-                        |items| {
-                            items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
-                            if scheduled {
-                                items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
-                            } else {
-                                items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
-                            }
-                        },
-                    );
-                }
-            }
-            if update::last_error().is_some() {
-                menu.item_icon(UPDATE_ERROR, "Ver erro da última atualização", Icon::Error);
-            }
-            if app.page_count() > 1 {
-                menu.group_icon("Página", Icon::Page, |items| {
-                    for page in 0..app.page_count() {
-                        items.item(
-                            PAGE_FIRST + page,
-                            &format!("Página {}", page + 1),
-                            app.page_is_current(page),
-                        );
-                    }
-                });
-            }
-            if app.save_failed || app.dropdown.save_failed {
-                menu.label("Configuração disponível nesta sessão");
-            }
+            menu.separator();
+            app.window_menu(hwnd, &menu);
         }
-    }
-    if let Some(index) = panel
-        && let Some(snapshot) = &app.snapshot
-    {
-        menu.separator();
-        app.panel_menu(&menu, snapshot, index, !appearance::is_click_through(hwnd));
-    }
-    if matches!(section, MenuSection::All) {
-        menu.separator();
-        menu.group_icon("Sobre o ARGOS", Icon::About, |items| {
-            items.text_block(&[
-                concat!("ARGOS ", env!("CARGO_PKG_VERSION")),
-                "Acompanhe CPU, GPU, memória, FPS e outros recursos no Windows em um painel personalizável com gráficos em tempo real e histórico.",
-                concat!("Licença ", env!("CARGO_PKG_LICENSE")),
-            ]);
-            items.separator();
-            items.centered_item(ABOUT_GUIDE, "Guia do painel");
-            items.centered_item(ABOUT_TWITCH, "Canal na Twitch");
-            items.centered_item(ABOUT_RELEASES, "Versões no GitHub");
-        });
-        if let Some(directory) = app.startup_directory() {
-            let enabled = autostart::enabled(directory).unwrap_or(false);
-            let label = if enabled {
-                "Iniciar com o Windows (ativado)"
-            } else {
-                "Iniciar com o Windows"
-            };
-            menu.item_icon_checked(START_WITH_WINDOWS, label, Icon::Power, enabled);
-        } else {
-            menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
-        }
-        if app.dropdown.active() {
-            let pinned = app.dropdown.pinned();
-            let icon = if pinned { Icon::Pinned } else { Icon::Pin };
-            menu.item_icon_checked(DROPDOWN_PIN, "Fixar aberto", icon, pinned);
-        } else {
-            if unsafe { IsZoomed(hwnd) } != 0 {
-                menu.label_icon("Mover janela", Icon::Move);
-                menu.item_icon(MAXIMIZE_WINDOW, "Restaurar", Icon::Restore);
-            } else {
-                menu.item_icon(MOVE_WINDOW, "Mover janela", Icon::Move);
-                menu.item_icon(MAXIMIZE_WINDOW, "Maximizar", Icon::Maximize);
-            }
-            menu.item_icon(MINIMIZE_WINDOW, "Minimizar", Icon::Minimize);
-        }
-        menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
     }
     Some(menu)
 }
@@ -1359,10 +1286,9 @@ fn apply_option(
     displays: &[dropdown::Display],
 ) {
     match choice {
-        ABOUT_RELEASES => open_about_link(hwnd, state, update::RELEASES_URL),
-        ABOUT_GUIDE => open_about_link(hwnd, state, ABOUT_GUIDE_URL),
-        ABOUT_TWITCH => open_about_link(hwnd, state, ABOUT_TWITCH_URL),
+        ABOUT_RELEASES | ABOUT_GUIDE | ABOUT_TWITCH => open_about_link(hwnd, state, choice),
         START_WITH_WINDOWS => toggle_autostart(hwnd, state),
+        RUN_AS_ADMIN => toggle_elevation_preference(hwnd, state),
         THEME_DARK | THEME_LIGHT => {
             edit_board(hwnd, state, |app| {
                 let theme = if choice == THEME_DARK {
@@ -1397,6 +1323,18 @@ fn apply_option(
         GPU_AUTO => choose_gpu(hwnd, state, None),
         choice if (GPU_FIRST..GPU_FIRST + GPU_LIMIT).contains(&choice) => {
             choose_gpu(hwnd, state, Some(choice - GPU_FIRST));
+        }
+        NETWORK_AUTO => choose_network_interface(hwnd, state, None),
+        choice if (NETWORK_FIRST..NETWORK_FIRST + NETWORK_LIMIT).contains(&choice) => {
+            let interface = state
+                .borrow()
+                .network_menu_interfaces
+                .as_ref()
+                .and_then(|interfaces| interfaces.get(choice - NETWORK_FIRST))
+                .map(|interface| interface.id);
+            if interface.is_some() {
+                choose_network_interface(hwnd, state, interface);
+            }
         }
         DROPDOWN_TOGGLE => {
             change_dropdown(state, |settings| settings.enabled = !settings.enabled);
@@ -1443,7 +1381,30 @@ fn apply_option(
         }
         MOVE_WINDOW => {
             if let Ok(mut app) = state.try_borrow_mut() {
-                app.window_move = WindowMove::Armed;
+                app.move_armed = true;
+            }
+        }
+        EDIT_PING_TARGETS => {
+            let current = state.borrow().board.ping_targets.clone();
+            if let Some(targets) = ping_targets::edit(hwnd, &current) {
+                edit_board(hwnd, state, |app| {
+                    let changed = app.board.ping_targets != targets;
+                    app.board.ping_targets = targets;
+                    if app.board.ping_targets.is_empty() || app.board.contains(CUSTOM_PING_INDEX) {
+                        return changed;
+                    }
+                    app.board.toggle(CUSTOM_PING_INDEX, app.first_slot());
+                    if let Some(slot) = app
+                        .board
+                        .panels
+                        .iter()
+                        .position(|panel| panel.contains(&CUSTOM_PING_INDEX))
+                    {
+                        app.show_panel(slot);
+                        return true;
+                    }
+                    changed
+                });
             }
         }
         MINIMIZE_WINDOW => {
@@ -1601,6 +1562,26 @@ fn choose_gpu(hwnd: HWND, state: &RefCell<Window>, index: Option<usize>) {
     invalidate(hwnd);
 }
 
+fn choose_network_interface(hwnd: HWND, state: &RefCell<Window>, interface: Option<u128>) {
+    edit_board(hwnd, state, |app| {
+        let previous = std::mem::replace(&mut app.board.network_interface, interface);
+        if app.board.network_enabled() {
+            return previous != interface;
+        }
+        let first = app.first_slot();
+        for sensor in [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX] {
+            app.board.toggle(sensor, first);
+        }
+        if let Some(panel) = app.board.panels.iter().position(|panel| {
+            panel.contains(&NETWORK_DOWNLOAD_INDEX) || panel.contains(&NETWORK_UPLOAD_INDEX)
+        }) {
+            app.show_panel(panel);
+            return true;
+        }
+        previous != interface
+    });
+}
+
 fn chosen_display<'a>(
     app: &Window,
     displays: &'a [dropdown::Display],
@@ -1620,7 +1601,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
     if settings.enabled && !app.dropdown.active() {
         menu.label("Dropdown suspenso");
     }
-    menu.group("Monitor", |items| {
+    menu.group_icon("Monitor", Icon::Monitor, |items| {
         for (index, display) in displays.iter().take(DROPDOWN_MONITOR_LIMIT).enumerate() {
             items.item(
                 DROPDOWN_MONITOR_FIRST + index,
@@ -1629,7 +1610,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
             );
         }
     });
-    menu.group("Posição da faixa", |items| {
+    menu.group_icon("Posição da faixa", Icon::Move, |items| {
         for (index, (value, label)) in DROPDOWN_ALIGNMENTS.iter().enumerate() {
             items.item(
                 DROPDOWN_ALIGNMENT_FIRST + index,
@@ -1638,7 +1619,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
             );
         }
     });
-    menu.group("Largura da faixa", |items| {
+    menu.group_icon("Largura da faixa", Icon::Width, |items| {
         for (index, value) in DROPDOWN_WIDTHS.iter().enumerate() {
             items.item(
                 DROPDOWN_WIDTH_FIRST + index,
@@ -1710,7 +1691,51 @@ fn choose_dropdown_hotkey(hwnd: HWND, state: &RefCell<Window>) {
     }
 }
 
-fn open_about_link(hwnd: HWND, state: &RefCell<Window>, url: &str) {
+fn open_about_link(hwnd: HWND, state: &RefCell<Window>, choice: usize) {
+    let page = match choice {
+        ABOUT_RELEASES => "releases",
+        ABOUT_GUIDE => "guide",
+        ABOUT_TWITCH => "twitch",
+        _ => return,
+    };
+    let result = if state.borrow().elevated {
+        std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command.args(["open-about-link", page]);
+            crate::desktop_child::spawn(&mut command).map(|_| ())
+        })
+    } else {
+        open_public_page(hwnd, page)
+    };
+    if let Err(error) = result {
+        show_notice(
+            hwnd,
+            state,
+            "Sobre o ARGOS",
+            &format!("Não foi possível abrir o link no navegador. {error}"),
+        );
+    }
+}
+
+pub(crate) fn open_public_page(hwnd: HWND, page: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if instance::process_is_elevated(unsafe { GetCurrentProcess() }) != Some(false) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "O navegador precisa ser aberto com as permissões normais da conta.",
+        ));
+    }
+    let url = match page {
+        "releases" => update::RELEASES_URL,
+        "guide" => ABOUT_GUIDE_URL,
+        "twitch" => ABOUT_TWITCH_URL,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Link desconhecido.",
+            ));
+        }
+    };
     let url = wide(url);
     let result = unsafe {
         let initialized = CoInitializeEx(
@@ -1731,13 +1756,9 @@ fn open_about_link(hwnd: HWND, state: &RefCell<Window>, url: &str) {
         result
     };
     if result as isize <= 32 {
-        show_notice(
-            hwnd,
-            state,
-            "Sobre o ARGOS",
-            "Não foi possível abrir o link no navegador.",
-        );
+        return Err(io::Error::from_raw_os_error(result as i32));
     }
+    Ok(())
 }
 
 fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
@@ -1757,6 +1778,116 @@ fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
             &format!("Não foi possível alterar a inicialização do ARGOS. {error}"),
         );
     }
+}
+
+fn toggle_elevation_preference(hwnd: HWND, state: &RefCell<Window>) {
+    let result = {
+        let mut app = state.borrow_mut();
+        app.board.run_as_admin = !app.board.run_as_admin;
+        match app.board.save() {
+            Ok(()) => {
+                app.save_failed = false;
+                Ok(app.should_elevate_on_open())
+            }
+            Err(error) => {
+                app.board.run_as_admin = !app.board.run_as_admin;
+                Err(error)
+            }
+        }
+    };
+    match result {
+        Ok(true) => reopen_as_admin(hwnd, state),
+        Ok(false) => {}
+        Err(error) => show_notice(
+            hwnd,
+            state,
+            "Sempre abrir como administrador",
+            &format!("Não foi possível salvar a preferência. {error}"),
+        ),
+    }
+}
+
+fn reopen_as_admin(hwnd: HWND, state: &RefCell<Window>) {
+    let (source, gpu) = {
+        let app = state.borrow();
+        if app.elevated
+            || app.elevated_child.as_ref().is_some_and(|child| {
+                (unsafe { WaitForSingleObject(child.as_raw_handle(), 0) }) == WAIT_TIMEOUT
+            })
+        {
+            return;
+        }
+        (app.source, app.gpu_override)
+    };
+    match launch_elevated(hwnd, source, gpu) {
+        Ok(Some(child)) => state.borrow_mut().elevated_child = Some(child),
+        Ok(None) => {}
+        Err(error) => show_notice(hwnd, state, "Abrir como administrador", &error),
+    }
+}
+
+fn launch_elevated(
+    hwnd: HWND,
+    source: Source,
+    gpu: Option<GpuIndex>,
+) -> Result<Option<OwnedHandle>, String> {
+    let origin = instance::RestartSource::current()?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Não foi possível localizar o executável do ARGOS. {error}"))?;
+    let directory = exe
+        .parent()
+        .ok_or("Não foi possível localizar a pasta do ARGOS.")?;
+    let executable: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let directory: Vec<_> = directory.as_os_str().encode_wide().chain([0]).collect();
+    let mut parameters = format!("reopen-elevated {} {}", origin.pid, origin.created);
+    if source != Source::Direct {
+        parameters.push_str(" --portable-exact");
+    }
+    if let Some(gpu) = gpu {
+        use std::fmt::Write;
+        let _ = match gpu {
+            GpuIndex::Nvidia(index) => write!(parameters, " --gpu {index}"),
+            GpuIndex::Radeon(index) => write!(parameters, " --gpu amd:{index}"),
+        };
+    }
+    let parameters = wide(&parameters);
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
+        hwnd,
+        lpVerb: w!("runas"),
+        lpFile: executable.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: directory.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+    let initialized = unsafe {
+        CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        ) >= 0
+    };
+    let result = if unsafe { ShellExecuteExW(&mut execute) } == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "Não foi possível abrir o ARGOS como administrador. {error}"
+            ))
+        }
+    } else if execute.hProcess.is_null() {
+        Err("O Windows não confirmou a abertura do ARGOS.".into())
+    } else {
+        Ok(Some(unsafe {
+            OwnedHandle::from_raw_handle(execute.hProcess)
+        }))
+    };
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
 }
 
 fn show_notice(hwnd: HWND, state: &RefCell<Window>, title: &str, message: &str) {
@@ -1803,6 +1934,14 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
         app.monitor.set_interval_ms(interval);
     }
     app.monitor.set_cpu_metrics(app.board.cpu_metrics());
+    app.monitor
+        .set_game_latency_enabled(app.board.contains(GAME_LATENCY_INDEX));
+    app.monitor
+        .set_custom_ping_targets(app.board.active_ping_targets());
+    app.monitor
+        .set_network_interface(app.board.network_interface, app.board.network_enabled());
+    app.monitor
+        .set_storage_selection(app.board.storage_selection());
     app.save_failed = app.board.save().is_err();
     drop(app);
     if interval != old_interval {
@@ -1874,7 +2013,7 @@ impl UpdateNotice {
     fn text(&self) -> std::borrow::Cow<'static, str> {
         match &self.result {
             CheckNotice::Ready(version) => {
-                format!("ARGOS {version} pronto para atualizar. Abra o menu do painel.").into()
+                format!("ARGOS {version} pronto. Abra Atualizações no menu.").into()
             }
             CheckNotice::Current => "O ARGOS está atualizado.".into(),
             CheckNotice::Failed(_) => {
@@ -1887,6 +2026,10 @@ impl UpdateNotice {
 struct Window {
     monitor: Monitor,
     updater: Updater,
+    elevated: bool,
+    elevated_child: Option<OwnedHandle>,
+    source: Source,
+    gpu_override: Option<GpuIndex>,
     update_notice: Option<UpdateNotice>,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
@@ -1895,13 +2038,15 @@ struct Window {
     save_failed: bool,
     custom_colors: [COLORREF; 16],
     open_menu: Option<Rc<OpenMenu>>,
+    network_menu_interfaces: Option<Arc<[Interface]>>,
+    unavailable_storage: [MetricSnapshot; STORAGE_SENSOR_COUNT],
     scroll_row: usize,
     scrollbar: HWND,
     scrollbar_overlay: Option<scrollbar::Overlay>,
     scrollbar_state: Option<ScrollbarState>,
     input_strip: Option<input_strip::Strip>,
     wheel_remainder: i32,
-    window_move: WindowMove,
+    move_armed: bool,
     drag: Option<PanelDrag>,
     dpi: u32,
     chart_fonts: chart::ChartFonts,
@@ -1914,6 +2059,10 @@ impl Window {
         Self {
             monitor,
             updater: Updater::new(source),
+            elevated: instance::is_elevated(),
+            elevated_child: None,
+            source,
+            gpu_override: None,
             update_notice: None,
             snapshot: None,
             board,
@@ -1922,19 +2071,33 @@ impl Window {
             save_failed: false,
             custom_colors: SERIES,
             open_menu: None,
+            network_menu_interfaces: None,
+            unavailable_storage: std::array::from_fn(|index| {
+                let mut metric = storage_metric_template(index);
+                metric.points.push(MetricPoint {
+                    at: Instant::now(),
+                    reading: Reading::Unavailable,
+                    interval: metric.interval,
+                });
+                metric
+            }),
             scroll_row: 0,
             scrollbar: null_mut(),
             scrollbar_overlay: None,
             scrollbar_state: None,
             input_strip: None,
             wheel_remainder: 0,
-            window_move: WindowMove::Idle,
+            move_armed: false,
             drag: None,
             dpi,
             chart_fonts: chart::ChartFonts::new(dpi),
             buffer: BackBuffer::default(),
             surface: Surface::default(),
         }
+    }
+
+    fn should_elevate_on_open(&self) -> bool {
+        self.board.run_as_admin && !self.elevated
     }
 
     fn set_dpi(&mut self, dpi: u32) {
@@ -1991,6 +2154,20 @@ impl Window {
                     }
                 }
             }
+        }
+        if self
+            .snapshot
+            .as_ref()
+            .is_none_or(|last| !Arc::ptr_eq(&last.storage, &next.storage))
+        {
+            for disk in next.storage.iter() {
+                for index in 0..STORAGE_SENSOR_COUNT {
+                    self.board.register_storage_sensor(&disk.id, index);
+                }
+            }
+        }
+        for metric in &mut self.unavailable_storage {
+            metric.points[0].at = next.at;
         }
         self.snapshot = Some(next);
         true
@@ -2154,7 +2331,18 @@ impl Window {
             && self.board.sensor_unit(index).is_some()
         {
             let first = self.first_slot();
+            let enabling_storage =
+                self.board.storage_sensor(index).is_some() && !self.board.contains(index);
             self.board.toggle(index, first);
+            if enabling_storage
+                && let Some(panel) = self
+                    .board
+                    .panels
+                    .iter()
+                    .position(|series| series.contains(&index))
+            {
+                self.show_panel(panel);
+            }
             return true;
         }
         false
@@ -2164,6 +2352,113 @@ impl Window {
         for (index, (_, label)) in PERIODS.iter().enumerate() {
             menu.item(PERIOD_FIRST + index, label, index == self.board.period);
         }
+    }
+
+    fn panel_settings_menu(&self, hwnd: HWND, menu: &Menu, displays: &[dropdown::Display]) {
+        menu.group_icon("Grade", Icon::Grid, |items| self.grid_menu(items));
+        menu.group_icon("Histórico", Icon::History, |items| self.period_menu(items));
+        if self.page_count() > 1 {
+            menu.group_icon("Página", Icon::Page, |items| {
+                for page in 0..self.page_count() {
+                    items.item(
+                        PAGE_FIRST + page,
+                        &format!("Página {}", page + 1),
+                        self.page_is_current(page),
+                    );
+                }
+            });
+        }
+        menu.separator();
+        menu.group_icon("Aparência", Icon::Appearance, |items| {
+            self.appearance_menu(hwnd, items)
+        });
+        menu.group_icon("Modo dropdown", Icon::Dropdown, |items| {
+            dropdown_menu(items, self, displays)
+        });
+        menu.group_icon("Intervalo de amostragem", Icon::Sampling, |items| {
+            for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
+                items.item(
+                    REFRESH_FIRST + index,
+                    &format!("{ms} ms"),
+                    ms == self.board.refresh_ms,
+                );
+            }
+        });
+        menu.separator();
+        if let Some(directory) = self.startup_directory() {
+            let enabled = autostart::enabled(directory).unwrap_or(false);
+            menu.item_icon_checked(
+                START_WITH_WINDOWS,
+                "Iniciar com o Windows",
+                Icon::Power,
+                enabled,
+            );
+        } else {
+            menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
+        }
+        if self.board.run_as_admin {
+            menu.item(RUN_AS_ADMIN, "Abertura como administrador ativada", true);
+        } else {
+            menu.item_icon(RUN_AS_ADMIN, "Sempre abrir como administrador", Icon::Admin);
+            if self.elevated {
+                menu.label("Sessão atual como administrador");
+            }
+        }
+        if self.save_failed || self.dropdown.save_failed {
+            menu.label("Configuração disponível nesta sessão");
+        }
+    }
+
+    fn updates_menu(&self, menu: &Menu) {
+        match self.updater.status() {
+            Status::Idle => {
+                menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update);
+                match self.update_notice.as_ref().map(|notice| &notice.result) {
+                    Some(CheckNotice::Current) => menu.label("O ARGOS está atualizado"),
+                    Some(CheckNotice::Failed(_)) => menu.item_icon(
+                        UPDATE_CHECK_DETAILS,
+                        "Ver erro da busca por atualizações",
+                        Icon::Error,
+                    ),
+                    _ => {}
+                }
+            }
+            Status::Checking => {
+                menu.label_icon("Buscando por atualizações…", Icon::Update);
+            }
+            Status::Ready(version, scheduled) => {
+                menu.group_icon("Atualizações", Icon::Update, |items| {
+                    items.label(&format!("ARGOS {version} disponível"));
+                    items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
+                    if scheduled {
+                        items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
+                    } else {
+                        items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
+                    }
+                });
+            }
+        }
+        if update::last_error().is_some() {
+            menu.item_icon(UPDATE_ERROR, "Ver erro da última atualização", Icon::Error);
+        }
+    }
+
+    fn window_menu(&self, hwnd: HWND, menu: &Menu) {
+        if self.dropdown.active() {
+            let pinned = self.dropdown.pinned();
+            let icon = if pinned { Icon::Pinned } else { Icon::Pin };
+            menu.item_icon_checked(DROPDOWN_PIN, "Fixar aberto", icon, pinned);
+        } else {
+            if unsafe { IsZoomed(hwnd) } != 0 {
+                menu.label_icon("Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Restaurar", Icon::Restore);
+            } else {
+                menu.item_icon(MOVE_WINDOW, "Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Maximizar", Icon::Maximize);
+            }
+            menu.item_icon(MINIMIZE_WINDOW, "Minimizar", Icon::Minimize);
+        }
+        menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
     }
 
     fn grid_menu(&self, menu: &Menu) {
@@ -2191,7 +2486,7 @@ impl Window {
         menu.item(THEME_DARK, "Tema escuro", appearance.theme == Theme::Dark);
         menu.item(THEME_LIGHT, "Tema claro", appearance.theme == Theme::Light);
         menu.separator();
-        menu.group("Opacidade", |items| {
+        menu.group_icon("Opacidade", Icon::Opacity, |items| {
             items.slider(OPACITY_SLIDER, appearance.opacity)
         });
         if appearance.translucent() && !appearance::is_click_through(hwnd) {
@@ -2226,13 +2521,175 @@ impl Window {
                 .any(|selection| gpu.matches_selection(selection));
             menu.item(GPU_FIRST + index, &gpu.label().replace('&', "&&"), checked);
         }
+        if snapshot.gpu_selections != selections {
+            menu.label("Atualizando as GPUs monitoradas…");
+        } else if snapshot.gpus.is_empty() || snapshot.gpus.len() < selections.len() {
+            menu.label(&snapshot.notice.replace('&', "&&"));
+        }
     }
 
-    fn sensor_menu(&self, menu: &Menu) {
+    fn network_menu(&self, menu: &Menu) {
+        let selected = self.board.network_interface;
+        let current = self.snapshot.as_ref().and_then(|snapshot| {
+            let id = snapshot.network_interface?;
+            snapshot
+                .network_interfaces
+                .iter()
+                .find(|interface| interface.id == id)
+        });
+        let auto = current.filter(|_| selected.is_none()).map_or_else(
+            || "Automática".to_owned(),
+            |interface| format!("Automática · {}", interface.name.replace('&', "&&")),
+        );
+        menu.item(NETWORK_AUTO, &auto, selected.is_none());
+        if let Some(interfaces) = &self.network_menu_interfaces {
+            for (index, interface) in interfaces.iter().take(NETWORK_LIMIT).enumerate() {
+                let mut name = interface.name.replace('&', "&&");
+                if !interface.connected {
+                    name.push_str(" (desconectada)");
+                }
+                menu.item(NETWORK_FIRST + index, &name, selected == Some(interface.id));
+            }
+            if let Some(id) = selected
+                && !interfaces
+                    .iter()
+                    .take(NETWORK_LIMIT)
+                    .any(|interface| interface.id == id)
+            {
+                menu.label("Interface selecionada indisponível");
+            } else if interfaces.is_empty() {
+                menu.label("Nenhum adaptador físico encontrado");
+            }
+        } else {
+            menu.label("Procurando interfaces…");
+        }
+        if self.board.network_enabled()
+            && let Some(snapshot) = &self.snapshot
+            && selected.is_none_or(|id| Some(id) == snapshot.network_interface)
+            && let Some(status) = snapshot.network_status.as_deref()
+        {
+            menu.label(&status.replace('&', "&&"));
+        }
+    }
+
+    fn network_sensors_menu(&self, menu: &Menu) {
+        menu.group_icon("Interface de rede", Icon::Adapter, |items| {
+            self.network_menu(items)
+        });
+        menu.separator();
+        self.sensor_items(menu, [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX]);
+        menu.separator();
+        self.sensor_items(menu, [GAME_LATENCY_INDEX]);
+        menu.group_icon("Ping personalizado", Icon::Ping, |items| {
+            let checked = self.board.contains(CUSTOM_PING_INDEX);
+            items.item(SENSOR_FIRST + CUSTOM_PING_INDEX, "Mostrar gráfico", checked);
+            items.item(EDIT_PING_TARGETS, "Editar endereços…", false);
+            if self.board.ping_targets.is_empty() {
+                items.label("Adicione endereços para começar");
+            } else if checked && let Some(snapshot) = &self.snapshot {
+                for status in &snapshot.custom_ping_status {
+                    items.label(&status.replace('&', "&&"));
+                }
+            }
+        });
+    }
+
+    fn storage_menu(&self, menu: &Menu) {
         let Some(snapshot) = &self.snapshot else {
             menu.label("Aguardando a primeira coleta");
             return;
         };
+        if snapshot.storage.is_empty() {
+            menu.label("Nenhum volume local disponível");
+        }
+        for disk in snapshot.storage.iter() {
+            menu.group_icon(&disk.label.replace('&', "&&"), Icon::Storage, |items| {
+                for (index, &(_, name, _)) in STORAGE_SENSORS.iter().enumerate() {
+                    if let Some(slot) = self.board.storage_sensor_slot(&disk.id, index)
+                        && slot < MERGE_FIRST - SENSOR_FIRST
+                    {
+                        items.item(SENSOR_FIRST + slot, name, self.board.contains(slot));
+                    }
+                }
+            });
+        }
+        let unavailable: Vec<_> =
+            self.board
+                .panels
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&slot| {
+                    slot < MERGE_FIRST - SENSOR_FIRST
+                        && self.board.storage_sensor(slot).is_some_and(|(id, _)| {
+                            !snapshot.storage.iter().any(|disk| disk.id == id)
+                        })
+                })
+                .collect();
+        if !unavailable.is_empty() {
+            menu.group_icon("Volumes indisponíveis", Icon::Error, |items| {
+                for slot in unavailable {
+                    if let Some(name) = self.series_title(snapshot, slot) {
+                        items.item(SENSOR_FIRST + slot, &name, true);
+                    }
+                }
+            });
+        }
+    }
+
+    fn sensor_menu(&self, menu: &Menu, processes: &[Process]) {
+        menu.group_icon("CPU", Icon::Cpu, |items| {
+            self.sensor_items(
+                items,
+                [CPU_USAGE_INDEX, CPU_TEMPERATURE_INDEX, CPU_POWER_INDEX],
+            )
+        });
+        menu.group_icon("Memória", Icon::Memory, |items| {
+            self.sensor_items(items, RAM_USED_INDEX..FRAME_SENSOR_START)
+        });
+        menu.group_icon("GPU", Icon::Gpu, |items| self.gpu_sensors_menu(items));
+        menu.group_icon("FPS", Icon::Fps, |items| self.frame_menu(items, processes));
+        menu.group_icon("Rede", Icon::Network, |items| {
+            self.network_sensors_menu(items)
+        });
+        menu.group_icon("Armazenamento", Icon::Storage, |items| {
+            self.storage_menu(items)
+        });
+        menu.separator();
+        menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
+    }
+
+    fn sensor_items(&self, menu: &Menu, indices: impl IntoIterator<Item = usize>) {
+        let Some(snapshot) = &self.snapshot else {
+            menu.label("Aguardando a primeira coleta");
+            return;
+        };
+        for index in indices {
+            let Some(metric) = snapshot.metrics.get(index) else {
+                continue;
+            };
+            let checked = self.board.contains(index);
+            menu.item(SENSOR_FIRST + index, metric.name, checked);
+            let status = match index {
+                CPU_TEMPERATURE_INDEX => snapshot.cpu_temperature_status.as_deref(),
+                CPU_POWER_INDEX => snapshot.cpu_power_status.as_deref(),
+                GAME_LATENCY_INDEX if checked => snapshot.game_latency_status.as_deref(),
+                _ => None,
+            };
+            if let Some(reason) = status {
+                menu.label(&reason.replace('&', "&&"));
+            }
+        }
+    }
+
+    fn gpu_sensors_menu(&self, menu: &Menu) {
+        menu.group_icon("GPUs monitoradas", Icon::Gpu, |items| self.gpu_menu(items));
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if !snapshot.gpus.is_empty() {
+            menu.separator();
+        }
         for (position, gpu) in snapshot.gpus.iter().enumerate() {
             let Some(info) = snapshot
                 .gpu_devices
@@ -2241,7 +2698,8 @@ impl Window {
             else {
                 continue;
             };
-            menu.group(&info.label().replace('&', "&&"), |items| {
+            menu.group_icon(&info.label().replace('&', "&&"), Icon::Gpu, |items| {
+                let mut source = None;
                 for (base, metric) in gpu.metrics.iter().enumerate() {
                     let index = if !info.persistent && position == 0 && self.board.contains(base) {
                         Some(base)
@@ -2251,6 +2709,12 @@ impl Window {
                     if let Some(index) = index.filter(|&index| index < MERGE_FIRST - SENSOR_FIRST)
                         && (gpu.has_sensor(base) || self.board.contains(index))
                     {
+                        if let Some(previous) = source.replace(metric.source)
+                            && previous != metric.source
+                        {
+                            items.separator();
+                            items.label(metric.source);
+                        }
                         items.item(
                             SENSOR_FIRST + index,
                             metric.name,
@@ -2278,7 +2742,7 @@ impl Window {
             })
             .collect();
         if !inactive.is_empty() {
-            menu.group("Gráficos de GPUs inativas", |items| {
+            menu.group_icon("Gráficos de GPUs inativas", Icon::Error, |items| {
                 for index in inactive {
                     if index < MERGE_FIRST - SENSOR_FIRST
                         && let Some(name) = self.series_title(snapshot, index)
@@ -2288,28 +2752,6 @@ impl Window {
                 }
             });
         }
-        let mut source = "";
-        for (index, metric) in snapshot.metrics.iter().enumerate().skip(CPU_USAGE_INDEX) {
-            let checked = self.board.contains(index);
-            if metric.source != source {
-                source = metric.source;
-                if index != CPU_USAGE_INDEX || !snapshot.gpus.is_empty() {
-                    menu.separator();
-                }
-                menu.label(source);
-            }
-            menu.item(SENSOR_FIRST + index, metric.name, checked);
-            let status = match index {
-                CPU_TEMPERATURE_INDEX => snapshot.cpu_temperature_status.as_deref(),
-                CPU_POWER_INDEX => snapshot.cpu_power_status.as_deref(),
-                _ => None,
-            };
-            if let Some(reason) = status {
-                menu.label(reason);
-            }
-        }
-        menu.separator();
-        menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
     }
 
     fn chart_metric<'a>(
@@ -2317,7 +2759,15 @@ impl Window {
         snapshot: &'a Snapshot,
         index: usize,
         selected: &[Selection],
-    ) -> Option<(&'a crate::watch::MetricSnapshot, Option<&'a str>)> {
+    ) -> Option<(&'a MetricSnapshot, Option<&'a str>)> {
+        if let Some((id, index)) = self.board.storage_sensor(index) {
+            if let Some(disk) = snapshot.storage.iter().find(|disk| disk.id == id)
+                && let Some(metric) = disk.metrics.get(index)
+            {
+                return Some((metric, Some(disk.label.get(..2).unwrap_or(&disk.label))));
+            }
+            return Some((&self.unavailable_storage[index], Some(&id[..8])));
+        }
         let (info, base) = if let Some((id, base)) = self.board.gpu_sensor(index) {
             (snapshot.gpu_devices.iter().find(|gpu| gpu.id == id), base)
         } else if index < CPU_USAGE_INDEX {
@@ -2388,53 +2838,42 @@ impl Window {
                 .and_then(|snapshot| snapshot.frame_status)
                 .unwrap_or("Aguardando a coleta de quadros")
         };
+        menu.group_icon("Aplicativo monitorado", Icon::Application, |items| {
+            items.item(
+                FRAME_TARGET_FOREGROUND,
+                "Aplicativo em foco",
+                target == FrameTarget::Foreground,
+            );
+            items.item(FRAME_TARGET_OFF, "Desativado", target == FrameTarget::Off);
+            if processes.is_empty() {
+                items.label("Nenhum aplicativo visível");
+            }
+            for (index, process) in processes.iter().enumerate() {
+                let name = process.name.replace('&', "&&");
+                items.item(
+                    FRAME_TARGET_FIRST + index,
+                    &format!("{name} (PID {})", process.pid),
+                    target == FrameTarget::Process(process.pid),
+                );
+            }
+        });
         menu.label(status);
+        menu.separator();
+        self.sensor_items(menu, FRAME_SENSORS);
         menu.item_icon(
             FPS_CEILING_EDIT,
             &format!("Teto do gráfico · {} FPS…", self.board.fps_ceiling),
             Icon::Fps,
         );
-        if let Some(snapshot) = &self.snapshot {
-            menu.separator();
-            menu.label("Gráficos exibidos");
-            for index in FRAME_SENSORS {
-                if let Some(metric) = snapshot.metrics.get(index) {
-                    menu.item(
-                        SENSOR_FIRST + index,
-                        metric.name,
-                        self.board.contains(index),
-                    );
-                }
-            }
-        }
-        menu.separator();
-        menu.label("Captura por aplicativo");
-        menu.item(
-            FRAME_TARGET_FOREGROUND,
-            "Aplicativo em foco",
-            target == FrameTarget::Foreground,
-        );
-        menu.item(FRAME_TARGET_OFF, "Desativado", target == FrameTarget::Off);
-        if processes.is_empty() {
-            menu.label("Nenhum aplicativo visível");
-        }
-        for (index, process) in processes.iter().enumerate() {
-            let name = process.name.replace('&', "&&");
-            menu.item(
-                FRAME_TARGET_FIRST + index,
-                &format!("{name} (PID {})", process.pid),
-                target == FrameTarget::Process(process.pid),
-            );
-        }
     }
 
     fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize, contextual_colors: bool) {
-        menu.group_icon("Mover painel para", Icon::Move, |positions| {
+        menu.group_icon("Mover gráfico para", Icon::Move, |positions| {
             if self.page_count() == 1 {
                 self.position_menu(positions, snapshot, panel, 0);
             } else {
                 for page in 0..self.page_count() {
-                    positions.group(&format!("Página {}", page + 1), |items| {
+                    positions.group_icon(&format!("Página {}", page + 1), Icon::Page, |items| {
                         self.position_menu(items, snapshot, panel, page);
                     });
                 }
@@ -2680,6 +3119,10 @@ impl Window {
             };
             let period = Duration::from_secs(PERIODS[self.board.period].0);
             let frames_current = snapshot.frame_target == self.monitor.frame_target();
+            let network_current = self
+                .board
+                .network_interface
+                .is_none_or(|id| Some(id) == snapshot.network_interface);
             let selected = self.monitor.gpu_selections();
             let mut series = Vec::new();
             for (slot, panel) in self
@@ -2694,17 +3137,35 @@ impl Window {
                     continue;
                 }
                 series.clear();
-                series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
-                    if !frames_current && FRAME_SENSORS.contains(&sensor) {
-                        return None;
-                    }
-                    let (metric, gpu) = self.chart_metric(snapshot, sensor, &selected)?;
-                    Some((
-                        metric,
-                        self.series_color(sensor, position, panel.len()),
-                        gpu,
-                    ))
-                }));
+                if panel.as_slice() == [CUSTOM_PING_INDEX]
+                    && !snapshot.custom_ping_metrics.is_empty()
+                {
+                    series.extend(snapshot.custom_ping_metrics.iter().enumerate().map(
+                        |(position, metric)| {
+                            let color = self
+                                .board
+                                .color(CUSTOM_PING_INDEX)
+                                .filter(|_| position == 0)
+                                .unwrap_or(SERIES[position]);
+                            (metric, color, None)
+                        },
+                    ));
+                } else {
+                    series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
+                        if (!frames_current && FRAME_SENSORS.contains(&sensor))
+                            || (!network_current
+                                && matches!(sensor, NETWORK_DOWNLOAD_INDEX | NETWORK_UPLOAD_INDEX))
+                        {
+                            return None;
+                        }
+                        let (metric, device) = self.chart_metric(snapshot, sensor, &selected)?;
+                        Some((
+                            metric,
+                            self.series_color(sensor, position, panel.len()),
+                            device,
+                        ))
+                    }));
+                }
                 chart::paint(
                     dc,
                     layout.card(slot),
@@ -2715,6 +3176,9 @@ impl Window {
                     chart::PaintStyle {
                         fonts: &self.chart_fonts,
                         palette,
+                        notice: (!self.elevated
+                            && series.iter().any(|(metric, _, _)| metric.requires_admin))
+                        .then_some(CHART_ADMIN_NOTICE),
                         axis_ceiling: panel
                             .contains(&FRAME_SENSOR_START)
                             .then(|| f64::from(self.board.fps_ceiling.get())),
@@ -3041,16 +3505,6 @@ fn dropdown_active(state: &RefCell<Window>) -> bool {
     state.try_borrow().is_ok_and(|app| app.dropdown.active())
 }
 
-fn taskbar_style(style: isize, tray_available: bool) -> isize {
-    let mask = (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW) as isize;
-    let presentation = if tray_available {
-        WS_EX_TOOLWINDOW
-    } else {
-        WS_EX_APPWINDOW
-    };
-    (style & !mask) | presentation as isize
-}
-
 fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
     let (available, was_available, dropdown) = {
         let Ok(mut app) = state.try_borrow_mut() else {
@@ -3061,7 +3515,7 @@ fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
         };
         let was_available = tray.available();
         let available = tray.register();
-        let dropdown = app.dropdown.update_normal_taskbar_style(available);
+        let dropdown = app.dropdown.active();
         (available, was_available, dropdown)
     };
 
@@ -3074,34 +3528,10 @@ fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
         if dropdown {
             return;
         }
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let style = taskbar_style(current, available);
-        if style == current {
-            return;
-        }
-
         let visible = IsWindowVisible(hwnd) != 0;
-        let minimized = IsIconic(hwnd) != 0;
-        // O Shell reaplica a apresentação na barra de tarefas ao mostrar a janela.
-        if visible {
+        if available && !was_available && visible && IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_HIDE);
-        }
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
-        let show = if visible && !(available && minimized) {
-            SWP_SHOWWINDOW
-        } else {
-            0
-        };
-        SetWindowPos(
-            hwnd,
-            null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | show,
-        );
-        if !available && was_available && !visible {
+        } else if !available && was_available && !visible {
             ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
         }
     }
@@ -3131,11 +3561,12 @@ fn handle_tray_event(hwnd: HWND, state: &RefCell<Window>, wp: WPARAM, lp: LPARAM
         if app.open_menu.is_some() {
             return None;
         }
-        app.tray.as_ref()?.event(wp, lp)
+        let event = app.tray.as_ref()?.event(wp, lp)?;
+        Some((event, app.elevated))
     });
     match event {
-        Some(tray::Event::Show) => reveal_panel(hwnd, state),
-        Some(tray::Event::Menu(point)) if unsafe { IsWindowEnabled(hwnd) } != 0 => {
+        Some((tray::Event::Show, _) | (tray::Event::Menu(_), true)) => reveal_panel(hwnd, state),
+        Some((tray::Event::Menu(point), false)) if unsafe { IsWindowEnabled(hwnd) } != 0 => {
             show_tray_menu(hwnd, state, point);
         }
         _ => {}
@@ -3263,15 +3694,6 @@ fn window_error(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tray_presentation_preserves_other_window_styles() {
-        let layered = appearance::LAYERED_STYLES as isize;
-        let normal = layered | WS_EX_APPWINDOW as isize;
-        let in_tray = layered | WS_EX_TOOLWINDOW as isize;
-        assert_eq!(taskbar_style(normal, true), in_tray);
-        assert_eq!(taskbar_style(in_tray, false), normal);
-    }
     use windows_sys::w;
 
     #[test]
@@ -3322,13 +3744,33 @@ mod tests {
     }
 
     #[test]
-    fn window_drag_moves_a_hidden_window_without_resizing_or_activating_it() {
+    fn window_drag_requests_native_move_at_the_screen_point() {
+        use std::cell::Cell;
+        use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+
+        unsafe extern "system" fn observe_move(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _id: usize,
+            data: usize,
+        ) -> LRESULT {
+            if msg == WM_SYSCOMMAND && wp as u32 & 0xfff0 == SC_MOVE {
+                // Stop before the interactive loop to keep the test independent of mouse input.
+                unsafe { &*(data as *const Cell<Option<LPARAM>>) }.set(Some(lp));
+                return 0;
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+        }
+
+        let observed = Cell::new(None::<LPARAM>);
         let hwnd = unsafe {
             CreateWindowExW(
-                0,
+                WS_EX_NOACTIVATE,
                 w!("STATIC"),
                 null(),
-                WS_POPUP,
+                WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                 -300,
                 50,
                 320,
@@ -3341,27 +3783,16 @@ mod tests {
         };
         assert!(!hwnd.is_null());
         let _guard = OwnedWindow(hwnd);
-        let bounds = || {
-            let mut rect = RECT::default();
-            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
-            (rect.left, rect.top, width(rect), height(rect))
-        };
+        assert_ne!(
+            unsafe { SetWindowSubclass(hwnd, Some(observe_move), 1, &raw const observed as usize) },
+            0
+        );
         let press = POINT { x: 25, y: 35 };
-        let mut movement = WindowMove::Idle;
-        assert!(!movement.begin(hwnd, press));
-        movement = WindowMove::Armed;
-        assert!(!movement.apply(hwnd, POINT { x: 80, y: 75 }));
-        assert_eq!(bounds(), (-300, 50, 320, 200));
-
-        assert!(movement.begin(hwnd, press));
-        assert!(movement.apply(hwnd, POINT { x: 95, y: 20 }));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, press));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, POINT { x: -55, y: 55 }));
-        assert_eq!(bounds(), (-310, 55, 320, 200));
-        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
-        assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
+        let mut screen = press;
+        assert_ne!(unsafe { ClientToScreen(hwnd, &mut screen) }, 0);
+        begin_window_move(hwnd, press);
+        let actual = message_point(observed.get().expect("comando nativo de movimentação"));
+        assert_eq!((actual.x, actual.y), (screen.x, screen.y));
     }
 
     #[test]

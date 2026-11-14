@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::UI::Shell::{
@@ -7,7 +8,8 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, HICON, RegisterWindowMessageW, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    ChangeWindowMessageFilterEx, GetCursorPos, HICON, MSGFLT_ALLOW, RegisterWindowMessageW, WM_APP,
+    WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 use windows_sys::w;
 
@@ -75,6 +77,22 @@ impl Tray {
             },
         );
         true
+    }
+
+    pub(super) fn allow_elevated_notifications(&self) -> bool {
+        // In an elevated panel these messages can only reveal the window or
+        // re-register its notification icon.
+        unsafe {
+            if self.taskbar_created != 0 {
+                ChangeWindowMessageFilterEx(
+                    self.data.hWnd,
+                    self.taskbar_created,
+                    MSGFLT_ALLOW,
+                    null_mut(),
+                );
+            }
+            ChangeWindowMessageFilterEx(self.data.hWnd, CALLBACK, MSGFLT_ALLOW, null_mut()) != 0
+        }
     }
 
     pub(super) fn available(&self) -> bool {

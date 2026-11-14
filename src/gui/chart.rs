@@ -4,12 +4,12 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     ANTIALIASED_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, DC_BRUSH, DC_PEN,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, Ellipse, FW_NORMAL, FW_SEMIBOLD,
-    FillRect, GetStockObject, GetTextExtentPoint32W, HDC, HGDIOBJ, IntersectClipRect,
-    NONANTIALIASED_QUALITY, OUT_DEFAULT_PRECIS, PS_SOLID, PolyPolyline, Polyline, RestoreDC,
-    RoundRect, SaveDC, SelectObject, SetBkMode, SetDCBrushColor, SetDCPenColor, SetTextColor,
-    TRANSPARENT,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS,
+    DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteObject,
+    DrawTextW, Ellipse, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject, GetTextExtentPoint32W,
+    HDC, HGDIOBJ, IntersectClipRect, NONANTIALIASED_QUALITY, OUT_DEFAULT_PRECIS, PS_SOLID,
+    PolyPolyline, Polyline, RestoreDC, RoundRect, SaveDC, SelectObject, SetBkMode, SetDCBrushColor,
+    SetDCPenColor, SetTextColor, TRANSPARENT,
 };
 
 use crate::watch::{MetricPoint, MetricSnapshot, Reading};
@@ -24,6 +24,7 @@ pub(super) struct PaintStyle<'a> {
     pub(super) fonts: &'a ChartFonts,
     pub(super) palette: Palette,
     pub(super) axis_ceiling: Option<f64>,
+    pub(super) notice: Option<&'static str>,
 }
 
 pub(super) fn paint(
@@ -37,6 +38,7 @@ pub(super) fn paint(
         fonts,
         palette,
         axis_ceiling,
+        notice,
     }: PaintStyle<'_>,
 ) {
     let Some(&(first, _, _)) = series.first() else {
@@ -106,8 +108,13 @@ pub(super) fn paint(
     let left = rect.left + px(3);
     let right = rect.right - px(3);
     let columns = ((right - left) / px(135).max(1)).clamp(1, views.len() as i32);
-    let rows = legend_rows(views.len(), columns, height >= px(68));
     let legend_row = px(if height < px(100) { 12 } else { 15 });
+    let rows = if first.address_label.is_some() {
+        let available = ((height - px(35)) / legend_row.max(1)).max(1);
+        (views.len().div_ceil(columns as usize) as i32).min(available)
+    } else {
+        legend_rows(views.len(), columns, height >= px(68))
+    };
     let legend_top = rect.top + px(2);
     let legend_bottom = legend_top + rows * legend_row;
     let stat_row = px(12);
@@ -157,6 +164,9 @@ pub(super) fn paint(
     for view in &views {
         draw_trace(dc, plot, view.color, scale, view.timeline, weight);
     }
+    if let Some(notice) = notice {
+        paint_notice(dc, plot, notice, fonts, palette, px(2), font_variant);
+    }
 
     if show_stats {
         paint_statistics(
@@ -174,6 +184,71 @@ pub(super) fn paint(
     }
 }
 
+fn paint_notice(
+    dc: HDC,
+    plot: RECT,
+    notice: &str,
+    fonts: &ChartFonts,
+    palette: Palette,
+    inset: i32,
+    font_variant: usize,
+) {
+    let Some(_state) = SavedDc::new(dc) else {
+        return;
+    };
+    let bounds = RECT {
+        left: plot.left + inset,
+        top: plot.top + inset,
+        right: plot.right - inset,
+        bottom: plot.bottom - inset,
+    };
+    if bounds.left >= bounds.right || bounds.top >= bounds.bottom {
+        return;
+    }
+    unsafe { IntersectClipRect(dc, plot.left, plot.top, plot.right, plot.bottom) };
+
+    let mut units = [0; 128];
+    let flags = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX;
+    for (message, font) in [
+        (notice, &fonts.legend[font_variant]),
+        (notice, &fonts.detail[font_variant]),
+        ("Requer admin", &fonts.detail[font_variant]),
+        ("Admin", &fonts.detail[font_variant]),
+    ] {
+        font.select(dc);
+        let count = text_units(message, &mut units);
+        let mut measured = bounds;
+        // With word wrapping, GDI expands the measured width if a word is too long.
+        let height = unsafe {
+            DrawTextW(
+                dc,
+                units.as_ptr(),
+                count,
+                &mut measured,
+                flags | DT_CALCRECT,
+            )
+        };
+        if height <= 0 || height > bounds.bottom - bounds.top || measured.right > bounds.right {
+            continue;
+        }
+        let top = bounds.top + (bounds.bottom - bounds.top - height) / 2;
+        let text_bounds = RECT {
+            top,
+            bottom: top + height,
+            ..bounds
+        };
+        draw_label(
+            dc,
+            text_bounds,
+            &units[..count as usize],
+            palette.text,
+            palette.text_outline,
+            flags,
+        );
+        break;
+    }
+}
+
 struct SeriesView<'a> {
     metric: &'a MetricSnapshot,
     color: COLORREF,
@@ -184,11 +259,17 @@ struct SeriesView<'a> {
 
 impl SeriesView<'_> {
     fn label(&self, compact: bool) -> Cow<'_, str> {
+        if let Some(address) = &self.metric.address_label {
+            return Cow::Borrowed(address);
+        }
         let metric = if compact {
             compact_name(self.metric.name)
         } else {
             self.metric.name
         };
+        if let Some(ip) = self.metric.remote_ip {
+            return Cow::Owned(format!("{metric} · {ip}"));
+        }
         self.gpu.map_or(Cow::Borrowed(metric), |gpu| {
             Cow::Owned(format!("{gpu} · {metric}"))
         })
@@ -672,8 +753,19 @@ pub(super) fn text(
     let mut units = [0; 128];
     let count = text_units(value, &mut units);
     let flags = align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+    draw_label(dc, rect, &units[..count as usize], color, outline, flags);
+}
+
+fn draw_label(
+    dc: HDC,
+    rect: RECT,
+    units: &[u16],
+    color: COLORREF,
+    outline: Option<COLORREF>,
+    flags: u32,
+) {
     let draw = |mut bounds: RECT| unsafe {
-        DrawTextW(dc, units.as_ptr(), count, &mut bounds, flags);
+        DrawTextW(dc, units.as_ptr(), units.len() as i32, &mut bounds, flags);
     };
     if let Some(outline) = outline {
         unsafe { SetTextColor(dc, outline) };
@@ -781,12 +873,91 @@ impl Drop for Object {
 mod tests {
     use super::*;
 
+    #[test]
+    fn permission_notice_wraps_and_stays_centered_in_a_compact_plot() {
+        use super::super::{appearance::Theme, surface::Surface};
+        use windows_sys::Win32::Graphics::Gdi::GetPixel;
+
+        let fonts = ChartFonts::new(96);
+        let mut surface = Surface::default();
+        let dc = surface.target(std::ptr::null_mut(), 128, 72).unwrap();
+        let mut palette = Theme::Light.palette();
+        palette.text_outline = Some(rgb(248, 250, 252));
+        let plot = RECT {
+            left: 25,
+            top: 9,
+            right: 105,
+            bottom: 63,
+        };
+        unsafe { SetBkMode(dc, TRANSPARENT as i32) };
+        paint_notice(
+            dc,
+            plot,
+            "Abra o ARGOS como administrador",
+            &fonts,
+            palette,
+            2,
+            1,
+        );
+        let mut extent = RECT {
+            left: 128,
+            top: 72,
+            right: 0,
+            bottom: 0,
+        };
+        for y in 0..72 {
+            for x in 0..128 {
+                if unsafe { GetPixel(dc, x, y) } == palette.text {
+                    extent.left = extent.left.min(x);
+                    extent.right = extent.right.max(x);
+                    extent.top = extent.top.min(y);
+                    extent.bottom = extent.bottom.max(y);
+                }
+            }
+        }
+        assert!(extent.bottom - extent.top > 15);
+        assert!(extent.left > plot.left && extent.right < plot.right);
+        assert!(extent.top > plot.top && extent.bottom < plot.bottom);
+        assert!((extent.left + extent.right - plot.left - plot.right).abs() < 7);
+        assert!((extent.top + extent.bottom - plot.top - plot.bottom).abs() < 7);
+    }
+
     fn point(at: Instant, reading: Reading) -> MetricPoint {
         MetricPoint {
             at,
             reading,
             interval: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn ping_legend_shows_the_address_in_compact_and_full_modes() {
+        let at = Instant::now();
+        let metric = MetricSnapshot {
+            name: "Ping",
+            address_label: None,
+            remote_ip: Some("2001:db8::10".parse().unwrap()),
+            requires_admin: false,
+            unit: " ms",
+            source: "Rede do jogo / Windows",
+            interval: Duration::from_secs(1),
+            axis_max: 100.0,
+            points: Vec::new(),
+        };
+        let view = SeriesView {
+            metric: &metric,
+            color: 0,
+            gpu: None,
+            timeline: Timeline {
+                points: &[],
+                at,
+                window: Duration::from_secs(10),
+                interval: metric.interval,
+            },
+            stats: None,
+        };
+        assert_eq!(view.label(false), "Ping · 2001:db8::10");
+        assert_eq!(view.label(true), view.label(false));
     }
 
     #[test]

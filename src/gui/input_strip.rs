@@ -1,6 +1,6 @@
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BLACK_BRUSH, BeginPaint, ClientToScreen, EndPaint, FillRect, GetStockObject, PAINTSTRUCT,
     ScreenToClient,
@@ -10,7 +10,7 @@ use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWi
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
-use super::{OwnedWindow, height, message_point, width};
+use super::{OwnedWindow, height, message_point, packed_point, width};
 
 pub(super) const HEIGHT: i32 = 10;
 const SUBCLASS: usize = 1;
@@ -157,8 +157,4 @@ unsafe extern "system" fn strip_proc(
             _ => DefSubclassProc(hwnd, msg, wp, lp),
         }
     }
-}
-
-fn packed_point(point: POINT) -> LPARAM {
-    (u32::from(point.x as u16) | (u32::from(point.y as u16) << 16)) as LPARAM
 }
