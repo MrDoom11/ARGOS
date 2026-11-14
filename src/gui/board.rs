@@ -191,6 +191,7 @@ pub(super) struct Board {
     pub(super) ping_targets: Vec<String>,
     pub(super) appearance: Appearance,
     pub(super) dropdown: DropdownSettings,
+    pub(super) run_as_admin: bool,
     colors: Vec<Option<u32>>,
     device_sensors: Vec<DeviceSensor>,
 }
@@ -210,6 +211,7 @@ impl Board {
             ping_targets: Vec::new(),
             appearance: Appearance::default(),
             dropdown: DropdownSettings::default(),
+            run_as_admin: false,
             colors: vec![None; sensor_catalog().count()],
             device_sensors: Vec::new(),
         };
@@ -566,6 +568,9 @@ impl Board {
             self.fps_ceiling,
             self.appearance.opacity,
         );
+        if self.run_as_admin {
+            text.push_str("run_as_admin=true\n");
+        }
         if let Some([left, top, right, bottom]) = self.window_bounds {
             let _ = writeln!(text, "window={left},{top},{right},{bottom}");
         }
@@ -698,6 +703,11 @@ impl Board {
                 "opacity" => {
                     if let Ok(opacity @ 0..=100) = value.parse() {
                         board.appearance.opacity = opacity;
+                    }
+                }
+                "run_as_admin" => {
+                    if let Ok(enabled) = value.parse() {
+                        board.run_as_admin = enabled;
                     }
                 }
                 "window" => {
@@ -1333,6 +1343,24 @@ mod tests {
         assert!(text.contains("fps_ceiling=144\n"));
         let invalid = format!("{text}fps_ceiling=0\nfps_ceiling=65536\nfps_ceiling=-1\n");
         assert_eq!(Board::decode(&invalid), Some(board));
+    }
+
+    #[test]
+    fn administrator_preference_defaults_off_and_round_trips() {
+        let mut board = Board::decode("version=1\npanel=cpu-usage\n").unwrap();
+        assert!(!board.run_as_admin);
+
+        board.run_as_admin = true;
+        let text = board.encode();
+        assert!(text.contains("run_as_admin=true\n"));
+        assert_eq!(Board::decode(&text).as_ref(), Some(&board));
+        assert_eq!(
+            Board::decode(&format!("{text}run_as_admin=invalid\n")).as_ref(),
+            Some(&board)
+        );
+
+        board.run_as_admin = false;
+        assert_eq!(Board::decode(&board.encode()), Some(board));
     }
 
     #[test]

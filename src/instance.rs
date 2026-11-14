@@ -16,7 +16,8 @@ use windows_sys::Win32::Foundation::{
     WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    EqualSid, GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
+    TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -42,6 +43,24 @@ pub(crate) const REPLACEMENT_CLOSE: usize = 0x4152_474f;
 const PANEL_BUSY: &str = "O painel do ARGOS está aberto. Feche-o antes de continuar.";
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT_MS: u32 = 10_000;
+const RESTART_SOURCE_INVALID: &str =
+    "Abra o ARGOS como administrador usando a mesma conta do Windows e o painel atual.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestartSource {
+    pub(crate) pid: u32,
+    pub(crate) created: u64,
+}
+
+impl RestartSource {
+    pub(crate) fn current() -> Result<Self, String> {
+        Ok(Self {
+            pid: std::process::id(),
+            created: creation_time(unsafe { GetCurrentProcess() })
+                .ok_or("Não foi possível identificar o processo do ARGOS.")?,
+        })
+    }
+}
 
 pub(crate) struct Instance {
     _panel: File,
@@ -59,14 +78,29 @@ impl Instance {
     }
 }
 
-pub(crate) fn enter() -> Result<Option<Instance>, String> {
+pub(crate) fn enter(restart: Option<RestartSource>) -> Result<Option<Instance>, String> {
+    // Validate the account and origin before accessing the elevated process's profile.
+    let origin = if let Some(source) = restart {
+        if !is_elevated() {
+            return Err("O Windows não concedeu permissões de administrador ao ARGOS.".into());
+        }
+        let process = open_panel_process(source.pid, Some(source.created))
+            .map_err(|_| RESTART_SOURCE_INVALID.to_owned())?;
+        Some((source, process))
+    } else {
+        None
+    };
     let (root, directory) = profile_directory()?;
     let launch = wait_for_launch(&directory.join("launch.lock"))?;
     let path = directory.join("panel.lock");
     let version = Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("Versão do ARGOS inválida. {error}"))?;
 
-    let mut panel = try_lock(&path, FILE_SHARE_READ)?;
+    let mut panel = if let Some((source, process)) = origin {
+        Some(replace_for_elevation(&path, source, &process)?)
+    } else {
+        try_lock(&path, FILE_SHARE_READ)?
+    };
     if panel.is_none() {
         let owner = read_owner(&path);
         // O painel pode ter fechado entre a primeira tentativa e a leitura.
@@ -107,15 +141,10 @@ pub(crate) fn enter() -> Result<Option<Instance>, String> {
     }
 
     let previous_version = read_owner(&path).map(|owner| owner.version);
-    let owner = Owner {
-        pid: std::process::id(),
-        created: creation_time(unsafe { GetCurrentProcess() })
-            .ok_or("Não foi possível identificar o processo do ARGOS.")?,
-        version,
-    };
+    let owner = RestartSource::current()?;
     panel
         .set_len(0)
-        .and_then(|()| writeln!(panel, "{} {} {}", owner.pid, owner.created, owner.version))
+        .and_then(|()| writeln!(panel, "{} {} {version}", owner.pid, owner.created))
         .map_err(|error| format!("Não foi possível registrar a instância do ARGOS. {error}"))?;
 
     Ok(Some(Instance {
@@ -123,6 +152,36 @@ pub(crate) fn enter() -> Result<Option<Instance>, String> {
         launch: Some(launch),
         previous_version,
     }))
+}
+
+fn replace_for_elevation(
+    path: &Path,
+    source: RestartSource,
+    origin: &OwnedHandle,
+) -> Result<File, String> {
+    let owner = read_owner(path).ok_or(RESTART_SOURCE_INVALID)?;
+    if source.pid != owner.pid || source.created != owner.created {
+        return Err(RESTART_SOURCE_INVALID.into());
+    }
+    if let Some(window) = find_panel(Some(source.pid))
+        && !exited(origin)
+        && unsafe { PostMessageW(window, WM_CLOSE, REPLACEMENT_CLOSE, 0) } == 0
+        && !exited(origin)
+    {
+        return Err(PANEL_BUSY.into());
+    }
+    // The portable launcher may keep the original process alive after it releases
+    // the panel, so wait for the lock instead of for the process.
+    let started = Instant::now();
+    loop {
+        if let Some(panel) = try_lock(path, FILE_SHARE_READ)? {
+            return Ok(panel);
+        }
+        if started.elapsed() >= Duration::from_millis(u64::from(CLOSE_TIMEOUT_MS)) {
+            return Err("O painel do ARGOS demorou a fechar. Tente novamente.".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 // O instalador mantém launch.lock aberto até concluir a instalação.
@@ -319,10 +378,13 @@ fn window_pid(window: HWND) -> Option<u32> {
 }
 
 fn same_user(process: HANDLE) -> bool {
-    let Some(current) = token_user(unsafe { GetCurrentProcess() }) else {
-        return false;
-    };
-    let Some(target) = token_user(process) else {
+    process_token(process).is_some_and(|token| token_is_current_user(token.as_raw_handle()))
+}
+
+fn token_is_current_user(token: HANDLE) -> bool {
+    let current = process_token(unsafe { GetCurrentProcess() })
+        .and_then(|token| token_user(token.as_raw_handle()));
+    let (Some(current), Some(target)) = (current, token_user(token)) else {
         return false;
     };
     // SAFETY: as duas áreas alinhadas contêm TOKEN_USER e os SIDs ainda estão válidos.
@@ -333,21 +395,16 @@ fn same_user(process: HANDLE) -> bool {
     }
 }
 
-fn token_user(process: HANDLE) -> Option<Vec<usize>> {
-    let mut token = null_mut();
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
-        return None;
-    }
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+fn token_user(token: HANDLE) -> Option<Vec<usize>> {
     let mut size = 0;
-    unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut size) };
+    unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut size) };
     if (size as usize) < std::mem::size_of::<TOKEN_USER>() {
         return None;
     }
     let mut buffer = vec![0_usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
     let ok = unsafe {
         GetTokenInformation(
-            token.as_raw_handle(),
+            token,
             TokenUser,
             buffer.as_mut_ptr().cast(),
             size,
@@ -355,6 +412,42 @@ fn token_user(process: HANDLE) -> Option<Vec<usize>> {
         )
     };
     (ok != 0).then_some(buffer)
+}
+
+fn process_token(process: HANDLE) -> Option<OwnedHandle> {
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    Some(unsafe { OwnedHandle::from_raw_handle(token) })
+}
+
+pub(crate) fn is_elevated() -> bool {
+    process_is_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)
+}
+
+pub(crate) fn process_is_elevated(process: HANDLE) -> Option<bool> {
+    let token = process_token(process)?;
+    token_is_elevated(token.as_raw_handle())
+}
+
+pub(crate) fn token_is_ordinary_user(token: HANDLE) -> bool {
+    token_is_elevated(token) == Some(false) && token_is_current_user(token)
+}
+
+fn token_is_elevated(token: HANDLE) -> Option<bool> {
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut size = 0;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+    };
+    (ok != 0).then_some(elevation.TokenIsElevated != 0)
 }
 
 fn legacy_panel(root: &Path) -> Option<HWND> {
@@ -487,5 +580,28 @@ mod tests {
         let created = creation_time(unsafe { GetCurrentProcess() }).unwrap();
         assert!(open_panel_process(pid, Some(created + 1)).is_err());
         assert!(!exited(&open_panel_process(pid, Some(created)).unwrap()));
+    }
+
+    #[test]
+    fn elevation_replaces_only_the_registered_panel_and_waits_for_its_lock() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("panel.lock");
+        let mut previous = try_lock(&path, FILE_SHARE_READ).unwrap().unwrap();
+        let source = RestartSource::current().unwrap();
+        let process = open_panel_process(source.pid, Some(source.created)).unwrap();
+        writeln!(previous, "{} {} 0.4.0", source.pid, source.created).unwrap();
+        let different_process = RestartSource {
+            created: source.created + 1,
+            ..source
+        };
+        assert!(replace_for_elevation(&path, different_process, &process).is_err());
+        assert!(try_lock(&path, FILE_SHARE_READ).unwrap().is_none());
+
+        let release = thread::spawn(move || drop(previous));
+        let replacement = replace_for_elevation(&path, source, &process).unwrap();
+        release.join().unwrap();
+        assert!(!exited(&process));
+        assert!(try_lock(&path, FILE_SHARE_READ).unwrap().is_none());
+        drop(replacement);
     }
 }

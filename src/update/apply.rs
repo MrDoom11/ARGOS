@@ -6,7 +6,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use semver::Version;
 use windows_sys::Win32::Foundation::{
@@ -70,7 +70,7 @@ pub(super) fn spawn(
     if let Some(installed) = installed {
         command.arg(installed);
     }
-    if let Err(error) = quiet(&mut command).spawn() {
+    if let Err(error) = crate::desktop_child::spawn(quiet(&mut command)) {
         let _ = fs::remove_file(worker);
         let _ = fs::remove_dir(attempt);
         return Err(io_error(error));
@@ -79,6 +79,9 @@ pub(super) fn spawn(
 }
 
 pub(super) fn run(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    if crate::instance::process_is_elevated(unsafe { GetCurrentProcess() }) != Some(false) {
+        return Err("A atualização exige as permissões normais da conta do Windows.".into());
+    }
     let pid = args
         .next()
         .and_then(|value| value.to_str()?.parse::<u32>().ok())
@@ -221,10 +224,13 @@ fn run_portable(package: &Path) -> Result<(), String> {
     start_portable(package).map(|_| ())
 }
 
-fn start_portable(package: &Path) -> Result<Child, String> {
-    quiet(hidden(package).args([PORTABLE_SWITCH, "/SP-", "/NORESTART"]))
-        .spawn()
-        .map_err(io_error)
+fn start_portable(package: &Path) -> Result<OwnedHandle, String> {
+    crate::desktop_child::spawn(quiet(hidden(package).args([
+        PORTABLE_SWITCH,
+        "/SP-",
+        "/NORESTART",
+    ])))
+    .map_err(io_error)
 }
 
 fn cached_directory(root: &Path) -> Result<Option<PathBuf>, String> {

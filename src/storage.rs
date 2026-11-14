@@ -260,11 +260,12 @@ impl VolumeSampler {
                 null_mut(),
             )
         };
+        let captured = Instant::now();
         if success == 0 {
             return None;
         }
         let Some(current) = (returned >= size)
-            .then(|| Counters::from_raw(data))
+            .then(|| Counters::from_raw(data, captured))
             .flatten()
         else {
             release_performance(&handle);
@@ -339,11 +340,11 @@ struct Counters {
     read: u64,
     written: u64,
     idle: u64,
-    time: u64,
+    captured: Instant,
 }
 
 impl Counters {
-    fn from_raw(data: DISK_PERFORMANCE) -> Option<Self> {
+    fn from_raw(data: DISK_PERFORMANCE, captured: Instant) -> Option<Self> {
         let manager = data
             .StorageManagerName
             .map(|code| u8::try_from(code).unwrap_or_default());
@@ -359,16 +360,20 @@ impl Counters {
             read: data.BytesRead.try_into().ok()?,
             written: data.BytesWritten.try_into().ok()?,
             idle: data.IdleTime.try_into().ok()?,
-            time: data.QueryTime.try_into().ok()?,
+            captured,
         })
     }
 
     fn since(self, previous: Self, mask: u8) -> Sample {
-        if self.device != previous.device || self.time <= previous.time {
+        // QueryTime is the wall clock, which may change between driver requests.
+        let elapsed = self
+            .captured
+            .duration_since(previous.captured)
+            .as_secs_f64();
+        if self.device != previous.device || elapsed == 0.0 {
             return Sample::default();
         }
-        let elapsed_100ns = (self.time - previous.time) as f64;
-        let elapsed = elapsed_100ns / 10_000_000.0;
+        let elapsed_100ns = elapsed * 10_000_000.0;
         Sample {
             read_bytes_per_sec: self
                 .read
@@ -420,5 +425,35 @@ impl Drop for CriticalErrorMode {
         if let Some(previous) = self.0 {
             unsafe { SetThreadErrorMode(previous, null_mut()) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_rates_use_monotonic_time_when_the_system_clock_moves_back() {
+        let at = Instant::now();
+        let before = DISK_PERFORMANCE {
+            BytesRead: 2_000,
+            BytesWritten: 4_000,
+            IdleTime: 2_000_000,
+            QueryTime: 60_000_000,
+            ..DISK_PERFORMANCE::default()
+        };
+        let after = DISK_PERFORMANCE {
+            BytesRead: 3_000,
+            BytesWritten: 6_000,
+            IdleTime: 7_000_000,
+            QueryTime: 50_000_000,
+            ..before
+        };
+        let previous = Counters::from_raw(before, at).unwrap();
+        let current = Counters::from_raw(after, at + Duration::from_secs(1)).unwrap();
+        let sample = current.since(previous, PERFORMANCE);
+        assert_eq!(sample.read_bytes_per_sec, Some(1_000.0));
+        assert_eq!(sample.write_bytes_per_sec, Some(2_000.0));
+        assert_eq!(sample.active_percent, Some(50.0));
     }
 }

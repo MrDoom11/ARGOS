@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Diagnostics::Etw::{
 use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::core::{GUID, w};
 
-use super::{Packet, Transport};
+use super::{Failure, Packet, Transport};
 
 const TCP_IP: GUID = GUID::from_u128(0x9a280ac0_c8e0_11d1_84e2_00c04fb998a2);
 const UDP_IP: GUID = GUID::from_u128(0xbf3a50c5_a9c9_4988_a005_2df0b7c80f80);
@@ -42,20 +42,8 @@ pub(super) struct Trace {
 }
 
 impl Trace {
-    pub(super) fn start<F: FnMut(Packet) + Send + 'static>(callback: F) -> Result<Self, String> {
-        Self::open(callback).map_err(|error| match error.raw_os_error().map(|code| code as u32) {
-            Some(ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD) => {
-                "A captura de rede requer permissão do Windows. Abra o ARGOS como administrador"
-                    .into()
-            }
-            Some(ERROR_ALREADY_EXISTS) => {
-                "Outra instância do ARGOS já está capturando a rede".into()
-            }
-            Some(ERROR_NO_SYSTEM_RESOURCES) => {
-                "O Windows atingiu o limite de sessões de captura".into()
-            }
-            _ => format!("Não foi possível iniciar a captura de rede: {error}"),
-        })
+    pub(super) fn start<F: FnMut(Packet) + Send + 'static>(callback: F) -> Result<Self, Failure> {
+        Self::open(callback).map_err(start_error)
     }
 
     fn open<F: FnMut(Packet) + Send + 'static>(callback: F) -> io::Result<Self> {
@@ -95,6 +83,23 @@ impl Trace {
 
     pub(super) fn take_loss(&self) -> bool {
         self.loss.swap(false, Ordering::Relaxed)
+    }
+}
+
+fn start_error(error: io::Error) -> Failure {
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD) => Failure::PermissionDenied(
+            "A captura de rede requer permissão do Windows. Abra o ARGOS como administrador",
+        ),
+        Some(ERROR_ALREADY_EXISTS) => {
+            Failure::Other("Outra instância do ARGOS já está capturando a rede".into())
+        }
+        Some(ERROR_NO_SYSTEM_RESOURCES) => {
+            Failure::Other("O Windows atingiu o limite de sessões de captura".into())
+        }
+        _ => Failure::Other(format!(
+            "Não foi possível iniciar a captura de rede: {error}"
+        )),
     }
 }
 
@@ -335,6 +340,16 @@ fn status(code: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_only_flags_windows_permission_errors_as_requiring_admin() {
+        for code in [ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD] {
+            assert!(start_error(io::Error::from_raw_os_error(code as i32)).requires_admin());
+        }
+        for code in [ERROR_ALREADY_EXISTS, ERROR_NO_SYSTEM_RESOURCES] {
+            assert!(!start_error(io::Error::from_raw_os_error(code as i32)).requires_admin());
+        }
+    }
 
     #[test]
     fn normalizes_tcp_and_udp_ipv4_directions() {

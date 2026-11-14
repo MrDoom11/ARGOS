@@ -4,6 +4,7 @@ mod icmp;
 mod tcp;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,6 +54,28 @@ pub struct Observation {
     pub target: Option<Target>,
     pub rtt: Rtt,
     pub detail: String,
+    pub(crate) requires_admin: bool,
+}
+
+#[derive(Clone)]
+enum Failure {
+    PermissionDenied(&'static str),
+    Other(String),
+}
+
+impl Failure {
+    fn requires_admin(&self) -> bool {
+        matches!(self, Self::PermissionDenied(_))
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PermissionDenied(message) => formatter.write_str(message),
+            Self::Other(message) => formatter.write_str(message),
+        }
+    }
 }
 
 pub enum Rtt {
@@ -180,12 +203,11 @@ fn collect(feed: &Feed) {
         let observation = worker.sample(started, request, |target| {
             let mut state = feed.state.lock().expect("alvo da latência");
             if !state.stopped && state.request == request {
-                state.latest = Some(Observation {
-                    timestamp: Instant::now(),
-                    target: Some(target),
-                    rtt: Rtt::Pending,
-                    detail: format!("{} · aguardando medição", target.label()),
-                });
+                state.latest = Some(observation(
+                    Some(target),
+                    Rtt::Pending,
+                    format!("{} · aguardando medição", target.label()),
+                ));
             }
         });
         state = feed.state.lock().expect("alvo da latência");
@@ -219,7 +241,7 @@ struct Worker {
     discovery: Arc<Mutex<Discovery>>,
     trace: Option<Trace>,
     retry_at: Instant,
-    trace_error: String,
+    trace_error: Failure,
     measurement: Option<(Target, Measurement)>,
     request: Request,
     process: Option<io::Result<ProcessTarget>>,
@@ -233,7 +255,7 @@ impl Worker {
             discovery: Arc::new(Mutex::new(Discovery::default())),
             trace: None,
             retry_at: started,
-            trace_error: String::new(),
+            trace_error: Failure::Other(String::new()),
             measurement: None,
             request: Request::default(),
             process: None,
@@ -287,16 +309,19 @@ impl Worker {
             };
             (target, !discovery.candidates.is_empty())
         };
-        if let Err(detail) = capture {
+        if let Err(error) = capture {
             if target.is_none() {
                 self.measurement = None;
             }
             let detail = if let Some(target) = target {
-                format!("{} · {detail}", target.label())
+                format!("{} · {error}", target.label())
             } else {
-                detail
+                error.to_string()
             };
-            return observation(target, Rtt::Unavailable, detail);
+            return Observation {
+                requires_admin: error.requires_admin(),
+                ..observation(target, Rtt::Unavailable, detail)
+            };
         }
         let Some(target) = target else {
             self.measurement = None;
@@ -314,15 +339,25 @@ impl Worker {
         let (_, measurement) = self.measurement.as_mut().expect("destino selecionado");
         let (source, result) = measurement.sample();
         let prefix = format!("{} · {source}", target.label());
-        let (rtt, detail) = match result {
-            Ok(Some(rtt_ms)) => (Rtt::Milliseconds(rtt_ms), prefix),
-            Ok(None) => (Rtt::Pending, format!("{prefix} · aguardando amostra")),
-            Err(error) => (Rtt::Unavailable, format!("{prefix} · {error}")),
-        };
-        observation(Some(target), rtt, detail)
+        match result {
+            Ok(Some(rtt_ms)) => observation(Some(target), Rtt::Milliseconds(rtt_ms), prefix),
+            Ok(None) => observation(
+                Some(target),
+                Rtt::Pending,
+                format!("{prefix} · aguardando amostra"),
+            ),
+            Err(error) => Observation {
+                requires_admin: error.requires_admin(),
+                ..observation(
+                    Some(target),
+                    Rtt::Unavailable,
+                    format!("{prefix} · {error}"),
+                )
+            },
+        }
     }
 
-    fn ensure_trace(&mut self, now: Instant, current: Option<Target>) -> Result<(), String> {
+    fn ensure_trace(&mut self, now: Instant, current: Option<Target>) -> Result<(), Failure> {
         if let Some(trace) = &self.trace {
             if trace.is_running() {
                 if trace.take_loss() {
@@ -330,7 +365,9 @@ impl Worker {
                         .lock()
                         .expect("descoberta de rede")
                         .reset_scores(current);
-                    return Err("Captura de rede incompleta. Redetectando o destino.".to_owned());
+                    return Err(Failure::Other(
+                        "Captura de rede incompleta. Redetectando o destino.".to_owned(),
+                    ));
                 }
                 return Ok(());
             }
@@ -339,8 +376,9 @@ impl Worker {
                 .lock()
                 .expect("descoberta de rede")
                 .reset_scores(current);
-            self.trace_error =
-                "A captura de rede foi interrompida. Tentando reconectar.".to_owned();
+            self.trace_error = Failure::Other(
+                "A captura de rede foi interrompida. Tentando reconectar.".to_owned(),
+            );
             self.retry_at = now + TRACE_RETRY;
         }
         if now < self.retry_at {
@@ -381,6 +419,7 @@ fn observation(target: Option<Target>, rtt: Rtt, detail: impl Into<String>) -> O
         target,
         rtt,
         detail: detail.into(),
+        requires_admin: false,
     }
 }
 
@@ -397,10 +436,13 @@ impl Measurement {
         }
     }
 
-    fn sample(&mut self) -> (&'static str, Result<Option<f64>, String>) {
+    fn sample(&mut self) -> (&'static str, Result<Option<f64>, Failure>) {
         match self {
             Self::Tcp(rtt) => ("RTT TCP", rtt.sample()),
-            Self::Icmp(rtt) => ("UDP observado · sonda ICMP", rtt.sample()),
+            Self::Icmp(rtt) => (
+                "UDP observado · sonda ICMP",
+                rtt.sample().map_err(Failure::Other),
+            ),
         }
     }
 }

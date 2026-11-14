@@ -1,12 +1,16 @@
 use std::cell::RefCell;
 use std::io;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{
+    COLORREF, ERROR_CANCELLED, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WAIT_TIMEOUT, WPARAM,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     DwmSetWindowAttribute,
@@ -16,6 +20,7 @@ use windows_sys::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
 use windows_sys::Win32::UI::HiDpi::*;
@@ -23,7 +28,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, IsWindowEnabled, ReleaseCapture, SetCapture, VK_END, VK_ESCAPE, VK_F2, VK_F3,
     VK_F4, VK_HOME, VK_NEXT, VK_PRIOR,
 };
-use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::Shell::{
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    ShellExecuteExW, ShellExecuteW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
@@ -91,6 +99,7 @@ const UPDATE_CANCEL: usize = 344;
 const UPDATE_ERROR: usize = 345;
 const UPDATE_CHECK_DETAILS: usize = 346;
 const EDIT_PING_TARGETS: usize = 347;
+const RUN_AS_ADMIN: usize = 348;
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const DROPDOWN_TOGGLE: usize = 350;
 const DROPDOWN_PREVIEW: usize = 351;
@@ -102,6 +111,7 @@ const DROPDOWN_WIDTH_FIRST: usize = 370;
 const THEME_DARK: usize = 380;
 const THEME_LIGHT: usize = 381;
 const FPS_CEILING_EDIT: usize = 382;
+const CHART_ADMIN_NOTICE: &str = "Abra o ARGOS como administrador";
 const DROPDOWN_ALIGNMENTS: [(u8, &str); 5] = [
     (0, "Esquerda"),
     (25, "Entre esquerda e centro"),
@@ -150,11 +160,15 @@ const SERIES: [COLORREF; 16] = [
     chart::rgb(255, 162, 178),
 ];
 
-pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
-    if gpu.is_none() && update::launch_cached(source) {
+pub(crate) fn run(
+    gpu: Option<GpuIndex>,
+    source: Source,
+    restart: Option<instance::RestartSource>,
+) -> Result<(), String> {
+    if restart.is_none() && gpu.is_none() && update::launch_cached(source) {
         return Ok(());
     }
-    let Some(mut panel_instance) = instance::enter()? else {
+    let Some(mut panel_instance) = instance::enter(restart)? else {
         return Ok(());
     };
     let saved_board = Board::load();
@@ -184,6 +198,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     });
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     let state = Box::new(RefCell::new(Window::new(monitor, board, dpi, source)));
+    state.borrow_mut().gpu_override = gpu;
     let instance = unsafe { GetModuleHandleW(null()) };
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
@@ -225,7 +240,17 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         return Err(window_error("criar a janela"));
     }
     let hwnd_guard = OwnedWindow(hwnd);
-    state.borrow_mut().tray = Some(tray::Tray::new(hwnd, class.hIcon));
+    let elevated = state.borrow().elevated;
+    if elevated {
+        // Keep the reveal-only action available to the normal launcher.
+        unsafe {
+            ChangeWindowMessageFilterEx(hwnd, instance::REVEAL_PANEL, MSGFLT_ALLOW, null_mut());
+        }
+    }
+    let tray = tray::Tray::new(hwnd, class.hIcon);
+    if !elevated || tray.allow_elevated_notifications() {
+        state.borrow_mut().tray = Some(tray);
+    }
     refresh_tray(hwnd, &state);
     let placed = saved_bounds.is_some_and(|bounds| restore_window_bounds(hwnd, bounds));
     let window_dpi = unsafe { GetDpiForWindow(hwnd) };
@@ -266,6 +291,9 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         notice.show(hwnd, theme);
         dropdown_mode::sync(hwnd, &state);
     }
+    if restart.is_none() && state.borrow().should_elevate_on_open() {
+        reopen_as_admin(hwnd, &state);
+    }
 
     let mut message = MSG::default();
     loop {
@@ -285,7 +313,16 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
             DispatchMessageW(&message);
         }
     }
+    let elevated_child = state.borrow_mut().elevated_child.take();
     drop(hwnd_guard);
+    drop(state);
+    drop(panel_instance);
+    if source != Source::Direct
+        && let Some(child) = elevated_child
+    {
+        // The portable installer retains its extracted files while this process lives.
+        unsafe { WaitForSingleObject(child.as_raw_handle(), INFINITE) };
+    }
     Ok(())
 }
 
@@ -1249,10 +1286,9 @@ fn apply_option(
     displays: &[dropdown::Display],
 ) {
     match choice {
-        ABOUT_RELEASES => open_about_link(hwnd, state, update::RELEASES_URL),
-        ABOUT_GUIDE => open_about_link(hwnd, state, ABOUT_GUIDE_URL),
-        ABOUT_TWITCH => open_about_link(hwnd, state, ABOUT_TWITCH_URL),
+        ABOUT_RELEASES | ABOUT_GUIDE | ABOUT_TWITCH => open_about_link(hwnd, state, choice),
         START_WITH_WINDOWS => toggle_autostart(hwnd, state),
+        RUN_AS_ADMIN => toggle_elevation_preference(hwnd, state),
         THEME_DARK | THEME_LIGHT => {
             edit_board(hwnd, state, |app| {
                 let theme = if choice == THEME_DARK {
@@ -1655,7 +1691,51 @@ fn choose_dropdown_hotkey(hwnd: HWND, state: &RefCell<Window>) {
     }
 }
 
-fn open_about_link(hwnd: HWND, state: &RefCell<Window>, url: &str) {
+fn open_about_link(hwnd: HWND, state: &RefCell<Window>, choice: usize) {
+    let page = match choice {
+        ABOUT_RELEASES => "releases",
+        ABOUT_GUIDE => "guide",
+        ABOUT_TWITCH => "twitch",
+        _ => return,
+    };
+    let result = if state.borrow().elevated {
+        std::env::current_exe().and_then(|exe| {
+            let mut command = std::process::Command::new(exe);
+            command.args(["open-about-link", page]);
+            crate::desktop_child::spawn(&mut command).map(|_| ())
+        })
+    } else {
+        open_public_page(hwnd, page)
+    };
+    if let Err(error) = result {
+        show_notice(
+            hwnd,
+            state,
+            "Sobre o ARGOS",
+            &format!("Não foi possível abrir o link no navegador. {error}"),
+        );
+    }
+}
+
+pub(crate) fn open_public_page(hwnd: HWND, page: &str) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if instance::process_is_elevated(unsafe { GetCurrentProcess() }) != Some(false) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "O navegador precisa ser aberto com as permissões normais da conta.",
+        ));
+    }
+    let url = match page {
+        "releases" => update::RELEASES_URL,
+        "guide" => ABOUT_GUIDE_URL,
+        "twitch" => ABOUT_TWITCH_URL,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Link desconhecido.",
+            ));
+        }
+    };
     let url = wide(url);
     let result = unsafe {
         let initialized = CoInitializeEx(
@@ -1676,13 +1756,9 @@ fn open_about_link(hwnd: HWND, state: &RefCell<Window>, url: &str) {
         result
     };
     if result as isize <= 32 {
-        show_notice(
-            hwnd,
-            state,
-            "Sobre o ARGOS",
-            "Não foi possível abrir o link no navegador.",
-        );
+        return Err(io::Error::from_raw_os_error(result as i32));
     }
+    Ok(())
 }
 
 fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
@@ -1702,6 +1778,116 @@ fn toggle_autostart(hwnd: HWND, state: &RefCell<Window>) {
             &format!("Não foi possível alterar a inicialização do ARGOS. {error}"),
         );
     }
+}
+
+fn toggle_elevation_preference(hwnd: HWND, state: &RefCell<Window>) {
+    let result = {
+        let mut app = state.borrow_mut();
+        app.board.run_as_admin = !app.board.run_as_admin;
+        match app.board.save() {
+            Ok(()) => {
+                app.save_failed = false;
+                Ok(app.should_elevate_on_open())
+            }
+            Err(error) => {
+                app.board.run_as_admin = !app.board.run_as_admin;
+                Err(error)
+            }
+        }
+    };
+    match result {
+        Ok(true) => reopen_as_admin(hwnd, state),
+        Ok(false) => {}
+        Err(error) => show_notice(
+            hwnd,
+            state,
+            "Sempre abrir como administrador",
+            &format!("Não foi possível salvar a preferência. {error}"),
+        ),
+    }
+}
+
+fn reopen_as_admin(hwnd: HWND, state: &RefCell<Window>) {
+    let (source, gpu) = {
+        let app = state.borrow();
+        if app.elevated
+            || app.elevated_child.as_ref().is_some_and(|child| {
+                (unsafe { WaitForSingleObject(child.as_raw_handle(), 0) }) == WAIT_TIMEOUT
+            })
+        {
+            return;
+        }
+        (app.source, app.gpu_override)
+    };
+    match launch_elevated(hwnd, source, gpu) {
+        Ok(Some(child)) => state.borrow_mut().elevated_child = Some(child),
+        Ok(None) => {}
+        Err(error) => show_notice(hwnd, state, "Abrir como administrador", &error),
+    }
+}
+
+fn launch_elevated(
+    hwnd: HWND,
+    source: Source,
+    gpu: Option<GpuIndex>,
+) -> Result<Option<OwnedHandle>, String> {
+    let origin = instance::RestartSource::current()?;
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Não foi possível localizar o executável do ARGOS. {error}"))?;
+    let directory = exe
+        .parent()
+        .ok_or("Não foi possível localizar a pasta do ARGOS.")?;
+    let executable: Vec<_> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let directory: Vec<_> = directory.as_os_str().encode_wide().chain([0]).collect();
+    let mut parameters = format!("reopen-elevated {} {}", origin.pid, origin.created);
+    if source != Source::Direct {
+        parameters.push_str(" --portable-exact");
+    }
+    if let Some(gpu) = gpu {
+        use std::fmt::Write;
+        let _ = match gpu {
+            GpuIndex::Nvidia(index) => write!(parameters, " --gpu {index}"),
+            GpuIndex::Radeon(index) => write!(parameters, " --gpu amd:{index}"),
+        };
+    }
+    let parameters = wide(&parameters);
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI,
+        hwnd,
+        lpVerb: w!("runas"),
+        lpFile: executable.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: directory.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+    let initialized = unsafe {
+        CoInitializeEx(
+            null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        ) >= 0
+    };
+    let result = if unsafe { ShellExecuteExW(&mut execute) } == 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "Não foi possível abrir o ARGOS como administrador. {error}"
+            ))
+        }
+    } else if execute.hProcess.is_null() {
+        Err("O Windows não confirmou a abertura do ARGOS.".into())
+    } else {
+        Ok(Some(unsafe {
+            OwnedHandle::from_raw_handle(execute.hProcess)
+        }))
+    };
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
 }
 
 fn show_notice(hwnd: HWND, state: &RefCell<Window>, title: &str, message: &str) {
@@ -1840,6 +2026,10 @@ impl UpdateNotice {
 struct Window {
     monitor: Monitor,
     updater: Updater,
+    elevated: bool,
+    elevated_child: Option<OwnedHandle>,
+    source: Source,
+    gpu_override: Option<GpuIndex>,
     update_notice: Option<UpdateNotice>,
     snapshot: Option<Arc<Snapshot>>,
     board: Board,
@@ -1869,6 +2059,10 @@ impl Window {
         Self {
             monitor,
             updater: Updater::new(source),
+            elevated: instance::is_elevated(),
+            elevated_child: None,
+            source,
+            gpu_override: None,
             update_notice: None,
             snapshot: None,
             board,
@@ -1900,6 +2094,10 @@ impl Window {
             buffer: BackBuffer::default(),
             surface: Surface::default(),
         }
+    }
+
+    fn should_elevate_on_open(&self) -> bool {
+        self.board.run_as_admin && !self.elevated
     }
 
     fn set_dpi(&mut self, dpi: u32) {
@@ -2197,6 +2395,14 @@ impl Window {
             );
         } else {
             menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
+        }
+        if self.board.run_as_admin {
+            menu.item(RUN_AS_ADMIN, "Abertura como administrador ativada", true);
+        } else {
+            menu.item_icon(RUN_AS_ADMIN, "Sempre abrir como administrador", Icon::Admin);
+            if self.elevated {
+                menu.label("Sessão atual como administrador");
+            }
         }
         if self.save_failed || self.dropdown.save_failed {
             menu.label("Configuração disponível nesta sessão");
@@ -2970,6 +3176,9 @@ impl Window {
                     chart::PaintStyle {
                         fonts: &self.chart_fonts,
                         palette,
+                        notice: (!self.elevated
+                            && series.iter().any(|(metric, _, _)| metric.requires_admin))
+                        .then_some(CHART_ADMIN_NOTICE),
                         axis_ceiling: panel
                             .contains(&FRAME_SENSOR_START)
                             .then(|| f64::from(self.board.fps_ceiling.get())),
@@ -3352,11 +3561,12 @@ fn handle_tray_event(hwnd: HWND, state: &RefCell<Window>, wp: WPARAM, lp: LPARAM
         if app.open_menu.is_some() {
             return None;
         }
-        app.tray.as_ref()?.event(wp, lp)
+        let event = app.tray.as_ref()?.event(wp, lp)?;
+        Some((event, app.elevated))
     });
     match event {
-        Some(tray::Event::Show) => reveal_panel(hwnd, state),
-        Some(tray::Event::Menu(point)) if unsafe { IsWindowEnabled(hwnd) } != 0 => {
+        Some((tray::Event::Show, _) | (tray::Event::Menu(_), true)) => reveal_panel(hwnd, state),
+        Some((tray::Event::Menu(point), false)) if unsafe { IsWindowEnabled(hwnd) } != 0 => {
             show_tray_menu(hwnd, state, point);
         }
         _ => {}

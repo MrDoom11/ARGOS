@@ -13,6 +13,8 @@ Abra `ARGOS-Setup.exe` no Windows 11 x64 e escolha uma opção.
 
 Na versão instalada, selecione **Painel → Iniciar com o Windows** para abrir o ARGOS ao entrar na sua conta. Selecione a opção novamente para desativar.
 
+Marque **Painel → Sempre abrir como administrador** para salvar a preferência e solicitar a elevação do painel atual. O menu passa a exibir **Abertura como administrador ativada** com uma marca de seleção. O Windows solicita confirmação a cada nova sessão do ARGOS. Se cancelar, o painel continua com as permissões normais e a preferência fica marcada. Clique na opção marcada para que a próxima abertura use as permissões normais. A opção **Iniciar com o Windows** é configurada separadamente.
+
 O painel mantém uma janela por conta do Windows. Se já houver uma janela aberta, pedir para executar uma versão igual ou mais antiga mostra o painel atual. Uma versão mais nova oferece a opção de trocar após fechar o painel. Ao instalar com o painel aberto, o instalador pede para fechá-lo e bloqueia a substituição de uma instalação por uma versão mais antiga. As duas opções usam as preferências do mesmo perfil do Windows.
 
 ![Tela inicial do instalador do ARGOS com as opções Somente executar e Instalar](docs/screenshots/instalador.jpg)
@@ -42,7 +44,7 @@ O pacote gerado fica em `target\dist\ARGOS-Setup.exe`.
 
 ### Atualizações pelo painel
 
-O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu principal, use **Buscar por atualizações** para consultar novamente. O resultado aparece no centro da janela e o painel continua recebendo cliques. Quando o pacote estiver pronto, abra **Atualizações** no menu principal e escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. O painel mostra as novidades na primeira abertura depois da atualização. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
+O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu principal, use **Buscar por atualizações** para consultar novamente. O resultado aparece no centro da janela e o painel continua recebendo cliques. Quando o pacote estiver pronto, abra **Atualizações** no menu principal e escolha **Atualizar e reiniciar** ou **Atualizar ao fechar**. A escolha **Atualizar ao fechar** vale para a sessão em que foi feita. Se você reabrir o painel como administrador, agende novamente na nova sessão. O painel mostra as novidades na primeira abertura depois da atualização. A instalação usa o mesmo pacote em modo silencioso. No modo **Somente executar**, a versão verificada fica no perfil do Windows e é reutilizada nas próximas aberturas pelo lançador. Se também houver uma cópia instalada, **Escolher outra versão** oferece a cópia instalada e a versão do pacote aberto.
 
 ## Janela de monitoramento
 
@@ -50,7 +52,7 @@ O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu pri
 
 Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. Na primeira abertura, o guia rápido mostra os principais controles e o painel usa um monitor secundário, quando disponível. Abra o menu com o botão direito. Use **Sensores** para escolher o que acompanhar e **Painel** para ajustar a exibição. A busca por atualizações e **Sobre o ARGOS** ficam no menu principal. O grupo **Gráfico** aparece ao abrir o menu sobre um gráfico.
 
-O ícone do ARGOS fica na área de notificação, perto do relógio. Clique nele para mostrar o painel depois de minimizar. Pelo botão direito no ícone, escolha **Mostrar ARGOS** ou **Fechar ARGOS**. Enquanto está aberto no modo normal, o painel também aparece na barra de tarefas e pode ser encaixado pelo FancyZones.
+O ícone do ARGOS fica na área de notificação, perto do relógio. Clique nele para mostrar o painel depois de minimizar. Pelo botão direito no ícone, escolha **Mostrar ARGOS** ou **Fechar ARGOS**. Em uma sessão de administrador, o botão direito no ícone também mostra o painel, onde fica o comando **Fechar ARGOS**. Enquanto está aberto no modo normal, o painel também aparece na barra de tarefas e pode ser encaixado pelo FancyZones.
 
 Em **Sensores → GPU → GPUs monitoradas**, marque as placas NVIDIA e Radeon que quer acompanhar ao mesmo tempo. O índice distingue placas do mesmo modelo. O modo automático coleta uma placa, com preferência pela NVIDIA. Cada placa tem seu próprio histórico e sua própria seção em **Sensores → GPU**. Ao desmarcar uma placa, seus gráficos ficam no layout e as demais placas continuam com seus históricos. CPU, RAM e quadros são coletados uma vez para todo o painel. Escolhas e gráficos são restaurados quando a placa tem uma identidade persistente. `gui --gpu 0` seleciona a primeira NVIDIA pelo índice NVML e `gui --gpu amd:0` seleciona a primeira Radeon pelo índice ADLX.
 

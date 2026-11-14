@@ -380,6 +380,7 @@ fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
     board.dropdown.enabled = true;
     let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
     let mut app = Window::new(monitor, board, 96, Source::PortableExact);
+    app.elevated = false;
     assert!(app.update_snapshot(Some(Arc::new(test_snapshot()))));
     let processes = [Process {
         pid: u32::MAX,
@@ -399,6 +400,19 @@ fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
     assert!(find_submenu(root.0, "Atualizações").is_none());
     assert!(has_direct_command(root.0, UPDATE_CHECK));
     assert!(has_direct_command(root.0, MOVE_WINDOW));
+    assert!(!has_direct_command(root.0, RUN_AS_ADMIN));
+    let administrative = menu_position(panel, "Sempre abrir como administrador").unwrap();
+    let autostart = menu_position(panel, "Iniciar com o Windows (requer instalação)").unwrap();
+    assert_eq!(administrative.abs_diff(autostart), 1);
+    assert_eq!(
+        unsafe { GetMenuItemID(panel, administrative as i32) },
+        RUN_AS_ADMIN as u32
+    );
+    let state = unsafe { GetMenuState(panel, RUN_AS_ADMIN as u32, MF_BYCOMMAND) };
+    assert_eq!(state & (MF_DISABLED | MF_GRAYED | MF_CHECKED), 0);
+    assert_menu_icon(panel, administrative);
+    assert!(menu_position(panel, "Sessão atual como administrador").is_none());
+    assert!(!app.should_elevate_on_open());
 
     let without_chart =
         options_menu(null_mut(), &app, MenuSection::All, &processes, &[], None).unwrap();
@@ -465,6 +479,28 @@ fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
     assert!(app_menu_commands(submenu(panel, "Intervalo de amostragem")).contains(&REFRESH_FIRST));
     assert!(app_menu_commands(submenu(panel, "Modo dropdown")).contains(&DROPDOWN_TOGGLE));
     assert!(app_menu_commands(submenu(panel, "Página")).contains(&PAGE_FIRST));
+
+    app.board.run_as_admin = true;
+    for elevated in [false, true] {
+        app.elevated = elevated;
+        assert_eq!(app.should_elevate_on_open(), !elevated);
+        let root = options_menu(null_mut(), &app, MenuSection::All, &[], &[], None).unwrap();
+        let panel = submenu(root.0, "Painel");
+        assert!(has_direct_command(panel, RUN_AS_ADMIN));
+        let state = unsafe { GetMenuState(panel, RUN_AS_ADMIN as u32, MF_BYCOMMAND) };
+        assert_eq!(state & (MF_DISABLED | MF_GRAYED | MF_CHECKED), MF_CHECKED);
+        let administrative = menu_position(panel, "Abertura como administrador ativada").unwrap();
+        assert_eq!(menu_item_data(panel, administrative), 0);
+        assert!(menu_position(panel, "Sempre abrir como administrador").is_none());
+        assert!(menu_position(panel, "Sessão atual como administrador").is_none());
+    }
+    app.board.run_as_admin = false;
+    let root = options_menu(null_mut(), &app, MenuSection::All, &[], &[], None).unwrap();
+    let panel = submenu(root.0, "Painel");
+    let status = menu_position(panel, "Sessão atual como administrador").unwrap();
+    let state = unsafe { GetMenuState(panel, status, MF_BYPOSITION) };
+    assert_ne!(state, u32::MAX);
+    assert_ne!(state & (MF_DISABLED | MF_GRAYED), 0);
 }
 
 #[test]
@@ -530,21 +566,26 @@ fn assert_submenu_icons(menu: HMENU) {
         if child.is_null() {
             continue;
         }
-        let mut info = MENUITEMINFOW {
-            cbSize: size_of::<MENUITEMINFOW>() as u32,
-            fMask: MIIM_DATA,
-            ..Default::default()
-        };
-        assert_ne!(
-            unsafe { GetMenuItemInfoW(menu, position as u32, 1, &mut info) },
-            0
-        );
-        assert!(
-            (1..=usize::from(u16::MAX)).contains(&info.dwItemData),
-            "submenu sem ícone na posição {position}"
-        );
+        assert_menu_icon(menu, position as u32);
         assert_submenu_icons(child);
     }
+}
+
+fn assert_menu_icon(menu: HMENU, position: u32) {
+    assert!(
+        (1..=usize::from(u16::MAX)).contains(&menu_item_data(menu, position)),
+        "item de menu sem ícone na posição {position}"
+    );
+}
+
+fn menu_item_data(menu: HMENU, position: u32) -> usize {
+    let mut info = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_DATA,
+        ..Default::default()
+    };
+    assert_ne!(unsafe { GetMenuItemInfoW(menu, position, 1, &mut info) }, 0);
+    info.dwItemData
 }
 
 fn submenu(menu: HMENU, label: &str) -> HMENU {
@@ -552,12 +593,14 @@ fn submenu(menu: HMENU, label: &str) -> HMENU {
 }
 
 fn find_submenu(menu: HMENU, label: &str) -> Option<HMENU> {
+    let position = menu_position(menu, label)?;
+    let child = unsafe { GetSubMenu(menu, position as i32) };
+    (!child.is_null()).then_some(child)
+}
+
+fn menu_position(menu: HMENU, label: &str) -> Option<u32> {
     let expected: Vec<_> = label.encode_utf16().collect();
     for position in 0..unsafe { GetMenuItemCount(menu) } {
-        let child = unsafe { GetSubMenu(menu, position) };
-        if child.is_null() {
-            continue;
-        }
         let mut name = [0; 128];
         let length = unsafe {
             GetMenuStringW(
@@ -569,7 +612,7 @@ fn find_submenu(menu: HMENU, label: &str) -> Option<HMENU> {
             )
         };
         if name[..length as usize] == expected {
-            return Some(child);
+            return Some(position as u32);
         }
     }
     None
@@ -636,6 +679,7 @@ fn test_snapshot() -> Snapshot {
                 remote_ip: None,
                 unit: "",
                 source: "",
+                requires_admin: false,
                 interval: Duration::from_secs(1),
                 axis_max: 100.0,
                 points: Vec::new(),

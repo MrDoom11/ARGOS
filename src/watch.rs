@@ -315,6 +315,7 @@ pub(crate) struct MetricSnapshot {
     pub(crate) remote_ip: Option<IpAddr>,
     pub(crate) unit: &'static str,
     pub(crate) source: &'static str,
+    pub(crate) requires_admin: bool,
     pub(crate) interval: Duration,
     pub(crate) axis_max: f64,
     pub(crate) points: Vec<MetricPoint>,
@@ -732,6 +733,7 @@ struct FrameMonitor {
     sampler: FrameSampler,
     group: Group<{ FRAME_SENSORS.len() }>,
     status: Option<&'static str>,
+    requires_admin: bool,
 }
 
 #[derive(Default)]
@@ -873,6 +875,7 @@ pub(crate) fn storage_metric_template(index: usize) -> MetricSnapshot {
         remote_ip: None,
         unit,
         source: STORAGE,
+        requires_admin: false,
         interval: STORAGE_INTERVAL,
         axis_max: if unit == "%" { 100.0 } else { 1.0 },
         points: Vec::new(),
@@ -1040,6 +1043,8 @@ struct GameLatencyMonitor {
     history: PingHistory,
     pid: Option<u32>,
     status: String,
+    requires_admin: bool,
+    enabled: bool,
 }
 
 impl GameLatencyMonitor {
@@ -1053,7 +1058,29 @@ impl GameLatencyMonitor {
             history: PingHistory::new(Instant::now(), game_network::INTERVAL),
             pid: None,
             status,
+            requires_admin: false,
+            enabled: true,
         }
+    }
+
+    fn configure(&mut self, enabled: bool, pid: Option<u32>) -> bool {
+        let changed = self.enabled != enabled;
+        if changed && enabled && self.sampler.is_none() {
+            *self = Self::new();
+        }
+        self.enabled = enabled;
+        if enabled {
+            let target_changed = self.set_pid(pid);
+            let published = self.poll();
+            return changed || target_changed || published;
+        }
+        if changed {
+            // The network worker stops the trace on its own thread.
+            self.set_pid(None);
+            self.requires_admin = false;
+            self.history = PingHistory::new(Instant::now(), game_network::INTERVAL);
+        }
+        changed
     }
 
     fn set_pid(&mut self, pid: Option<u32>) -> bool {
@@ -1061,6 +1088,7 @@ impl GameLatencyMonitor {
             return false;
         }
         self.pid = pid;
+        self.requires_admin = false;
         self.history.remote_ip = None;
         if let Some(sampler) = &self.sampler {
             sampler.set_pid(pid);
@@ -1088,6 +1116,7 @@ impl GameLatencyMonitor {
             observation.rtt.into(),
         );
         self.status = observation.detail;
+        self.requires_admin = observation.requires_admin;
         true
     }
 }
@@ -1381,6 +1410,7 @@ struct CpuMonitor {
     group: Group<{ CPU_SENSORS.len() }>,
     retry_at: Instant,
     status: [Option<String>; CPU_SENSORS.len()],
+    requires_admin: [bool; CPU_SENSORS.len()],
     power_axis_max: f64,
 }
 
@@ -1391,6 +1421,7 @@ impl CpuMonitor {
             group: Group::new(start, interval, FASTEST_GUI_INTERVAL),
             retry_at: start,
             status: [None, None],
+            requires_admin: [false; CPU_SENSORS.len()],
             power_axis_max: CPU_POWER_AXIS_START,
         }
     }
@@ -1406,6 +1437,7 @@ impl CpuMonitor {
                         Err(error) => {
                             let reason = cpu_sensor_error(&error);
                             self.status = [Some(reason.clone()), Some(reason)];
+                            self.requires_admin = [cpu_requires_admin(&error); CPU_SENSORS.len()];
                         }
                     }
                 }
@@ -1417,6 +1449,10 @@ impl CpuMonitor {
                 {
                     Some(Ok(samples)) => {
                         let [temperature, power] = &mut self.status;
+                        self.requires_admin = [
+                            samples.temperature.as_ref().is_err_and(cpu_requires_admin),
+                            samples.power.as_ref().is_err_and(cpu_requires_admin),
+                        ];
                         [
                             read_cpu_metric(samples.temperature, temperature),
                             read_cpu_metric(samples.power, power),
@@ -1426,6 +1462,7 @@ impl CpuMonitor {
                         self.status = std::array::from_fn(|index| {
                             enabled[index].then(|| cpu_sensor_error(&error))
                         });
+                        self.requires_admin = [cpu_requires_admin(&error); CPU_SENSORS.len()];
                         [cpu_reading_error(&error); 2]
                     }
                     None => [Reading::Unavailable; 2],
@@ -1455,6 +1492,7 @@ impl FrameMonitor {
             sampler,
             group: Group::new(Instant::now(), interval, FASTEST_GUI_INTERVAL),
             status: None,
+            requires_admin: false,
         }
     }
 
@@ -1464,6 +1502,7 @@ impl FrameMonitor {
             .capture(start, || {
                 let sample = self.sampler.sample(interval);
                 self.status = Some(sample.status());
+                self.requires_admin = sample.requires_admin();
                 match sample {
                     frames::Sample::Measured(values) => {
                         values.map(|value| value.map_or(Reading::Pending, Reading::Value))
@@ -1627,13 +1666,13 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             if let Some(frames) = &mut dashboard.frames {
                 snapshot_pending |= frames.collect(start);
             }
-            if latency_enabled != dashboard.game_latency.is_some() {
-                dashboard.game_latency = latency_enabled.then(GameLatencyMonitor::new);
+            if latency_enabled && dashboard.game_latency.is_none() {
+                dashboard.game_latency = Some(GameLatencyMonitor::new());
                 snapshot_pending = true;
             }
             if let Some(latency) = &mut dashboard.game_latency {
-                snapshot_pending |= latency.set_pid(pid.or(dashboard.foreground_pid));
-                snapshot_pending |= latency.poll();
+                snapshot_pending |=
+                    latency.configure(latency_enabled, pid.or(dashboard.foreground_pid));
             }
             let ping_targets = feed.custom_ping_targets();
             if dashboard.custom_ping.is_none() && !ping_targets.is_empty() {
@@ -1720,6 +1759,7 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             } else {
                 cpu.source = None;
                 cpu.status = [None, None];
+                cpu.requires_admin = [false; CPU_SENSORS.len()];
             }
         }
         let mut next = system.cadence.deadline();
@@ -1741,7 +1781,7 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
         if dashboard
             .game_latency
             .as_ref()
-            .is_some_and(|latency| latency.sampler.is_some())
+            .is_some_and(|latency| latency.enabled && latency.sampler.is_some())
             || dashboard
                 .custom_ping
                 .as_ref()
@@ -1841,6 +1881,11 @@ fn build_snapshot(
         interval,
         axis_limits,
     );
+    if frames.is_some_and(|frames| frames.requires_admin) {
+        for metric in &mut metrics[FRAME_SENSOR_START..CPU_TEMPERATURE_INDEX] {
+            metric.requires_admin = true;
+        }
+    }
     let cpu = dashboard.cpu.as_ref();
     append_metrics(
         &mut metrics,
@@ -1853,6 +1898,13 @@ fn build_snapshot(
     );
     if let Some(cpu) = cpu {
         metrics[CPU_POWER_INDEX].axis_max = cpu.power_axis_max;
+        for (metric, requires_admin) in metrics
+            [CPU_TEMPERATURE_INDEX..CPU_TEMPERATURE_INDEX + CPU_SENSORS.len()]
+            .iter_mut()
+            .zip(cpu.requires_admin)
+        {
+            metric.requires_admin = requires_admin;
+        }
     } else {
         for metric in &mut metrics[CPU_TEMPERATURE_INDEX..] {
             metric.points.push(MetricPoint {
@@ -1864,7 +1916,10 @@ fn build_snapshot(
     }
     let [cpu_temperature_status, cpu_power_status] =
         cpu.map_or([None, None], |cpu| cpu.status.clone());
-    let latency = dashboard.game_latency.as_ref();
+    let latency = dashboard
+        .game_latency
+        .as_ref()
+        .filter(|latency| latency.enabled);
     append_metrics(
         &mut metrics,
         at,
@@ -1875,11 +1930,11 @@ fn build_snapshot(
         axis_limits,
     );
     if let Some(latency) = latency {
-        latency.history.update_metric(
-            &mut metrics[GAME_LATENCY_INDEX],
-            at,
-            latency.sampler.is_some(),
-        );
+        let metric = &mut metrics[GAME_LATENCY_INDEX];
+        latency
+            .history
+            .update_metric(metric, at, latency.sampler.is_some());
+        metric.requires_admin = latency.requires_admin;
     }
     append_metrics(
         &mut metrics,
@@ -2087,6 +2142,7 @@ fn append_metrics<const N: usize>(
         remote_ip: None,
         unit,
         source,
+        requires_admin: false,
         interval,
         axis_max: axis_limits.max_for(axis),
         points: Vec::with_capacity(capacity),
@@ -2334,6 +2390,11 @@ fn cpu_reading_error(error: &io::Error) -> Reading {
     } else {
         Reading::Failed
     }
+}
+
+fn cpu_requires_admin(error: &io::Error) -> bool {
+    // Broker permission errors map to Unsupported. A denial here is direct PawnIO access.
+    error.kind() == io::ErrorKind::PermissionDenied
 }
 
 fn cpu_sensor_error(error: &io::Error) -> String {
@@ -2601,6 +2662,8 @@ mod tests {
             history: PingHistory::new(start, game_network::INTERVAL),
             pid: Some(1),
             status: String::new(),
+            requires_admin: false,
+            enabled: true,
         };
         latency.history.record(start, first, Reading::Value(42.0));
         for tick in 1..=400 {
@@ -2619,11 +2682,17 @@ mod tests {
         let waiting = start + Duration::from_secs(100);
         let snapshot = build_snapshot(waiting, "", &system, &[], &dashboard, &FALLBACK_AXES);
         let metric = &snapshot.metrics[GAME_LATENCY_INDEX];
+        assert!(!metric.requires_admin);
         let [previous, status] = metric.points.as_slice() else {
             panic!("o gráfico deve manter a leitura e exibir o estado atual");
         };
         assert!(matches!(previous.reading, Reading::Value(42.0)));
         assert!(matches!(status.reading, Reading::Pending));
+        dashboard.game_latency.as_mut().unwrap().requires_admin = true;
+        let denied = build_snapshot(waiting, "", &system, &[], &dashboard, &FALLBACK_AXES);
+        assert!(denied.metrics[GAME_LATENCY_INDEX].requires_admin);
+        assert!(!denied.metrics[CUSTOM_PING_INDEX].requires_admin);
+        assert!(!denied.metrics[NETWORK_DOWNLOAD_INDEX].requires_admin);
         let latency = dashboard.game_latency.as_mut().unwrap();
         let resumed = start + Duration::from_secs(101);
         latency.history.record(resumed, first, Reading::Value(43.0));
@@ -2651,8 +2720,40 @@ mod tests {
         ));
         assert_eq!(points[3].0, switched);
         assert!(latency.set_pid(Some(2)));
+        assert!(!latency.requires_admin);
         assert_eq!(latency.history.remote_ip, None);
         assert_eq!(latency.history.group.history.len(), 5);
+    }
+
+    #[test]
+    fn disabling_game_ping_keeps_the_worker_and_removes_its_readings() {
+        let start = Instant::now();
+        let mut latency = GameLatencyMonitor::new();
+        latency.pid = Some(1);
+        latency.history.record(
+            start,
+            Some(IpAddr::from([192, 0, 2, 1])),
+            Reading::Value(42.0),
+        );
+        latency.requires_admin = true;
+        let mut dashboard = DashboardReadings {
+            game_latency: Some(latency),
+            ..Default::default()
+        };
+        let system = Group::new(start, game_network::INTERVAL, game_network::INTERVAL);
+        let latency = dashboard.game_latency.as_mut().unwrap();
+        assert!(latency.configure(false, Some(1)));
+        assert!(latency.sampler.is_some());
+        assert!(latency.pid.is_none());
+        assert!(!latency.requires_admin);
+        assert!(!latency.configure(false, Some(1)));
+        let snapshot = build_snapshot(start, "", &system, &[], &dashboard, &FALLBACK_AXES);
+        assert!(snapshot.metrics[GAME_LATENCY_INDEX].points.is_empty());
+        assert!(snapshot.game_latency_status.is_none());
+        let latency = dashboard.game_latency.as_mut().unwrap();
+        assert!(latency.configure(true, None));
+        assert!(latency.sampler.is_some());
+        assert_eq!(latency.history.group.history.len(), 0);
     }
 
     #[test]

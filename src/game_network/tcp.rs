@@ -2,7 +2,8 @@ use std::net::SocketAddr;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, NO_ERROR,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, ERROR_PRIVILEGE_NOT_HELD,
+    NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetPerTcp6ConnectionEStats, GetPerTcpConnectionEStats,
@@ -13,7 +14,7 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, IN6_ADDR, IN6_ADDR_0};
 
-use super::Target;
+use super::{Failure, Target};
 
 pub(super) struct TcpRtt {
     target: Target,
@@ -30,7 +31,7 @@ impl TcpRtt {
         }
     }
 
-    pub(super) fn sample(&mut self) -> Result<Option<f64>, String> {
+    pub(super) fn sample(&mut self) -> Result<Option<f64>, Failure> {
         let Some(connection) = self.find_connection()? else {
             self.enable_result = None;
             return Ok(None);
@@ -47,10 +48,11 @@ impl TcpRtt {
                         self.enable_result = None;
                         Ok(None)
                     }
-                    ERROR_ACCESS_DENIED => Err(
-                        "O Windows exige privilégios de administrador para ativar as estatísticas TCP."
-                            .to_owned(),
-                    ),
+                    ERROR_ACCESS_DENIED | ERROR_PRIVILEGE_NOT_HELD => {
+                        Err(Failure::PermissionDenied(
+                            "O Windows exige privilégios de administrador para ativar as estatísticas TCP.",
+                        ))
+                    }
                     status => Err(api_error("ativar as estatísticas TCP", status)),
                 }
             }
@@ -62,7 +64,7 @@ impl TcpRtt {
         }
     }
 
-    fn find_connection(&mut self) -> Result<Option<Connection>, String> {
+    fn find_connection(&mut self) -> Result<Option<Connection>, Failure> {
         let pid = self.target.pid;
         let established = MIB_TCP_STATE_ESTAB as u32;
         match (self.target.local, self.target.remote) {
@@ -144,7 +146,7 @@ impl TcpRtt {
         }
     }
 
-    fn read_table(&mut self, family: u16) -> Result<&[u32], String> {
+    fn read_table(&mut self, family: u16) -> Result<&[u32], Failure> {
         for _ in 0..4 {
             let mut size = size_of_val(self.table.as_slice()) as u32;
             let table = if size == 0 {
@@ -261,6 +263,8 @@ impl Connection {
     }
 }
 
-fn api_error(operation: &str, status: u32) -> String {
-    format!("O Windows não conseguiu {operation} (código {status}).")
+fn api_error(operation: &str, status: u32) -> Failure {
+    Failure::Other(format!(
+        "O Windows não conseguiu {operation} (código {status})."
+    ))
 }

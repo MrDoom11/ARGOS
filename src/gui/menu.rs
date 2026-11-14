@@ -68,6 +68,7 @@ pub(super) enum Icon {
     Pin = 0xe718,
     Pinned = 0xe842,
     Power = 0xe7e8,
+    Admin = 0xea18,
     Minimize = 0xe921,
     Maximize = 0xe922,
     Restore = 0xe923,

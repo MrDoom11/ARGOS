@@ -1,11 +1,13 @@
-• Ping — acompanhe a latência do aplicativo em foco ou do aplicativo fixado no menu FPS. O gráfico mostra o IP medido ao lado do título. O menu Sensores informa o método, e o gráfico deixa uma lacuna quando a leitura está indisponível.
+• Ping — acompanhe a latência do aplicativo em foco ou do aplicativo fixado no menu FPS. O gráfico mostra o IP medido ao lado do título. O menu Sensores → Rede informa o método, e o gráfico deixa uma lacuna quando a leitura está indisponível.
 
 • Ping personalizado — acompanhe até quatro IPs ou nomes de host no mesmo gráfico. Edite a lista em Sensores → Rede → Ping personalizado e acompanhe cada destino pela cor da curva.
 
 • FancyZones — use Mover janela e arraste o painel para uma zona configurada no PowerToys.
 
-• Rede — selecione uma interface e acompanhe as taxas de download e upload em Mbps, com a escala ajustada à velocidade do link.
+• Rede — selecione um adaptador físico e acompanhe as taxas de download e upload em Mbps, com a escala ajustada à velocidade do link.
 
 • Armazenamento — configure por volume os gráficos de leitura, escrita, atividade e espaço ocupado. Acompanhe vários volumes ao mesmo tempo.
 
 • Menus — escolha os gráficos em Sensores e ajuste a exibição em Painel. Buscar por atualizações e Sobre o ARGOS ficam no menu principal. Sobre um gráfico, abra Gráfico para mover, mesclar, separar ou ajustar as cores.
+
+• Sempre abrir como administrador — marque a opção em Painel para solicitar privilégios de administrador a cada nova sessão. Quando a falta de permissão impede a coleta, o gráfico afetado mostra um aviso.
