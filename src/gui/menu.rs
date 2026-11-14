@@ -40,12 +40,22 @@ const TEXT_BLOCK_SEPARATOR: &str = " · ";
 pub(super) enum Icon {
     Sampling = 0xe917,
     History = 0xe81c,
+    Cpu = 0xeea1,
+    Memory = 0xeea0,
     Gpu = 0xe770,
     Sensors = 0xe9d2,
     Fps = 0xe916,
+    Application = 0xe8f9,
+    Network = 0xe774,
+    Adapter = 0xeda3,
+    Ping = 0xe9d9,
+    Storage = 0xeda2,
     Grid = 0xe8a9,
     Appearance = 0xe771,
+    Opacity = 0xef1f,
     Dropdown = 0xe70d,
+    Monitor = 0xe7f9,
+    Width = 0xe7ea,
     Page = 0xe8a5,
     About = 0xea1f,
     Update = 0xe72c,
@@ -130,24 +140,11 @@ impl Menu {
         unsafe { AppendMenuW(self.0, MF_SEPARATOR, 0, null()) };
     }
 
-    pub(super) fn group(&self, label: &str, items: impl FnOnce(&Self)) {
-        self.add_group(label, None, items);
-    }
-
     pub(super) fn group_icon(&self, label: &str, icon: Icon, items: impl FnOnce(&Self)) {
-        self.add_group(label, Some(icon), items);
-    }
-
-    fn add_group(&self, label: &str, icon: Option<Icon>, items: impl FnOnce(&Self)) {
         let Some(submenu) = Self::new() else { return };
         items(&submenu);
         // Uma inclusão bem-sucedida transfere o submenu para o menu pai.
-        if self.append(
-            MF_POPUP,
-            submenu.0 as usize,
-            label,
-            icon.map_or(0, |icon| icon as usize),
-        ) {
+        if self.append(MF_POPUP, submenu.0 as usize, label, icon as usize) {
             std::mem::forget(submenu);
         }
     }

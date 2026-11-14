@@ -36,8 +36,8 @@ use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
     CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, FRAME_SENSOR_START,
     GAME_LATENCY_INDEX, GUI_INTERVALS_MS, MetricPoint, MetricSnapshot, Monitor,
-    NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX, Reading, STORAGE_SENSOR_COUNT, STORAGE_SENSORS,
-    Snapshot, storage_metric_template,
+    NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX, RAM_USED_INDEX, Reading, STORAGE_SENSOR_COUNT,
+    STORAGE_SENSORS, Snapshot, storage_metric_template,
 };
 
 mod appearance;
@@ -1039,6 +1039,12 @@ enum MenuSection {
     Grid,
 }
 
+impl MenuSection {
+    fn has_sensor_controls(self) -> bool {
+        matches!(self, Self::All | Self::Sensors)
+    }
+}
+
 struct OpenMenu {
     root: HMENU,
     section: MenuSection,
@@ -1066,10 +1072,15 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
     {
         return;
     }
-    let (processes, displays) = if matches!(section, MenuSection::All) {
-        (visible_processes(), dropdown::displays())
+    let processes = if section.has_sensor_controls() {
+        visible_processes()
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
+    };
+    let displays = if matches!(section, MenuSection::All) {
+        dropdown::displays()
+    } else {
+        Vec::new()
     };
     let (menu, panel_sensors, theme, dpi) = {
         let Ok(mut app) = state.try_borrow_mut() else {
@@ -1088,7 +1099,7 @@ fn show_options(hwnd: HWND, state: &RefCell<Window>, screen: POINT, section: Men
             None
         };
         // Preserve command IDs while adapter discovery refreshes in the background.
-        app.network_menu_interfaces = if matches!(section, MenuSection::All) {
+        app.network_menu_interfaces = if section.has_sensor_controls() {
             app.snapshot
                 .as_ref()
                 .map(|snapshot| Arc::clone(&snapshot.network_interfaces))
@@ -1157,138 +1168,42 @@ fn options_menu(
 ) -> Option<Menu> {
     let menu = Menu::new()?;
     match section {
-        MenuSection::Sensors => app.sensor_menu(&menu),
+        MenuSection::Sensors => app.sensor_menu(&menu, processes),
         MenuSection::Period => app.period_menu(&menu),
         MenuSection::Grid => app.grid_menu(&menu),
         MenuSection::All => {
-            if let Some(snapshot) = &app.snapshot {
-                if app.snapshot_is_stale(Instant::now()) {
-                    menu.label("Coleta atrasada");
-                }
-                if snapshot.gpu_selections == app.monitor.gpu_selections() {
-                    menu.label(&snapshot.notice);
-                } else {
-                    menu.label("Atualizando as GPUs monitoradas…");
-                }
+            if app.snapshot_is_stale(Instant::now()) {
+                menu.label_icon("Coleta atrasada", Icon::Error);
+            }
+            if let Some(index) = panel
+                && let Some(snapshot) = &app.snapshot
+            {
+                menu.group_icon("Gráfico", Icon::Layers, |items| {
+                    app.panel_menu(items, snapshot, index, !appearance::is_click_through(hwnd));
+                });
                 menu.separator();
             }
-            menu.group_icon("Intervalo de amostragem", Icon::Sampling, |items| {
-                for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
-                    items.item(
-                        REFRESH_FIRST + index,
-                        &format!("{ms} ms"),
-                        ms == app.board.refresh_ms,
-                    );
-                }
+            menu.group_icon("Sensores", Icon::Sensors, |items| {
+                app.sensor_menu(items, processes)
             });
-            menu.group_icon("Histórico", Icon::History, |items| app.period_menu(items));
-            menu.group_icon("GPUs monitoradas", Icon::Gpu, |items| app.gpu_menu(items));
-            menu.group_icon("Interfaces de rede", Icon::Sensors, |items| {
-                app.network_menu(items)
+            menu.group_icon("Painel", Icon::Grid, |items| {
+                app.panel_settings_menu(hwnd, items, displays)
             });
-            menu.group_icon("Sensores", Icon::Sensors, |items| app.sensor_menu(items));
-            menu.group_icon("FPS", Icon::Fps, |items| app.frame_menu(items, processes));
             menu.separator();
-            menu.group_icon("Grade", Icon::Grid, |items| app.grid_menu(items));
-            menu.group_icon("Aparência", Icon::Appearance, |items| {
-                app.appearance_menu(hwnd, items)
+            app.updates_menu(&menu);
+            menu.group_icon("Sobre o ARGOS", Icon::About, |items| {
+                items.text_block(&[
+                    concat!("ARGOS ", env!("CARGO_PKG_VERSION")),
+                    concat!("Licença ", env!("CARGO_PKG_LICENSE")),
+                ]);
+                items.separator();
+                items.centered_item(ABOUT_GUIDE, "Guia do painel");
+                items.centered_item(ABOUT_TWITCH, "Canal na Twitch");
+                items.centered_item(ABOUT_RELEASES, "Versões no GitHub");
             });
-            menu.group_icon("Modo dropdown", Icon::Dropdown, |items| {
-                dropdown_menu(items, app, displays)
-            });
-            match app.updater.status() {
-                Status::Idle => {
-                    menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update);
-                    match app.update_notice.as_ref().map(|notice| &notice.result) {
-                        Some(CheckNotice::Current) => menu.label("O ARGOS está atualizado"),
-                        Some(CheckNotice::Failed(_)) => menu.item_icon(
-                            UPDATE_CHECK_DETAILS,
-                            "Ver erro da busca por atualizações",
-                            Icon::Error,
-                        ),
-                        _ => {}
-                    }
-                }
-                Status::Checking => menu.label_icon("Buscando por atualizações…", Icon::Update),
-                Status::Ready(version, scheduled) => {
-                    menu.group_icon(
-                        &format!("ARGOS {version} disponível"),
-                        Icon::Update,
-                        |items| {
-                            items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
-                            if scheduled {
-                                items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
-                            } else {
-                                items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
-                            }
-                        },
-                    );
-                }
-            }
-            if update::last_error().is_some() {
-                menu.item_icon(UPDATE_ERROR, "Ver erro da última atualização", Icon::Error);
-            }
-            if app.page_count() > 1 {
-                menu.group_icon("Página", Icon::Page, |items| {
-                    for page in 0..app.page_count() {
-                        items.item(
-                            PAGE_FIRST + page,
-                            &format!("Página {}", page + 1),
-                            app.page_is_current(page),
-                        );
-                    }
-                });
-            }
-            if app.save_failed || app.dropdown.save_failed {
-                menu.label("Configuração disponível nesta sessão");
-            }
+            menu.separator();
+            app.window_menu(hwnd, &menu);
         }
-    }
-    if let Some(index) = panel
-        && let Some(snapshot) = &app.snapshot
-    {
-        menu.separator();
-        app.panel_menu(&menu, snapshot, index, !appearance::is_click_through(hwnd));
-    }
-    if matches!(section, MenuSection::All) {
-        menu.separator();
-        menu.group_icon("Sobre o ARGOS", Icon::About, |items| {
-            items.text_block(&[
-                concat!("ARGOS ", env!("CARGO_PKG_VERSION")),
-                "Acompanhe CPU, GPU, memória, FPS e outros recursos no Windows em um painel personalizável com gráficos em tempo real e histórico.",
-                concat!("Licença ", env!("CARGO_PKG_LICENSE")),
-            ]);
-            items.separator();
-            items.centered_item(ABOUT_GUIDE, "Guia do painel");
-            items.centered_item(ABOUT_TWITCH, "Canal na Twitch");
-            items.centered_item(ABOUT_RELEASES, "Versões no GitHub");
-        });
-        if let Some(directory) = app.startup_directory() {
-            let enabled = autostart::enabled(directory).unwrap_or(false);
-            let label = if enabled {
-                "Iniciar com o Windows (ativado)"
-            } else {
-                "Iniciar com o Windows"
-            };
-            menu.item_icon_checked(START_WITH_WINDOWS, label, Icon::Power, enabled);
-        } else {
-            menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
-        }
-        if app.dropdown.active() {
-            let pinned = app.dropdown.pinned();
-            let icon = if pinned { Icon::Pinned } else { Icon::Pin };
-            menu.item_icon_checked(DROPDOWN_PIN, "Fixar aberto", icon, pinned);
-        } else {
-            if unsafe { IsZoomed(hwnd) } != 0 {
-                menu.label_icon("Mover janela", Icon::Move);
-                menu.item_icon(MAXIMIZE_WINDOW, "Restaurar", Icon::Restore);
-            } else {
-                menu.item_icon(MOVE_WINDOW, "Mover janela", Icon::Move);
-                menu.item_icon(MAXIMIZE_WINDOW, "Maximizar", Icon::Maximize);
-            }
-            menu.item_icon(MINIMIZE_WINDOW, "Minimizar", Icon::Minimize);
-        }
-        menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
     }
     Some(menu)
 }
@@ -1650,7 +1565,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
     if settings.enabled && !app.dropdown.active() {
         menu.label("Dropdown suspenso");
     }
-    menu.group("Monitor", |items| {
+    menu.group_icon("Monitor", Icon::Monitor, |items| {
         for (index, display) in displays.iter().take(DROPDOWN_MONITOR_LIMIT).enumerate() {
             items.item(
                 DROPDOWN_MONITOR_FIRST + index,
@@ -1659,7 +1574,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
             );
         }
     });
-    menu.group("Posição da faixa", |items| {
+    menu.group_icon("Posição da faixa", Icon::Move, |items| {
         for (index, (value, label)) in DROPDOWN_ALIGNMENTS.iter().enumerate() {
             items.item(
                 DROPDOWN_ALIGNMENT_FIRST + index,
@@ -1668,7 +1583,7 @@ fn dropdown_menu(menu: &Menu, app: &Window, displays: &[dropdown::Display]) {
             );
         }
     });
-    menu.group("Largura da faixa", |items| {
+    menu.group_icon("Largura da faixa", Icon::Width, |items| {
         for (index, value) in DROPDOWN_WIDTHS.iter().enumerate() {
             items.item(
                 DROPDOWN_WIDTH_FIRST + index,
@@ -1912,7 +1827,7 @@ impl UpdateNotice {
     fn text(&self) -> std::borrow::Cow<'static, str> {
         match &self.result {
             CheckNotice::Ready(version) => {
-                format!("ARGOS {version} pronto para atualizar. Abra o menu do painel.").into()
+                format!("ARGOS {version} pronto. Abra Atualizações no menu.").into()
             }
             CheckNotice::Current => "O ARGOS está atualizado.".into(),
             CheckNotice::Failed(_) => {
@@ -2241,6 +2156,105 @@ impl Window {
         }
     }
 
+    fn panel_settings_menu(&self, hwnd: HWND, menu: &Menu, displays: &[dropdown::Display]) {
+        menu.group_icon("Grade", Icon::Grid, |items| self.grid_menu(items));
+        menu.group_icon("Histórico", Icon::History, |items| self.period_menu(items));
+        if self.page_count() > 1 {
+            menu.group_icon("Página", Icon::Page, |items| {
+                for page in 0..self.page_count() {
+                    items.item(
+                        PAGE_FIRST + page,
+                        &format!("Página {}", page + 1),
+                        self.page_is_current(page),
+                    );
+                }
+            });
+        }
+        menu.separator();
+        menu.group_icon("Aparência", Icon::Appearance, |items| {
+            self.appearance_menu(hwnd, items)
+        });
+        menu.group_icon("Modo dropdown", Icon::Dropdown, |items| {
+            dropdown_menu(items, self, displays)
+        });
+        menu.group_icon("Intervalo de amostragem", Icon::Sampling, |items| {
+            for (index, &ms) in GUI_INTERVALS_MS.iter().enumerate() {
+                items.item(
+                    REFRESH_FIRST + index,
+                    &format!("{ms} ms"),
+                    ms == self.board.refresh_ms,
+                );
+            }
+        });
+        menu.separator();
+        if let Some(directory) = self.startup_directory() {
+            let enabled = autostart::enabled(directory).unwrap_or(false);
+            menu.item_icon_checked(
+                START_WITH_WINDOWS,
+                "Iniciar com o Windows",
+                Icon::Power,
+                enabled,
+            );
+        } else {
+            menu.label_icon("Iniciar com o Windows (requer instalação)", Icon::Power);
+        }
+        if self.save_failed || self.dropdown.save_failed {
+            menu.label("Configuração disponível nesta sessão");
+        }
+    }
+
+    fn updates_menu(&self, menu: &Menu) {
+        match self.updater.status() {
+            Status::Idle => {
+                menu.item_icon(UPDATE_CHECK, "Buscar por atualizações", Icon::Update);
+                match self.update_notice.as_ref().map(|notice| &notice.result) {
+                    Some(CheckNotice::Current) => menu.label("O ARGOS está atualizado"),
+                    Some(CheckNotice::Failed(_)) => menu.item_icon(
+                        UPDATE_CHECK_DETAILS,
+                        "Ver erro da busca por atualizações",
+                        Icon::Error,
+                    ),
+                    _ => {}
+                }
+            }
+            Status::Checking => {
+                menu.label_icon("Buscando por atualizações…", Icon::Update);
+            }
+            Status::Ready(version, scheduled) => {
+                menu.group_icon("Atualizações", Icon::Update, |items| {
+                    items.label(&format!("ARGOS {version} disponível"));
+                    items.item(UPDATE_RESTART, "Atualizar e reiniciar", false);
+                    if scheduled {
+                        items.item(UPDATE_CANCEL, "Cancelar atualização ao fechar", false);
+                    } else {
+                        items.item(UPDATE_SCHEDULE, "Atualizar ao fechar", false);
+                    }
+                });
+            }
+        }
+        if update::last_error().is_some() {
+            menu.item_icon(UPDATE_ERROR, "Ver erro da última atualização", Icon::Error);
+        }
+    }
+
+    fn window_menu(&self, hwnd: HWND, menu: &Menu) {
+        if self.dropdown.active() {
+            let pinned = self.dropdown.pinned();
+            let icon = if pinned { Icon::Pinned } else { Icon::Pin };
+            menu.item_icon_checked(DROPDOWN_PIN, "Fixar aberto", icon, pinned);
+        } else {
+            if unsafe { IsZoomed(hwnd) } != 0 {
+                menu.label_icon("Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Restaurar", Icon::Restore);
+            } else {
+                menu.item_icon(MOVE_WINDOW, "Mover janela", Icon::Move);
+                menu.item_icon(MAXIMIZE_WINDOW, "Maximizar", Icon::Maximize);
+            }
+            menu.item_icon(MINIMIZE_WINDOW, "Minimizar", Icon::Minimize);
+        }
+        menu.item_icon(CLOSE_WINDOW, "Fechar ARGOS", Icon::Close);
+    }
+
     fn grid_menu(&self, menu: &Menu) {
         menu.label("Colunas");
         for count in 1..=MAX_COLUMNS {
@@ -2266,7 +2280,7 @@ impl Window {
         menu.item(THEME_DARK, "Tema escuro", appearance.theme == Theme::Dark);
         menu.item(THEME_LIGHT, "Tema claro", appearance.theme == Theme::Light);
         menu.separator();
-        menu.group("Opacidade", |items| {
+        menu.group_icon("Opacidade", Icon::Opacity, |items| {
             items.slider(OPACITY_SLIDER, appearance.opacity)
         });
         if appearance.translucent() && !appearance::is_click_through(hwnd) {
@@ -2301,6 +2315,11 @@ impl Window {
                 .any(|selection| gpu.matches_selection(selection));
             menu.item(GPU_FIRST + index, &gpu.label().replace('&', "&&"), checked);
         }
+        if snapshot.gpu_selections != selections {
+            menu.label("Atualizando as GPUs monitoradas…");
+        } else if snapshot.gpus.is_empty() || snapshot.gpus.len() < selections.len() {
+            menu.label(&snapshot.notice.replace('&', "&&"));
+        }
     }
 
     fn network_menu(&self, menu: &Menu) {
@@ -2333,29 +2352,40 @@ impl Window {
             {
                 menu.label("Interface selecionada indisponível");
             } else if interfaces.is_empty() {
-                menu.label("Nenhuma interface encontrada");
+                menu.label("Nenhum adaptador físico encontrado");
             }
         } else {
             menu.label("Procurando interfaces…");
         }
-        if let Some(snapshot) = &self.snapshot {
-            menu.separator();
-            for index in [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX] {
-                if let Some(metric) = snapshot.metrics.get(index) {
-                    menu.item(
-                        SENSOR_FIRST + index,
-                        metric.name,
-                        self.board.contains(index),
-                    );
+        if self.board.network_enabled()
+            && let Some(snapshot) = &self.snapshot
+            && selected.is_none_or(|id| Some(id) == snapshot.network_interface)
+            && let Some(status) = snapshot.network_status.as_deref()
+        {
+            menu.label(&status.replace('&', "&&"));
+        }
+    }
+
+    fn network_sensors_menu(&self, menu: &Menu) {
+        menu.group_icon("Interface de rede", Icon::Adapter, |items| {
+            self.network_menu(items)
+        });
+        menu.separator();
+        self.sensor_items(menu, [NETWORK_DOWNLOAD_INDEX, NETWORK_UPLOAD_INDEX]);
+        menu.separator();
+        self.sensor_items(menu, [GAME_LATENCY_INDEX]);
+        menu.group_icon("Ping personalizado", Icon::Ping, |items| {
+            let checked = self.board.contains(CUSTOM_PING_INDEX);
+            items.item(SENSOR_FIRST + CUSTOM_PING_INDEX, "Mostrar gráfico", checked);
+            items.item(EDIT_PING_TARGETS, "Editar endereços…", false);
+            if self.board.ping_targets.is_empty() {
+                items.label("Adicione endereços para começar");
+            } else if checked && let Some(snapshot) = &self.snapshot {
+                for status in &snapshot.custom_ping_status {
+                    items.label(&status.replace('&', "&&"));
                 }
             }
-            if self.board.network_enabled()
-                && selected.is_none_or(|id| Some(id) == snapshot.network_interface)
-                && let Some(status) = snapshot.network_status.as_deref()
-            {
-                menu.label(&status.replace('&', "&&"));
-            }
-        }
+        });
     }
 
     fn storage_menu(&self, menu: &Menu) {
@@ -2367,7 +2397,7 @@ impl Window {
             menu.label("Nenhum volume local disponível");
         }
         for disk in snapshot.storage.iter() {
-            menu.group(&disk.label.replace('&', "&&"), |items| {
+            menu.group_icon(&disk.label.replace('&', "&&"), Icon::Storage, |items| {
                 for (index, &(_, name, _)) in STORAGE_SENSORS.iter().enumerate() {
                     if let Some(slot) = self.board.storage_sensor_slot(&disk.id, index)
                         && slot < MERGE_FIRST - SENSOR_FIRST
@@ -2391,7 +2421,7 @@ impl Window {
                 })
                 .collect();
         if !unavailable.is_empty() {
-            menu.group("Volumes indisponíveis", |items| {
+            menu.group_icon("Volumes indisponíveis", Icon::Error, |items| {
                 for slot in unavailable {
                     if let Some(name) = self.series_title(snapshot, slot) {
                         items.item(SENSOR_FIRST + slot, &name, true);
@@ -2401,15 +2431,59 @@ impl Window {
         }
     }
 
-    fn sensor_menu(&self, menu: &Menu) {
-        menu.group_icon("Armazenamento", Icon::Sensors, |items| {
+    fn sensor_menu(&self, menu: &Menu, processes: &[Process]) {
+        menu.group_icon("CPU", Icon::Cpu, |items| {
+            self.sensor_items(
+                items,
+                [CPU_USAGE_INDEX, CPU_TEMPERATURE_INDEX, CPU_POWER_INDEX],
+            )
+        });
+        menu.group_icon("Memória", Icon::Memory, |items| {
+            self.sensor_items(items, RAM_USED_INDEX..FRAME_SENSOR_START)
+        });
+        menu.group_icon("GPU", Icon::Gpu, |items| self.gpu_sensors_menu(items));
+        menu.group_icon("FPS", Icon::Fps, |items| self.frame_menu(items, processes));
+        menu.group_icon("Rede", Icon::Network, |items| {
+            self.network_sensors_menu(items)
+        });
+        menu.group_icon("Armazenamento", Icon::Storage, |items| {
             self.storage_menu(items)
         });
         menu.separator();
+        menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
+    }
+
+    fn sensor_items(&self, menu: &Menu, indices: impl IntoIterator<Item = usize>) {
         let Some(snapshot) = &self.snapshot else {
             menu.label("Aguardando a primeira coleta");
             return;
         };
+        for index in indices {
+            let Some(metric) = snapshot.metrics.get(index) else {
+                continue;
+            };
+            let checked = self.board.contains(index);
+            menu.item(SENSOR_FIRST + index, metric.name, checked);
+            let status = match index {
+                CPU_TEMPERATURE_INDEX => snapshot.cpu_temperature_status.as_deref(),
+                CPU_POWER_INDEX => snapshot.cpu_power_status.as_deref(),
+                GAME_LATENCY_INDEX if checked => snapshot.game_latency_status.as_deref(),
+                _ => None,
+            };
+            if let Some(reason) = status {
+                menu.label(&reason.replace('&', "&&"));
+            }
+        }
+    }
+
+    fn gpu_sensors_menu(&self, menu: &Menu) {
+        menu.group_icon("GPUs monitoradas", Icon::Gpu, |items| self.gpu_menu(items));
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        if !snapshot.gpus.is_empty() {
+            menu.separator();
+        }
         for (position, gpu) in snapshot.gpus.iter().enumerate() {
             let Some(info) = snapshot
                 .gpu_devices
@@ -2418,7 +2492,8 @@ impl Window {
             else {
                 continue;
             };
-            menu.group(&info.label().replace('&', "&&"), |items| {
+            menu.group_icon(&info.label().replace('&', "&&"), Icon::Gpu, |items| {
+                let mut source = None;
                 for (base, metric) in gpu.metrics.iter().enumerate() {
                     let index = if !info.persistent && position == 0 && self.board.contains(base) {
                         Some(base)
@@ -2428,6 +2503,12 @@ impl Window {
                     if let Some(index) = index.filter(|&index| index < MERGE_FIRST - SENSOR_FIRST)
                         && (gpu.has_sensor(base) || self.board.contains(index))
                     {
+                        if let Some(previous) = source.replace(metric.source)
+                            && previous != metric.source
+                        {
+                            items.separator();
+                            items.label(metric.source);
+                        }
                         items.item(
                             SENSOR_FIRST + index,
                             metric.name,
@@ -2455,7 +2536,7 @@ impl Window {
             })
             .collect();
         if !inactive.is_empty() {
-            menu.group("Gráficos de GPUs inativas", |items| {
+            menu.group_icon("Gráficos de GPUs inativas", Icon::Error, |items| {
                 for index in inactive {
                     if index < MERGE_FIRST - SENSOR_FIRST
                         && let Some(name) = self.series_title(snapshot, index)
@@ -2465,43 +2546,6 @@ impl Window {
                 }
             });
         }
-        let mut source = "";
-        for (index, metric) in snapshot.metrics.iter().enumerate().skip(CPU_USAGE_INDEX) {
-            let checked = self.board.contains(index);
-            if metric.source != source {
-                source = metric.source;
-                if index != CPU_USAGE_INDEX || !snapshot.gpus.is_empty() {
-                    menu.separator();
-                }
-                menu.label(source);
-            }
-            if index == CUSTOM_PING_INDEX {
-                menu.group(metric.name, |items| {
-                    items.item(SENSOR_FIRST + index, "Mostrar gráfico", checked);
-                    items.item(EDIT_PING_TARGETS, "Editar endereços…", false);
-                    if self.board.ping_targets.is_empty() {
-                        items.label("Adicione endereços para começar");
-                    } else if checked {
-                        for status in &snapshot.custom_ping_status {
-                            items.label(status);
-                        }
-                    }
-                });
-                continue;
-            }
-            menu.item(SENSOR_FIRST + index, metric.name, checked);
-            let status = match index {
-                CPU_TEMPERATURE_INDEX => snapshot.cpu_temperature_status.as_deref(),
-                CPU_POWER_INDEX => snapshot.cpu_power_status.as_deref(),
-                GAME_LATENCY_INDEX if checked => snapshot.game_latency_status.as_deref(),
-                _ => None,
-            };
-            if let Some(reason) = status {
-                menu.label(reason);
-            }
-        }
-        menu.separator();
-        menu.item(RESET_SENSORS, "Restaurar seleção inicial", false);
     }
 
     fn chart_metric<'a>(
@@ -2588,53 +2632,42 @@ impl Window {
                 .and_then(|snapshot| snapshot.frame_status)
                 .unwrap_or("Aguardando a coleta de quadros")
         };
+        menu.group_icon("Aplicativo monitorado", Icon::Application, |items| {
+            items.item(
+                FRAME_TARGET_FOREGROUND,
+                "Aplicativo em foco",
+                target == FrameTarget::Foreground,
+            );
+            items.item(FRAME_TARGET_OFF, "Desativado", target == FrameTarget::Off);
+            if processes.is_empty() {
+                items.label("Nenhum aplicativo visível");
+            }
+            for (index, process) in processes.iter().enumerate() {
+                let name = process.name.replace('&', "&&");
+                items.item(
+                    FRAME_TARGET_FIRST + index,
+                    &format!("{name} (PID {})", process.pid),
+                    target == FrameTarget::Process(process.pid),
+                );
+            }
+        });
         menu.label(status);
+        menu.separator();
+        self.sensor_items(menu, FRAME_SENSORS);
         menu.item_icon(
             FPS_CEILING_EDIT,
             &format!("Teto do gráfico · {} FPS…", self.board.fps_ceiling),
             Icon::Fps,
         );
-        if let Some(snapshot) = &self.snapshot {
-            menu.separator();
-            menu.label("Gráficos exibidos");
-            for index in FRAME_SENSORS {
-                if let Some(metric) = snapshot.metrics.get(index) {
-                    menu.item(
-                        SENSOR_FIRST + index,
-                        metric.name,
-                        self.board.contains(index),
-                    );
-                }
-            }
-        }
-        menu.separator();
-        menu.label("Captura por aplicativo");
-        menu.item(
-            FRAME_TARGET_FOREGROUND,
-            "Aplicativo em foco",
-            target == FrameTarget::Foreground,
-        );
-        menu.item(FRAME_TARGET_OFF, "Desativado", target == FrameTarget::Off);
-        if processes.is_empty() {
-            menu.label("Nenhum aplicativo visível");
-        }
-        for (index, process) in processes.iter().enumerate() {
-            let name = process.name.replace('&', "&&");
-            menu.item(
-                FRAME_TARGET_FIRST + index,
-                &format!("{name} (PID {})", process.pid),
-                target == FrameTarget::Process(process.pid),
-            );
-        }
     }
 
     fn panel_menu(&self, menu: &Menu, snapshot: &Snapshot, panel: usize, contextual_colors: bool) {
-        menu.group_icon("Mover painel para", Icon::Move, |positions| {
+        menu.group_icon("Mover gráfico para", Icon::Move, |positions| {
             if self.page_count() == 1 {
                 self.position_menu(positions, snapshot, panel, 0);
             } else {
                 for page in 0..self.page_count() {
-                    positions.group(&format!("Página {}", page + 1), |items| {
+                    positions.group_icon(&format!("Página {}", page + 1), Icon::Page, |items| {
                         self.position_menu(items, snapshot, panel, page);
                     });
                 }

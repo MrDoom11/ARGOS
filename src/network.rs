@@ -20,7 +20,6 @@ pub(crate) struct Interface {
     pub(crate) name: String,
     pub(crate) connected: bool,
     luid: u64,
-    hardware: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,6 +31,33 @@ pub(crate) struct Counters {
 }
 
 impl Interface {
+    fn from_row(row: &MIB_IF_ROW2) -> Option<Self> {
+        let flags = row.InterfaceAndOperStatusFlags._bitfield;
+        let id = interface_id(row.InterfaceGuid);
+        let luid = unsafe { row.InterfaceLuid.Value };
+        if id == 0
+            || luid == 0
+            || row.Type == IF_TYPE_SOFTWARE_LOOPBACK
+            || flags & HARDWARE_INTERFACE == 0
+            || flags & FILTER_INTERFACE != 0
+        {
+            return None;
+        }
+        let mut name = interface_name(&row.Alias);
+        if name.is_empty() {
+            name = interface_name(&row.Description);
+        }
+        if name.is_empty() {
+            name = format!("Interface {}", row.InterfaceIndex);
+        }
+        Some(Self {
+            id,
+            name,
+            connected: row.OperStatus == IfOperStatusUp,
+            luid,
+        })
+    }
+
     pub(crate) fn counters(&self) -> io::Result<Option<Counters>> {
         let mut row = MIB_IF_ROW2 {
             InterfaceLuid: NET_LUID_LH { Value: self.luid },
@@ -65,35 +91,7 @@ pub(crate) fn interfaces() -> io::Result<Vec<Interface>> {
             (*table.0.as_ptr()).NumEntries,
         )
     };
-    let mut interfaces: Vec<_> = rows
-        .iter()
-        .filter_map(|row| {
-            let flags = row.InterfaceAndOperStatusFlags._bitfield;
-            let id = interface_id(row.InterfaceGuid);
-            let luid = unsafe { row.InterfaceLuid.Value };
-            if id == 0
-                || luid == 0
-                || row.Type == IF_TYPE_SOFTWARE_LOOPBACK
-                || flags & FILTER_INTERFACE != 0
-            {
-                return None;
-            }
-            let mut name = interface_name(&row.Alias);
-            if name.is_empty() {
-                name = interface_name(&row.Description);
-            }
-            if name.is_empty() {
-                name = format!("Interface {}", row.InterfaceIndex);
-            }
-            Some(Interface {
-                id,
-                name,
-                connected: row.OperStatus == IfOperStatusUp,
-                luid,
-                hardware: flags & HARDWARE_INTERFACE != 0,
-            })
-        })
-        .collect();
+    let mut interfaces: Vec<_> = rows.iter().filter_map(Interface::from_row).collect();
     interfaces.sort_by_cached_key(|interface| {
         (
             !interface.connected,
@@ -106,16 +104,7 @@ pub(crate) fn interfaces() -> io::Result<Vec<Interface>> {
 
 pub(crate) fn default_interface_id(interfaces: &[Interface]) -> Option<u128> {
     let first_connected = interfaces.iter().find(|interface| interface.connected)?;
-    let best_route = best_default_route(interfaces);
-    let connected_hardware = || {
-        interfaces
-            .iter()
-            .find(|interface| interface.connected && interface.hardware)
-            .map(|interface| interface.id)
-    };
-    best_route
-        .or_else(connected_hardware)
-        .or(Some(first_connected.id))
+    best_default_route(interfaces).or(Some(first_connected.id))
 }
 
 fn best_default_route(interfaces: &[Interface]) -> Option<u128> {
@@ -219,5 +208,25 @@ mod tests {
     fn interface_guid_keeps_its_canonical_order() {
         let id = 0x12345678_abcd_9012_3456_9876543210abu128;
         assert_eq!(interface_id(GUID::from_u128(id)), id);
+    }
+
+    #[test]
+    fn inventory_keeps_physical_adapters_even_when_disconnected() {
+        let mut row = MIB_IF_ROW2 {
+            InterfaceGuid: GUID::from_u128(1),
+            InterfaceLuid: NET_LUID_LH { Value: 1 },
+            ..Default::default()
+        };
+        row.InterfaceAndOperStatusFlags._bitfield = HARDWARE_INTERFACE;
+        assert!(!Interface::from_row(&row).unwrap().connected);
+        row.OperStatus = IfOperStatusUp;
+        assert!(Interface::from_row(&row).unwrap().connected);
+        row.InterfaceAndOperStatusFlags._bitfield = 0;
+        assert!(Interface::from_row(&row).is_none());
+        row.InterfaceAndOperStatusFlags._bitfield = HARDWARE_INTERFACE | FILTER_INTERFACE;
+        assert!(Interface::from_row(&row).is_none());
+        row.InterfaceAndOperStatusFlags._bitfield = HARDWARE_INTERFACE;
+        row.Type = IF_TYPE_SOFTWARE_LOOPBACK;
+        assert!(Interface::from_row(&row).is_none());
     }
 }

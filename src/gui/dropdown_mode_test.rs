@@ -361,13 +361,218 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
     assert!(app.board.set_color(RAM_USED_INDEX, Some(SERIES[0])));
     let previous = app.snapshot.replace(Arc::new(test_snapshot()));
     let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
+    let panel = submenu(menu.0, "Painel");
+    let appearance = submenu(panel, "Aparência");
+    let colors = submenu(appearance, "Cor dos gráficos");
     let color_item =
-        |sensor| unsafe { GetMenuState(menu.0, (COLOR_FIRST + sensor) as u32, MF_BYCOMMAND) };
+        |sensor| unsafe { GetMenuState(colors, (COLOR_FIRST + sensor) as u32, MF_BYCOMMAND) };
     assert_ne!(color_item(CPU_USAGE_INDEX), u32::MAX);
     let next_page = color_item(RAM_USED_INDEX);
     assert_ne!(next_page, u32::MAX);
     assert_eq!(next_page & (MF_CHECKED | MF_GRAYED), 0);
     app.snapshot = previous;
+}
+
+#[test]
+fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
+    let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX]);
+    board.columns = 1;
+    board.dropdown.enabled = true;
+    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let mut app = Window::new(monitor, board, 96, Source::PortableExact);
+    assert!(app.update_snapshot(Some(Arc::new(test_snapshot()))));
+    let processes = [Process {
+        pid: u32::MAX,
+        name: String::from("Jogo de teste"),
+    }];
+    app.monitor
+        .set_frame_target(FrameTarget::Process(processes[0].pid));
+    let root = options_menu(null_mut(), &app, MenuSection::All, &processes, &[], Some(0)).unwrap();
+    assert_submenu_icons(root.0);
+    let sensors = submenu(root.0, "Sensores");
+    let panel = submenu(root.0, "Painel");
+    let chart = submenu(root.0, "Gráfico");
+    let move_chart = submenu(chart, "Mover gráfico para");
+    assert!(app_menu_commands(move_chart).contains(&(MOVE_PANEL_FIRST + 1)));
+    assert!(app_menu_commands(submenu(root.0, "Sobre o ARGOS")).contains(&ABOUT_GUIDE));
+    assert!(find_submenu(root.0, "ARGOS").is_none());
+    assert!(find_submenu(root.0, "Atualizações").is_none());
+    assert!(has_direct_command(root.0, UPDATE_CHECK));
+    assert!(has_direct_command(root.0, MOVE_WINDOW));
+
+    let without_chart =
+        options_menu(null_mut(), &app, MenuSection::All, &processes, &[], None).unwrap();
+    assert!(find_submenu(without_chart.0, "Gráfico").is_none());
+    let f2 = options_menu(
+        null_mut(),
+        &app,
+        MenuSection::Sensors,
+        &processes,
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_submenu_icons(f2.0);
+    for group in ["CPU", "Memória", "GPU", "FPS", "Rede", "Armazenamento"] {
+        assert_eq!(
+            app_menu_commands(submenu(sensors, group)),
+            app_menu_commands(submenu(f2.0, group)),
+        );
+    }
+    assert!(
+        app_menu_commands(submenu(submenu(f2.0, "GPU"), "GPUs monitoradas")).contains(&GPU_AUTO)
+    );
+    let network = submenu(f2.0, "Rede");
+    assert!(app_menu_commands(submenu(network, "Interface de rede")).contains(&NETWORK_AUTO));
+    let fps = submenu(f2.0, "FPS");
+    assert!(app_menu_commands(fps).contains(&(SENSOR_FIRST + FRAME_SENSOR_START)));
+    let target = submenu(fps, "Aplicativo monitorado");
+    let state = unsafe { GetMenuState(target, FRAME_TARGET_FIRST as u32, MF_BYCOMMAND) };
+    assert_ne!(state, u32::MAX);
+    assert_ne!(state & MF_CHECKED, 0);
+
+    let network_commands = app_menu_commands(network);
+    for command in [
+        SENSOR_FIRST + NETWORK_DOWNLOAD_INDEX,
+        SENSOR_FIRST + NETWORK_UPLOAD_INDEX,
+        SENSOR_FIRST + GAME_LATENCY_INDEX,
+        SENSOR_FIRST + CUSTOM_PING_INDEX,
+        EDIT_PING_TARGETS,
+    ] {
+        assert!(network_commands.contains(&command));
+    }
+    let mut sensor_commands: Vec<_> = app_menu_commands(root.0)
+        .into_iter()
+        .filter(|&id| {
+            (NETWORK_AUTO..NETWORK_FIRST + NETWORK_LIMIT).contains(&id)
+                || (SENSOR_FIRST..MERGE_FIRST).contains(&id)
+                || id >= FRAME_TARGET_FOREGROUND
+        })
+        .collect();
+    sensor_commands.sort_unstable();
+    assert!(sensor_commands.windows(2).all(|ids| ids[0] != ids[1]));
+    let f3 = options_menu(null_mut(), &app, MenuSection::Period, &[], &[], None).unwrap();
+    let f4 = options_menu(null_mut(), &app, MenuSection::Grid, &[], &[], None).unwrap();
+    assert_eq!(
+        app_menu_commands(submenu(panel, "Histórico")),
+        app_menu_commands(f3.0)
+    );
+    assert_eq!(
+        app_menu_commands(submenu(panel, "Grade")),
+        app_menu_commands(f4.0)
+    );
+    assert!(app_menu_commands(submenu(panel, "Aparência")).contains(&THEME_DARK));
+    assert!(app_menu_commands(submenu(panel, "Intervalo de amostragem")).contains(&REFRESH_FIRST));
+    assert!(app_menu_commands(submenu(panel, "Modo dropdown")).contains(&DROPDOWN_TOGGLE));
+    assert!(app_menu_commands(submenu(panel, "Página")).contains(&PAGE_FIRST));
+}
+
+#[test]
+fn update_actions_remain_available_from_the_main_menu() {
+    let board = Board::new([]);
+    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let mut app = Window::new(monitor, board, 96, Source::PortableExact);
+    let menu =
+        |app: &Window| options_menu(null_mut(), app, MenuSection::All, &[], &[], None).unwrap();
+
+    app.update_notice = Some(UpdateNotice::new(CheckNotice::Failed(
+        "Falha de teste".into(),
+    )));
+    let failed = menu(&app);
+    assert!(has_direct_command(failed.0, UPDATE_CHECK));
+    assert!(has_direct_command(failed.0, UPDATE_CHECK_DETAILS));
+
+    let version = semver::Version::new(0, 4, 1);
+    app.updater.complete_manual_check_for_test(version.clone());
+    let checking = menu(&app);
+    assert!(!has_direct_command(checking.0, UPDATE_CHECK));
+    assert!(find_submenu(checking.0, "Atualizações").is_none());
+
+    assert!(matches!(app.updater.poll(), Some(CheckNotice::Ready(ready)) if ready == version));
+    let ready = menu(&app);
+    let updates = submenu(ready.0, "Atualizações");
+    assert!(has_direct_command(updates, UPDATE_RESTART));
+    assert!(has_direct_command(updates, UPDATE_SCHEDULE));
+    assert!(!has_direct_command(updates, UPDATE_CANCEL));
+
+    app.updater.schedule(true);
+    let scheduled = menu(&app);
+    let updates = submenu(scheduled.0, "Atualizações");
+    assert!(has_direct_command(updates, UPDATE_RESTART));
+    assert!(has_direct_command(updates, UPDATE_CANCEL));
+    assert!(!has_direct_command(updates, UPDATE_SCHEDULE));
+}
+
+fn has_direct_command(menu: HMENU, command: usize) -> bool {
+    (0..unsafe { GetMenuItemCount(menu) })
+        .any(|position| (unsafe { GetMenuItemID(menu, position) }) == command as u32)
+}
+
+fn app_menu_commands(menu: HMENU) -> Vec<usize> {
+    let mut commands = Vec::new();
+    for position in 0..unsafe { GetMenuItemCount(menu) } {
+        let child = unsafe { GetSubMenu(menu, position) };
+        if !child.is_null() {
+            commands.extend(app_menu_commands(child));
+        } else {
+            let command = unsafe { GetMenuItemID(menu, position) };
+            if command != 0 {
+                commands.push(command as usize);
+            }
+        }
+    }
+    commands
+}
+
+fn assert_submenu_icons(menu: HMENU) {
+    for position in 0..unsafe { GetMenuItemCount(menu) } {
+        let child = unsafe { GetSubMenu(menu, position) };
+        if child.is_null() {
+            continue;
+        }
+        let mut info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_DATA,
+            ..Default::default()
+        };
+        assert_ne!(
+            unsafe { GetMenuItemInfoW(menu, position as u32, 1, &mut info) },
+            0
+        );
+        assert!(
+            (1..=usize::from(u16::MAX)).contains(&info.dwItemData),
+            "submenu sem ícone na posição {position}"
+        );
+        assert_submenu_icons(child);
+    }
+}
+
+fn submenu(menu: HMENU, label: &str) -> HMENU {
+    find_submenu(menu, label).unwrap_or_else(|| panic!("submenu ausente: {label}"))
+}
+
+fn find_submenu(menu: HMENU, label: &str) -> Option<HMENU> {
+    let expected: Vec<_> = label.encode_utf16().collect();
+    for position in 0..unsafe { GetMenuItemCount(menu) } {
+        let child = unsafe { GetSubMenu(menu, position) };
+        if child.is_null() {
+            continue;
+        }
+        let mut name = [0; 128];
+        let length = unsafe {
+            GetMenuStringW(
+                menu,
+                position as u32,
+                name.as_mut_ptr(),
+                name.len() as i32,
+                MF_BYPOSITION,
+            )
+        };
+        if name[..length as usize] == expected {
+            return Some(child);
+        }
+    }
+    None
 }
 
 #[test]
@@ -391,8 +596,12 @@ fn storage_menu_shows_independent_checks_and_drive_names() {
     let system_read = app.board.storage_sensor_slot(ids[0], 0).unwrap();
     let data_read = app.board.storage_sensor_slot(ids[1], 0).unwrap();
     let data_write = app.board.storage_sensor_slot(ids[1], 1).unwrap();
+    let disconnected = app
+        .board
+        .register_storage_sensor("33333333-3333-3333-3333-333333333333", 0);
     app.board.toggle(system_read, 0);
     app.board.toggle(data_write, 0);
+    app.board.toggle(disconnected, 0);
 
     let snapshot = app.snapshot.as_ref().unwrap();
     assert_eq!(
@@ -404,6 +613,9 @@ fn storage_menu_shows_independent_checks_and_drive_names() {
         Some("D: · Escrita")
     );
     let menu = options_menu(null_mut(), &app, MenuSection::Sensors, &[], &[], None).unwrap();
+    let disks = submenu(menu.0, "Armazenamento");
+    assert!(!submenu(disks, "Volumes indisponíveis").is_null());
+    assert_submenu_icons(menu.0);
     let state = |slot| unsafe { GetMenuState(menu.0, (SENSOR_FIRST + slot) as u32, MF_BYCOMMAND) };
     for slot in [system_read, data_read, data_write] {
         assert_ne!(state(slot), u32::MAX);
@@ -417,7 +629,7 @@ fn test_snapshot() -> Snapshot {
     Snapshot {
         at: Instant::now(),
         notice: String::new(),
-        metrics: (0..=RAM_USED_INDEX)
+        metrics: (0..=NETWORK_UPLOAD_INDEX)
             .map(|_| MetricSnapshot {
                 name: "Métrica de teste",
                 address_label: None,

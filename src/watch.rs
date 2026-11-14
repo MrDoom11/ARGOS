@@ -951,7 +951,7 @@ impl NetworkMonitor {
             Some(_) => None,
             None if self.inventory_failed => Some("Não foi possível listar as interfaces de rede"),
             None if settings.interface.is_some() => Some("Interface selecionada indisponível"),
-            None => Some("Nenhuma interface conectada"),
+            None => Some("Nenhum adaptador físico conectado"),
         };
         if !settings.enabled {
             changed |= status != self.status;
