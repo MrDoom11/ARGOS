@@ -33,8 +33,8 @@ use crate::gpu::Selection;
 use crate::instance::{self, WINDOW_CLASS, WINDOW_TITLE};
 use crate::update::{self, CheckNotice, Source, Status, Updater};
 use crate::watch::{
-    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, FRAME_SENSOR_START, GUI_INTERVALS_MS,
-    Monitor, Snapshot,
+    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, FRAME_SENSOR_START,
+    GAME_LATENCY_INDEX, GUI_INTERVALS_MS, Monitor, Snapshot,
 };
 
 mod appearance;
@@ -50,6 +50,7 @@ mod hotkey;
 mod input_strip;
 mod menu;
 mod menu_style;
+mod ping_targets;
 mod scrollbar;
 mod startup;
 mod surface;
@@ -86,6 +87,7 @@ const UPDATE_SCHEDULE: usize = 343;
 const UPDATE_CANCEL: usize = 344;
 const UPDATE_ERROR: usize = 345;
 const UPDATE_CHECK_DETAILS: usize = 346;
+const EDIT_PING_TARGETS: usize = 347;
 const UPDATE_NOTICE_DURATION: Duration = Duration::from_secs(8);
 const DROPDOWN_TOGGLE: usize = 350;
 const DROPDOWN_PREVIEW: usize = 351;
@@ -167,6 +169,8 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
         |index| vec![Selection::Index(index)],
     );
     let monitor = Monitor::start(selections, refresh_ms, board.cpu_metrics())?;
+    monitor.set_game_latency_enabled(board.contains(GAME_LATENCY_INDEX));
+    monitor.set_custom_ping_targets(board.active_ping_targets());
     let _dpi_context = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
@@ -190,7 +194,7 @@ pub(crate) fn run(gpu: Option<GpuIndex>, source: Source) -> Result<(), String> {
     // SAFETY: o estado em Box permanece no mesmo endereço até a destruição de hwnd.
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            WS_EX_APPWINDOW,
             WINDOW_CLASS,
             WINDOW_TITLE,
             WS_POPUP
@@ -327,7 +331,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             WM_MOUSEACTIVATE if dropdown_active(state) => MA_NOACTIVATE as LRESULT,
-            WM_SETCURSOR if u32::from(lp as u16) == HTCLIENT && window_move(state).is_active() => {
+            WM_SETCURSOR
+                if u32::from(lp as u16) == HTCLIENT
+                    && state.try_borrow().is_ok_and(|app| app.move_armed) =>
+            {
                 SetCursor(LoadCursorW(null_mut(), IDC_SIZEALL));
                 1
             }
@@ -547,7 +554,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_LBUTTONDOWN => {
-                start_drag(hwnd, state, message_point(lp));
+                let point = message_point(lp);
+                if cancel_window_move(state) {
+                    if !dropdown_active(state) {
+                        begin_window_move(hwnd, point);
+                    }
+                } else {
+                    start_drag(hwnd, state, point);
+                }
                 0
             }
             WM_MOUSEMOVE => {
@@ -557,7 +571,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             WM_LBUTTONUP => {
                 let mut point = message_point(lp);
                 let clicked_menu = state.try_borrow().is_ok_and(|app| {
-                    !app.window_move.is_active()
+                    !app.move_armed
                         && app.drag.is_none()
                         && appearance::is_click_through(hwnd)
                         && (0..input_strip::HEIGHT).contains(&point.y)
@@ -571,20 +585,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CAPTURECHANGED => {
-                if let Ok(mut app) = state.try_borrow_mut()
-                    && matches!(app.window_move, WindowMove::Dragging { .. })
-                {
-                    app.window_move = WindowMove::Idle;
-                }
                 clear_drag(hwnd, state);
                 0
             }
             WM_ACTIVATE if u32::from(wp as u16) == WA_INACTIVE => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_CANCELMODE => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 cancel_drag(hwnd, state);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
@@ -625,7 +634,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_CONTEXTMENU | WM_NCRBUTTONUP => {
-                stop_window_move(hwnd, state, false);
+                cancel_window_move(state);
                 cancel_drag(hwnd, state);
                 // O clique na borda chega como mensagem não cliente, com coordenadas de tela.
                 let point = if lp == -1 {
@@ -637,7 +646,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 0
             }
             WM_DESTROY => {
-                stop_window_move(hwnd, state, false);
                 cancel_drag(hwnd, state);
                 KillTimer(hwnd, TIMER);
                 KillTimer(hwnd, dropdown_mode::TIMER);
@@ -682,6 +690,10 @@ fn message_point(value: LPARAM) -> POINT {
     }
 }
 
+fn packed_point(point: POINT) -> LPARAM {
+    (u32::from(point.x as u16) | (u32::from(point.y as u16) << 16)) as LPARAM
+}
+
 fn current_monitor(hwnd: HWND) -> Option<MONITORINFO> {
     monitor_info(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
 }
@@ -696,76 +708,24 @@ fn menu_center(hwnd: HWND) -> POINT {
     point
 }
 
-#[derive(Clone, Copy, Default)]
-enum WindowMove {
-    #[default]
-    Idle,
-    Armed,
-    Dragging {
-        original: RECT,
-        anchor: POINT,
-    },
-}
-
-impl WindowMove {
-    fn is_active(self) -> bool {
-        !matches!(self, Self::Idle)
-    }
-
-    fn begin(&mut self, hwnd: HWND, mut anchor: POINT) -> bool {
-        if !matches!(self, Self::Armed) {
-            return false;
+fn begin_window_move(hwnd: HWND, mut point: POINT) {
+    // A movimentação nativa emite os eventos observados pelo FancyZones.
+    unsafe {
+        if ClientToScreen(hwnd, &mut point) != 0 {
+            DefWindowProcW(
+                hwnd,
+                WM_NCLBUTTONDOWN,
+                HTCAPTION as WPARAM,
+                packed_point(point),
+            );
         }
-        let mut original = RECT::default();
-        *self = if unsafe {
-            GetWindowRect(hwnd, &mut original) != 0 && ClientToScreen(hwnd, &mut anchor) != 0
-        } {
-            Self::Dragging { original, anchor }
-        } else {
-            Self::Idle
-        };
-        true
-    }
-
-    fn apply(self, hwnd: HWND, mut point: POINT) -> bool {
-        let Self::Dragging { original, anchor } = self else {
-            return false;
-        };
-        // O ponto chega em coordenadas de uma janela que já pode ter mudado de lugar.
-        unsafe {
-            if ClientToScreen(hwnd, &mut point) != 0 {
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    original.left + (point.x - anchor.x),
-                    original.top + (point.y - anchor.y),
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-        }
-        true
     }
 }
 
-fn window_move(state: &RefCell<Window>) -> WindowMove {
+fn cancel_window_move(state: &RefCell<Window>) -> bool {
     state
-        .try_borrow()
-        .map_or(WindowMove::Idle, |app| app.window_move)
-}
-
-fn stop_window_move(hwnd: HWND, state: &RefCell<Window>, restore: bool) -> bool {
-    let movement = state.try_borrow_mut().map_or(WindowMove::Idle, |mut app| {
-        std::mem::take(&mut app.window_move)
-    });
-    if let WindowMove::Dragging { original, .. } = movement {
-        release_mouse(hwnd);
-        if restore {
-            position_window(hwnd, original);
-        }
-    }
-    movement.is_active()
+        .try_borrow_mut()
+        .is_ok_and(|mut app| std::mem::take(&mut app.move_armed))
 }
 
 struct PanelDrag {
@@ -791,9 +751,6 @@ impl PanelDrag {
 
 fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
     let started = state.try_borrow_mut().is_ok_and(|mut app| {
-        if app.window_move.begin(hwnd, point) {
-            return app.window_move.is_active();
-        }
         let Some(source) = app.panel_at(client(hwnd), point) else {
             return false;
         };
@@ -812,16 +769,12 @@ fn start_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
         // Alterar a captura pode despachar mensagens, por isso o estado já foi liberado.
         unsafe { SetCapture(hwnd) };
         if unsafe { GetCapture() } != hwnd {
-            stop_window_move(hwnd, state, false);
             clear_drag(hwnd, state);
         }
     }
 }
 
 fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        return;
-    }
     let repaint = state.try_borrow_mut().is_ok_and(|mut app| {
         if app.drag.is_none() {
             return false;
@@ -838,10 +791,6 @@ fn update_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
 }
 
 fn finish_drag(hwnd: HWND, state: &RefCell<Window>, point: POINT) {
-    if window_move(state).apply(hwnd, point) {
-        stop_window_move(hwnd, state, false);
-        return;
-    }
     let drag = state.try_borrow_mut().ok().and_then(|mut app| {
         let mut drag = app.drag.take()?;
         let target = app.panel_at(client(hwnd), point);
@@ -892,7 +841,7 @@ fn release_mouse(hwnd: HWND) {
 
 fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
     let section = match key {
-        VK_ESCAPE => return stop_window_move(hwnd, state, true) || cancel_drag(hwnd, state),
+        VK_ESCAPE => return cancel_window_move(state) || cancel_drag(hwnd, state),
         VK_F2 => MenuSection::Sensors,
         VK_F3 => MenuSection::Period,
         VK_F4 => MenuSection::Grid,
@@ -908,7 +857,7 @@ fn keyboard(hwnd: HWND, state: &RefCell<Window>, key: u16) -> bool {
         }
         _ => return false,
     };
-    stop_window_move(hwnd, state, false);
+    cancel_window_move(state);
     cancel_drag(hwnd, state);
     show_options(hwnd, state, menu_center(hwnd), section);
     true
@@ -1443,7 +1392,30 @@ fn apply_option(
         }
         MOVE_WINDOW => {
             if let Ok(mut app) = state.try_borrow_mut() {
-                app.window_move = WindowMove::Armed;
+                app.move_armed = true;
+            }
+        }
+        EDIT_PING_TARGETS => {
+            let current = state.borrow().board.ping_targets.clone();
+            if let Some(targets) = ping_targets::edit(hwnd, &current) {
+                edit_board(hwnd, state, |app| {
+                    let changed = app.board.ping_targets != targets;
+                    app.board.ping_targets = targets;
+                    if app.board.ping_targets.is_empty() || app.board.contains(CUSTOM_PING_INDEX) {
+                        return changed;
+                    }
+                    app.board.toggle(CUSTOM_PING_INDEX, app.first_slot());
+                    if let Some(slot) = app
+                        .board
+                        .panels
+                        .iter()
+                        .position(|panel| panel.contains(&CUSTOM_PING_INDEX))
+                    {
+                        app.show_panel(slot);
+                        return true;
+                    }
+                    changed
+                });
             }
         }
         MINIMIZE_WINDOW => {
@@ -1803,6 +1775,10 @@ fn edit_board(hwnd: HWND, state: &RefCell<Window>, edit: impl FnOnce(&mut Window
         app.monitor.set_interval_ms(interval);
     }
     app.monitor.set_cpu_metrics(app.board.cpu_metrics());
+    app.monitor
+        .set_game_latency_enabled(app.board.contains(GAME_LATENCY_INDEX));
+    app.monitor
+        .set_custom_ping_targets(app.board.active_ping_targets());
     app.save_failed = app.board.save().is_err();
     drop(app);
     if interval != old_interval {
@@ -1901,7 +1877,7 @@ struct Window {
     scrollbar_state: Option<ScrollbarState>,
     input_strip: Option<input_strip::Strip>,
     wheel_remainder: i32,
-    window_move: WindowMove,
+    move_armed: bool,
     drag: Option<PanelDrag>,
     dpi: u32,
     chart_fonts: chart::ChartFonts,
@@ -1928,7 +1904,7 @@ impl Window {
             scrollbar_state: None,
             input_strip: None,
             wheel_remainder: 0,
-            window_move: WindowMove::Idle,
+            move_armed: false,
             drag: None,
             dpi,
             chart_fonts: chart::ChartFonts::new(dpi),
@@ -2298,10 +2274,25 @@ impl Window {
                 }
                 menu.label(source);
             }
+            if index == CUSTOM_PING_INDEX {
+                menu.group(metric.name, |items| {
+                    items.item(SENSOR_FIRST + index, "Mostrar gráfico", checked);
+                    items.item(EDIT_PING_TARGETS, "Editar endereços…", false);
+                    if self.board.ping_targets.is_empty() {
+                        items.label("Adicione endereços para começar");
+                    } else if checked {
+                        for status in &snapshot.custom_ping_status {
+                            items.label(status);
+                        }
+                    }
+                });
+                continue;
+            }
             menu.item(SENSOR_FIRST + index, metric.name, checked);
             let status = match index {
                 CPU_TEMPERATURE_INDEX => snapshot.cpu_temperature_status.as_deref(),
                 CPU_POWER_INDEX => snapshot.cpu_power_status.as_deref(),
+                GAME_LATENCY_INDEX if checked => snapshot.game_latency_status.as_deref(),
                 _ => None,
             };
             if let Some(reason) = status {
@@ -2694,17 +2685,32 @@ impl Window {
                     continue;
                 }
                 series.clear();
-                series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
-                    if !frames_current && FRAME_SENSORS.contains(&sensor) {
-                        return None;
-                    }
-                    let (metric, gpu) = self.chart_metric(snapshot, sensor, &selected)?;
-                    Some((
-                        metric,
-                        self.series_color(sensor, position, panel.len()),
-                        gpu,
-                    ))
-                }));
+                if panel.as_slice() == [CUSTOM_PING_INDEX]
+                    && !snapshot.custom_ping_metrics.is_empty()
+                {
+                    series.extend(snapshot.custom_ping_metrics.iter().enumerate().map(
+                        |(position, metric)| {
+                            let color = self
+                                .board
+                                .color(CUSTOM_PING_INDEX)
+                                .filter(|_| position == 0)
+                                .unwrap_or(SERIES[position]);
+                            (metric, color, None)
+                        },
+                    ));
+                } else {
+                    series.extend(panel.iter().enumerate().filter_map(|(position, &sensor)| {
+                        if !frames_current && FRAME_SENSORS.contains(&sensor) {
+                            return None;
+                        }
+                        let (metric, gpu) = self.chart_metric(snapshot, sensor, &selected)?;
+                        Some((
+                            metric,
+                            self.series_color(sensor, position, panel.len()),
+                            gpu,
+                        ))
+                    }));
+                }
                 chart::paint(
                     dc,
                     layout.card(slot),
@@ -3041,16 +3047,6 @@ fn dropdown_active(state: &RefCell<Window>) -> bool {
     state.try_borrow().is_ok_and(|app| app.dropdown.active())
 }
 
-fn taskbar_style(style: isize, tray_available: bool) -> isize {
-    let mask = (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW) as isize;
-    let presentation = if tray_available {
-        WS_EX_TOOLWINDOW
-    } else {
-        WS_EX_APPWINDOW
-    };
-    (style & !mask) | presentation as isize
-}
-
 fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
     let (available, was_available, dropdown) = {
         let Ok(mut app) = state.try_borrow_mut() else {
@@ -3061,7 +3057,7 @@ fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
         };
         let was_available = tray.available();
         let available = tray.register();
-        let dropdown = app.dropdown.update_normal_taskbar_style(available);
+        let dropdown = app.dropdown.active();
         (available, was_available, dropdown)
     };
 
@@ -3074,34 +3070,10 @@ fn refresh_tray(hwnd: HWND, state: &RefCell<Window>) {
         if dropdown {
             return;
         }
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let style = taskbar_style(current, available);
-        if style == current {
-            return;
-        }
-
         let visible = IsWindowVisible(hwnd) != 0;
-        let minimized = IsIconic(hwnd) != 0;
-        // O Shell reaplica a apresentação na barra de tarefas ao mostrar a janela.
-        if visible {
+        if available && !was_available && visible && IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_HIDE);
-        }
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
-        let show = if visible && !(available && minimized) {
-            SWP_SHOWWINDOW
-        } else {
-            0
-        };
-        SetWindowPos(
-            hwnd,
-            null_mut(),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | show,
-        );
-        if !available && was_available && !visible {
+        } else if !available && was_available && !visible {
             ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
         }
     }
@@ -3263,15 +3235,6 @@ fn window_error(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tray_presentation_preserves_other_window_styles() {
-        let layered = appearance::LAYERED_STYLES as isize;
-        let normal = layered | WS_EX_APPWINDOW as isize;
-        let in_tray = layered | WS_EX_TOOLWINDOW as isize;
-        assert_eq!(taskbar_style(normal, true), in_tray);
-        assert_eq!(taskbar_style(in_tray, false), normal);
-    }
     use windows_sys::w;
 
     #[test]
@@ -3322,13 +3285,33 @@ mod tests {
     }
 
     #[test]
-    fn window_drag_moves_a_hidden_window_without_resizing_or_activating_it() {
+    fn window_drag_requests_native_move_at_the_screen_point() {
+        use std::cell::Cell;
+        use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+
+        unsafe extern "system" fn observe_move(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+            _id: usize,
+            data: usize,
+        ) -> LRESULT {
+            if msg == WM_SYSCOMMAND && wp as u32 & 0xfff0 == SC_MOVE {
+                // Stop before the interactive loop to keep the test independent of mouse input.
+                unsafe { &*(data as *const Cell<Option<LPARAM>>) }.set(Some(lp));
+                return 0;
+            }
+            unsafe { DefSubclassProc(hwnd, msg, wp, lp) }
+        }
+
+        let observed = Cell::new(None::<LPARAM>);
         let hwnd = unsafe {
             CreateWindowExW(
-                0,
+                WS_EX_NOACTIVATE,
                 w!("STATIC"),
                 null(),
-                WS_POPUP,
+                WS_POPUP | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX,
                 -300,
                 50,
                 320,
@@ -3341,27 +3324,16 @@ mod tests {
         };
         assert!(!hwnd.is_null());
         let _guard = OwnedWindow(hwnd);
-        let bounds = || {
-            let mut rect = RECT::default();
-            assert_ne!(unsafe { GetWindowRect(hwnd, &mut rect) }, 0);
-            (rect.left, rect.top, width(rect), height(rect))
-        };
+        assert_ne!(
+            unsafe { SetWindowSubclass(hwnd, Some(observe_move), 1, &raw const observed as usize) },
+            0
+        );
         let press = POINT { x: 25, y: 35 };
-        let mut movement = WindowMove::Idle;
-        assert!(!movement.begin(hwnd, press));
-        movement = WindowMove::Armed;
-        assert!(!movement.apply(hwnd, POINT { x: 80, y: 75 }));
-        assert_eq!(bounds(), (-300, 50, 320, 200));
-
-        assert!(movement.begin(hwnd, press));
-        assert!(movement.apply(hwnd, POINT { x: 95, y: 20 }));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, press));
-        assert_eq!(bounds(), (-230, 35, 320, 200));
-        assert!(movement.apply(hwnd, POINT { x: -55, y: 55 }));
-        assert_eq!(bounds(), (-310, 55, 320, 200));
-        assert_eq!(unsafe { IsWindowVisible(hwnd) }, 0);
-        assert_ne!(unsafe { GetForegroundWindow() }, hwnd);
+        let mut screen = press;
+        assert_ne!(unsafe { ClientToScreen(hwnd, &mut screen) }, 0);
+        begin_window_move(hwnd, press);
+        let actual = message_point(observed.get().expect("comando nativo de movimentação"));
+        assert_eq!((actual.x, actual.y), (screen.x, screen.y));
     }
 
     #[test]

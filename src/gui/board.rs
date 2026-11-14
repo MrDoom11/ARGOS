@@ -10,9 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 use super::appearance::{Appearance, Theme};
+use super::ping_targets::normalize_target;
+use crate::game_network::custom_ping::MAX_TARGETS;
 use crate::watch::{
-    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CpuMetrics, DEFAULT_FPS_CEILING,
-    FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
+    CPU_POWER_INDEX, CPU_TEMPERATURE_INDEX, CPU_USAGE_INDEX, CUSTOM_PING_INDEX, CpuMetrics,
+    DEFAULT_FPS_CEILING, FRAME_SENSOR_START, GUI_INTERVALS_MS, RAM_USED_INDEX, sensor_catalog,
 };
 
 pub(super) const MAX_COLUMNS: usize = 6;
@@ -176,6 +178,7 @@ pub(super) struct Board {
     pub(super) panels: Vec<Vec<usize>>,
     pub(super) window_bounds: Option<[i32; 4]>,
     pub(super) gpu_ids: Vec<String>,
+    pub(super) ping_targets: Vec<String>,
     pub(super) appearance: Appearance,
     pub(super) dropdown: DropdownSettings,
     colors: Vec<Option<u32>>,
@@ -193,6 +196,7 @@ impl Board {
             panels: Vec::new(),
             window_bounds: None,
             gpu_ids: Vec::new(),
+            ping_targets: Vec::new(),
             appearance: Appearance::default(),
             dropdown: DropdownSettings::default(),
             colors: vec![None; sensor_catalog().count()],
@@ -331,6 +335,14 @@ impl Board {
         }
     }
 
+    pub(super) fn active_ping_targets(&self) -> &[String] {
+        if self.contains(CUSTOM_PING_INDEX) {
+            &self.ping_targets
+        } else {
+            &[]
+        }
+    }
+
     pub(super) fn color(&self, sensor: usize) -> Option<u32> {
         self.colors.get(sensor).copied().flatten()
     }
@@ -382,8 +394,8 @@ impl Board {
     pub(super) fn can_merge(&self, source: usize, target: usize) -> bool {
         source != target
             && self
-                .panel_unit(source)
-                .zip(self.panel_unit(target))
+                .mergeable_panel_unit(source)
+                .zip(self.mergeable_panel_unit(target))
                 .is_some_and(|(left, right)| left == right)
     }
 
@@ -461,8 +473,11 @@ impl Board {
         }
     }
 
-    fn panel_unit(&self, index: usize) -> Option<&'static str> {
+    fn mergeable_panel_unit(&self, index: usize) -> Option<&'static str> {
         let sensor = *self.panels.get(index)?.first()?;
+        if sensor == CUSTOM_PING_INDEX {
+            return None;
+        }
         self.sensor_unit(sensor)
     }
 
@@ -486,6 +501,9 @@ impl Board {
         }
         for gpu in self.gpu_ids.iter().filter(|id| is_persistent_gpu_id(id)) {
             let _ = writeln!(text, "gpu={}", hex::encode(gpu));
+        }
+        for target in &self.ping_targets {
+            let _ = writeln!(text, "ping_target={target}");
         }
         for panel in &self.panels {
             let keys: Vec<_> = panel
@@ -595,6 +613,14 @@ impl Board {
                         board.gpu_ids.push(gpu);
                     }
                 }
+                "ping_target" => {
+                    if board.ping_targets.len() < MAX_TARGETS
+                        && let Some(target) = normalize_target(value)
+                        && !board.ping_targets.contains(&target)
+                    {
+                        board.ping_targets.push(target);
+                    }
+                }
                 "panel" => {
                     if board.panels.len() >= MAX_SLOTS {
                         continue;
@@ -610,10 +636,11 @@ impl Board {
                         }
                         let unit = board.sensor_unit(sensor);
                         // Registros editados com unidades distintas viram painéis separados.
-                        if let Some(offset) = board.panels[first..]
-                            .iter()
-                            .position(|panel| board.sensor_unit(panel[0]) == unit)
-                        {
+                        if let Some(offset) = board.panels[first..].iter().position(|panel| {
+                            sensor != CUSTOM_PING_INDEX
+                                && panel[0] != CUSTOM_PING_INDEX
+                                && board.sensor_unit(panel[0]) == unit
+                        }) {
                             board.panels[first + offset].push(sensor);
                         } else if board.panels.len() < MAX_SLOTS {
                             board.panels.push(vec![sensor]);
@@ -777,6 +804,36 @@ mod tests {
         assert_eq!(Board::decode(&board.encode()), Some(board));
         let empty = Board::new([]);
         assert_eq!(Board::decode(&empty.encode()), Some(empty));
+    }
+
+    #[test]
+    fn custom_ping_destinations_round_trip_in_their_own_panel() {
+        let legacy = Board::new(INITIAL_SENSORS).encode();
+        assert!(Board::decode(&legacy).unwrap().ping_targets.is_empty());
+
+        let catalog: Vec<_> = sensor_catalog().collect();
+        let ping = crate::watch::GAME_LATENCY_INDEX;
+        let ping_key = catalog[ping].0;
+        let custom_key = catalog[CUSTOM_PING_INDEX].0;
+        let text = format!("{VERSION}\npanel={ping_key},{custom_key}\n")
+            + concat!(
+                "ping_target=EXAMPLE.COM\nping_target=example.com\n",
+                "ping_target=https://example.com\nping_target=FE80::1%12\n",
+                "ping_target=2001:DB8::0001\nping_target=192.0.2.1\n",
+                "ping_target=192.0.2.2\n"
+            );
+        let mut board = Board::decode(&text).unwrap();
+        assert_eq!(board.panels, [vec![ping], vec![CUSTOM_PING_INDEX]]);
+        assert!(!board.can_merge(0, 1));
+        assert!(!board.can_merge(1, 0));
+        assert_eq!(
+            board.active_ping_targets(),
+            ["example.com", "fe80::1%12", "2001:db8::1", "192.0.2.1"]
+        );
+        assert_eq!(Board::decode(&board.encode()).as_ref(), Some(&board));
+        board.toggle(CUSTOM_PING_INDEX, 0);
+        assert!(board.active_ping_targets().is_empty());
+        assert_eq!(board.ping_targets.len(), MAX_TARGETS);
     }
 
     #[test]

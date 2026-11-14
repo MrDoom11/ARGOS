@@ -1,0 +1,5 @@
+• Ping — acompanhe a latência do aplicativo em foco ou do aplicativo fixado no menu FPS. O gráfico mostra o IP medido ao lado do título. O menu Sensores informa o método, e o gráfico deixa uma lacuna quando a leitura está indisponível.
+
+• Ping personalizado — acompanhe até quatro IPs ou nomes de host no mesmo gráfico. Edite a lista em Sensores e acompanhe cada destino pela cor da curva.
+
+• FancyZones — use Mover janela e arraste o painel para uma zona configurada no PowerToys.

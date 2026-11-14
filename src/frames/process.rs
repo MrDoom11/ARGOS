@@ -19,14 +19,14 @@ pub(crate) struct Process {
     pub(crate) name: String,
 }
 
-pub(super) struct Target(OwnedHandle);
+pub(crate) struct Target(OwnedHandle);
 
 impl Target {
-    pub(super) fn open(pid: u32) -> io::Result<Self> {
+    pub(crate) fn open(pid: u32) -> io::Result<Self> {
         open_process(pid, PROCESS_SYNCHRONIZE).map(Self)
     }
 
-    pub(super) fn is_running(&self) -> bool {
+    pub(crate) fn is_running(&self) -> bool {
         (unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) }) == WAIT_TIMEOUT
     }
 }
@@ -39,6 +39,10 @@ pub(crate) fn foreground_pid() -> Option<u32> {
     let mut pid = 0;
     let thread = unsafe { GetWindowThreadProcessId(window, &mut pid) };
     (thread != 0 && pid != 0 && pid != std::process::id()).then_some(pid)
+}
+
+pub(crate) fn process_name(pid: u32) -> Option<String> {
+    executable_name(pid, &mut vec![0; IMAGE_PATH_CAPACITY])
 }
 
 pub(crate) fn visible_processes() -> Vec<Process> {

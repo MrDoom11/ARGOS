@@ -106,8 +106,13 @@ pub(super) fn paint(
     let left = rect.left + px(3);
     let right = rect.right - px(3);
     let columns = ((right - left) / px(135).max(1)).clamp(1, views.len() as i32);
-    let rows = legend_rows(views.len(), columns, height >= px(68));
     let legend_row = px(if height < px(100) { 12 } else { 15 });
+    let rows = if first.address_label.is_some() {
+        let available = ((height - px(35)) / legend_row.max(1)).max(1);
+        (views.len().div_ceil(columns as usize) as i32).min(available)
+    } else {
+        legend_rows(views.len(), columns, height >= px(68))
+    };
     let legend_top = rect.top + px(2);
     let legend_bottom = legend_top + rows * legend_row;
     let stat_row = px(12);
@@ -184,11 +189,17 @@ struct SeriesView<'a> {
 
 impl SeriesView<'_> {
     fn label(&self, compact: bool) -> Cow<'_, str> {
+        if let Some(address) = &self.metric.address_label {
+            return Cow::Borrowed(address);
+        }
         let metric = if compact {
             compact_name(self.metric.name)
         } else {
             self.metric.name
         };
+        if let Some(ip) = self.metric.remote_ip {
+            return Cow::Owned(format!("{metric} · {ip}"));
+        }
         self.gpu.map_or(Cow::Borrowed(metric), |gpu| {
             Cow::Owned(format!("{gpu} · {metric}"))
         })
@@ -787,6 +798,35 @@ mod tests {
             reading,
             interval: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn ping_legend_shows_the_address_in_compact_and_full_modes() {
+        let at = Instant::now();
+        let metric = MetricSnapshot {
+            name: "Ping",
+            address_label: None,
+            remote_ip: Some("2001:db8::10".parse().unwrap()),
+            unit: " ms",
+            source: "Rede do jogo / Windows",
+            interval: Duration::from_secs(1),
+            axis_max: 100.0,
+            points: Vec::new(),
+        };
+        let view = SeriesView {
+            metric: &metric,
+            color: 0,
+            gpu: None,
+            timeline: Timeline {
+                points: &[],
+                at,
+                window: Duration::from_secs(10),
+                interval: metric.interval,
+            },
+            stats: None,
+        };
+        assert_eq!(view.label(false), "Ping · 2001:db8::10");
+        assert_eq!(view.label(true), view.label(false));
     }
 
     #[test]

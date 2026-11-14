@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -9,6 +10,8 @@ use crate::adlx;
 use crate::cli::{GpuIndex, WatchOptions};
 use crate::cpu_sensor::CpuSensor;
 use crate::frames::{self, FrameSampler, FrameTarget};
+use crate::game_network;
+use crate::game_network::custom_ping;
 use crate::gpu::{self, GpuInfo, Inventory, Selection};
 use crate::gpu_video;
 use crate::nvml::{Device as NvmlDevice, Error as NvmlError, GPM_METRICS, GpmSampler};
@@ -22,6 +25,8 @@ const GPM_MIN_INTERVAL: Duration = Duration::from_millis(101);
 const VIDEO_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const CPU_SENSOR_RETRY: Duration = Duration::from_secs(5);
 const CPU_POWER_AXIS_START: f64 = 150.0;
+const GAME_LATENCY_AXIS_START: f64 = 100.0;
+const NETWORK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SNAPSHOT_INTERVAL: Duration = FASTEST_GUI_INTERVAL;
 const BYTES_PER_MIB: f64 = 1_048_576.0;
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
@@ -130,6 +135,18 @@ const CPU_SENSORS: [Sensor; 2] = [
         Axis::Fixed(CPU_POWER_AXIS_START),
     ),
 ];
+const GAME_LATENCY_SENSORS: [Sensor; 1] = [(
+    "game-server-latency",
+    "Ping",
+    " ms",
+    Axis::Fixed(GAME_LATENCY_AXIS_START),
+)];
+const CUSTOM_PING_SENSORS: [Sensor; 1] = [(
+    "custom-ping",
+    "Ping personalizado",
+    " ms",
+    Axis::Fixed(GAME_LATENCY_AXIS_START),
+)];
 const GPM_COUNT: usize = GPM_METRICS.len();
 const NVIDIA_MEDIA_FIRST: usize = 9;
 const GPU_SHARED_MEMORY_INDEX: usize = GPU_SENSORS.len() - 1;
@@ -141,6 +158,8 @@ pub(crate) const FRAME_SENSOR_START: usize = CPU_USAGE_INDEX + SYSTEM_SENSORS.le
 pub(crate) const DEFAULT_FPS_CEILING: u16 = 360;
 pub(crate) const CPU_TEMPERATURE_INDEX: usize = FRAME_SENSOR_START + FRAME_SENSORS.len();
 pub(crate) const CPU_POWER_INDEX: usize = CPU_TEMPERATURE_INDEX + 1;
+pub(crate) const GAME_LATENCY_INDEX: usize = CPU_TEMPERATURE_INDEX + CPU_SENSORS.len();
+pub(crate) const CUSTOM_PING_INDEX: usize = GAME_LATENCY_INDEX + GAME_LATENCY_SENSORS.len();
 const GPU: &str = "GPU / NVML";
 const RADEON: &str = "GPU / AMD ADLX";
 const GPM: &str = "GPM / NVML";
@@ -148,6 +167,8 @@ const GPU_VIDEO: &str = "Vídeo da GPU / Windows";
 const SYSTEM: &str = "Sistema / Windows";
 const FRAMES: &str = "Quadros / DirectX";
 const CPU: &str = "CPU / PawnIO";
+const GAME_NETWORK: &str = "Rede do jogo / Windows";
+const CUSTOM_NETWORK: &str = "Rede / ICMP";
 // A chave persistida independe da tradução e da ordem de exibição do sensor.
 type Sensor = (&'static str, &'static str, &'static str, Axis);
 
@@ -246,6 +267,8 @@ pub(crate) fn sensor_catalog() -> impl Iterator<Item = (&'static str, &'static s
         .chain(SYSTEM_SENSORS)
         .chain(FRAME_SENSORS)
         .chain(CPU_SENSORS)
+        .chain(GAME_LATENCY_SENSORS)
+        .chain(CUSTOM_PING_SENSORS)
         .map(|(key, _, unit, _)| (key, unit))
 }
 
@@ -259,6 +282,8 @@ pub(crate) enum Reading {
 
 pub(crate) struct MetricSnapshot {
     pub(crate) name: &'static str,
+    pub(crate) address_label: Option<Arc<str>>,
+    pub(crate) remote_ip: Option<IpAddr>,
     pub(crate) unit: &'static str,
     pub(crate) source: &'static str,
     pub(crate) interval: Duration,
@@ -284,6 +309,9 @@ pub(crate) struct Snapshot {
     pub(crate) frame_status: Option<&'static str>,
     pub(crate) cpu_temperature_status: Option<String>,
     pub(crate) cpu_power_status: Option<String>,
+    pub(crate) game_latency_status: Option<String>,
+    pub(crate) custom_ping_metrics: Vec<MetricSnapshot>,
+    pub(crate) custom_ping_status: Vec<String>,
 }
 
 pub(crate) struct GpuSnapshot {
@@ -338,6 +366,8 @@ struct WindowFeed {
     gpu_selections: Mutex<Vec<Selection>>,
     frame_target: Mutex<FrameTarget>,
     cpu_metrics: AtomicU8,
+    game_latency_enabled: AtomicBool,
+    custom_ping_targets: Mutex<Arc<[String]>>,
 }
 
 impl WindowFeed {
@@ -351,6 +381,12 @@ impl WindowFeed {
         self.frame_target
             .lock()
             .map_or(FrameTarget::Off, |target| *target)
+    }
+
+    fn custom_ping_targets(&self) -> Arc<[String]> {
+        self.custom_ping_targets
+            .lock()
+            .map_or_else(|_| Arc::default(), |targets| Arc::clone(&targets))
     }
 }
 
@@ -376,6 +412,8 @@ impl Monitor {
             gpu_selections: Mutex::new(gpus),
             frame_target: Mutex::default(),
             cpu_metrics: AtomicU8::new(cpu_metrics.bits()),
+            game_latency_enabled: AtomicBool::new(false),
+            custom_ping_targets: Mutex::default(),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_feed = Arc::clone(&feed);
@@ -438,6 +476,29 @@ impl Monitor {
     pub(crate) fn set_cpu_metrics(&self, metrics: CpuMetrics) {
         let bits = metrics.bits();
         if self.feed.cpu_metrics.swap(bits, Ordering::Relaxed) != bits {
+            self.feed.requested.store(true, Ordering::Relaxed);
+            self.wake();
+        }
+    }
+
+    pub(crate) fn set_game_latency_enabled(&self, enabled: bool) {
+        if self
+            .feed
+            .game_latency_enabled
+            .swap(enabled, Ordering::Relaxed)
+            != enabled
+        {
+            self.feed.requested.store(true, Ordering::Relaxed);
+            self.wake();
+        }
+    }
+
+    pub(crate) fn set_custom_ping_targets(&self, targets: &[String]) {
+        if let Ok(mut current) = self.feed.custom_ping_targets.lock()
+            && current.as_ref() != targets
+        {
+            *current = Arc::from(targets);
+            drop(current);
             self.feed.requested.store(true, Ordering::Relaxed);
             self.wake();
         }
@@ -607,7 +668,214 @@ struct DashboardReadings {
     gpu_selections: Vec<Selection>,
     frames: Option<FrameMonitor>,
     frame_target: FrameTarget,
+    foreground_pid: Option<u32>,
     cpu: Option<CpuMonitor>,
+    game_latency: Option<GameLatencyMonitor>,
+    custom_ping: Option<CustomPingMonitor>,
+}
+
+struct GameLatencyMonitor {
+    sampler: Option<game_network::Monitor>,
+    history: PingHistory,
+    pid: Option<u32>,
+    status: String,
+}
+
+impl GameLatencyMonitor {
+    fn new() -> Self {
+        let (sampler, status) = match game_network::Monitor::start() {
+            Ok(sampler) => (Some(sampler), "Aguardando um aplicativo em foco…".into()),
+            Err(error) => (None, error),
+        };
+        Self {
+            sampler,
+            history: PingHistory::new(Instant::now(), game_network::INTERVAL),
+            pid: None,
+            status,
+        }
+    }
+
+    fn set_pid(&mut self, pid: Option<u32>) -> bool {
+        if self.pid == pid {
+            return false;
+        }
+        self.pid = pid;
+        self.history.remote_ip = None;
+        if let Some(sampler) = &self.sampler {
+            sampler.set_pid(pid);
+            self.history.gap = Some(Reading::Pending);
+            self.status = if pid.is_some() {
+                "Aguardando tráfego do aplicativo…"
+            } else {
+                "Aguardando um aplicativo em foco…"
+            }
+            .into();
+        }
+        true
+    }
+
+    fn poll(&mut self) -> bool {
+        let Some(sampler) = &self.sampler else {
+            return false;
+        };
+        let Some(observation) = sampler.try_recv() else {
+            return false;
+        };
+        self.history.record(
+            observation.timestamp,
+            observation.target.map(game_network::Target::remote_ip),
+            observation.rtt.into(),
+        );
+        self.status = observation.detail;
+        true
+    }
+}
+
+impl From<game_network::Rtt> for Reading {
+    fn from(rtt: game_network::Rtt) -> Self {
+        match rtt {
+            game_network::Rtt::Pending => Self::Pending,
+            game_network::Rtt::Unavailable => Self::Unavailable,
+            game_network::Rtt::Milliseconds(value) => Self::Value(value),
+        }
+    }
+}
+
+struct PingHistory {
+    group: Group<1>,
+    remote_ip: Option<IpAddr>,
+    gap: Option<Reading>,
+}
+
+impl PingHistory {
+    fn new(at: Instant, interval: Duration) -> Self {
+        Self {
+            // Each measured point can also carry a separator before it.
+            group: Group::new(at, interval, interval / 2),
+            remote_ip: None,
+            gap: None,
+        }
+    }
+
+    fn record(&mut self, at: Instant, remote_ip: Option<IpAddr>, reading: Reading) {
+        if matches!(reading, Reading::Value(_)) {
+            let gap = self.gap.take();
+            if (gap.is_some() || self.remote_ip != remote_ip) && self.group.history.len() != 0 {
+                self.push(at, gap.unwrap_or(Reading::Pending));
+            }
+            self.push(at, reading);
+        } else {
+            // Keep one live status for any number of missed readings.
+            self.gap = Some(reading);
+        }
+        self.remote_ip = remote_ip;
+    }
+
+    fn push(&mut self, at: Instant, reading: Reading) {
+        self.group.history.push(
+            at,
+            StoredFrame {
+                frame: [reading].into(),
+                interval: self.group.cadence.interval(),
+            },
+        );
+    }
+
+    fn update_metric(&self, metric: &mut MetricSnapshot, at: Instant, available: bool) {
+        metric.remote_ip = self.remote_ip;
+        if self.gap.is_some() || metric.points.is_empty() {
+            metric.points.push(MetricPoint {
+                at,
+                reading: self.gap.unwrap_or(if available {
+                    Reading::Pending
+                } else {
+                    Reading::Unavailable
+                }),
+                interval: metric.interval,
+            });
+        }
+        for point in &metric.points {
+            if let Reading::Value(value) = point.reading {
+                metric.axis_max = metric.axis_max.max((value / 50.0).ceil() * 50.0);
+            }
+        }
+    }
+}
+
+struct CustomPingSeries {
+    address: Arc<str>,
+    history: PingHistory,
+    detail: String,
+}
+
+struct CustomPingMonitor {
+    sampler: Result<custom_ping::Monitor, String>,
+    targets: Arc<[String]>,
+    series: Vec<CustomPingSeries>,
+}
+
+impl CustomPingMonitor {
+    fn new() -> Self {
+        Self {
+            sampler: custom_ping::Monitor::start(),
+            targets: Arc::default(),
+            series: Vec::new(),
+        }
+    }
+
+    fn configure(&mut self, targets: Arc<[String]>, at: Instant) -> bool {
+        if self.targets == targets {
+            return false;
+        }
+        let mut previous = std::mem::take(&mut self.series);
+        self.series = targets
+            .iter()
+            .map(|address| {
+                previous
+                    .iter()
+                    .position(|series| series.address.as_ref() == address)
+                    .map(|index| previous.swap_remove(index))
+                    .unwrap_or_else(|| CustomPingSeries {
+                        address: Arc::from(address.as_str()),
+                        history: PingHistory::new(at, custom_ping::INTERVAL),
+                        detail: self
+                            .sampler
+                            .as_ref()
+                            .err()
+                            .cloned()
+                            .unwrap_or_else(|| "Aguardando a primeira leitura".to_owned()),
+                    })
+            })
+            .collect();
+        if let Ok(sampler) = &self.sampler {
+            sampler.set_targets(&targets);
+        }
+        self.targets = targets;
+        true
+    }
+
+    fn poll(&mut self) -> bool {
+        let Ok(sampler) = &self.sampler else {
+            return false;
+        };
+        let mut changed = false;
+        for observation in sampler.drain() {
+            if let Some(series) = self
+                .series
+                .iter_mut()
+                .find(|series| series.address.as_ref() == observation.address)
+            {
+                series.history.record(
+                    observation.timestamp,
+                    observation.resolved_ip,
+                    observation.rtt.into(),
+                );
+                series.detail = observation.detail;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 enum GpuSource<'a> {
@@ -976,10 +1244,16 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 snapshot_pending = true;
             }
             let target = feed.frame_target();
+            let latency_enabled = feed.game_latency_enabled.load(Ordering::Relaxed);
+            dashboard.foreground_pid = if target == FrameTarget::Foreground
+                || (latency_enabled && target == FrameTarget::Off)
+            {
+                FrameTarget::Foreground.resolve(dashboard.foreground_pid, frames::foreground_pid)
+            } else {
+                None
+            };
+            let pid = target.resolve(None, || dashboard.foreground_pid);
             let previous_pid = dashboard.frames.as_ref().map(|frames| frames.pid);
-            let previous_foreground =
-                previous_pid.filter(|_| dashboard.frame_target == FrameTarget::Foreground);
-            let pid = target.resolve(previous_foreground, frames::foreground_pid);
             if target != dashboard.frame_target || pid != previous_pid {
                 // Drop the previous session before starting a capture for the new process.
                 drop(dashboard.frames.take());
@@ -989,6 +1263,22 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
             }
             if let Some(frames) = &mut dashboard.frames {
                 snapshot_pending |= frames.collect(start);
+            }
+            if latency_enabled != dashboard.game_latency.is_some() {
+                dashboard.game_latency = latency_enabled.then(GameLatencyMonitor::new);
+                snapshot_pending = true;
+            }
+            if let Some(latency) = &mut dashboard.game_latency {
+                snapshot_pending |= latency.set_pid(pid.or(dashboard.foreground_pid));
+                snapshot_pending |= latency.poll();
+            }
+            let ping_targets = feed.custom_ping_targets();
+            if dashboard.custom_ping.is_none() && !ping_targets.is_empty() {
+                dashboard.custom_ping = Some(CustomPingMonitor::new());
+            }
+            if let Some(custom_ping) = &mut dashboard.custom_ping {
+                snapshot_pending |= custom_ping.configure(ping_targets, Instant::now());
+                snapshot_pending |= custom_ping.poll();
             }
         }
         if let Some((elapsed, frame)) =
@@ -1067,6 +1357,17 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
         }
         if let Some(frames) = &dashboard.frames {
             next = next.min(frames.group.cadence.deadline());
+        }
+        if dashboard
+            .game_latency
+            .as_ref()
+            .is_some_and(|latency| latency.sampler.is_some())
+            || dashboard
+                .custom_ping
+                .as_ref()
+                .is_some_and(|ping| !ping.targets.is_empty() && ping.sampler.is_ok())
+        {
+            next = next.min(Instant::now() + NETWORK_POLL_INTERVAL);
         }
         if cpu_metrics.any()
             && let Some(cpu) = &dashboard.cpu
@@ -1183,6 +1484,53 @@ fn build_snapshot(
     }
     let [cpu_temperature_status, cpu_power_status] =
         cpu.map_or([None, None], |cpu| cpu.status.clone());
+    let latency = dashboard.game_latency.as_ref();
+    append_metrics(
+        &mut metrics,
+        at,
+        latency.map(|latency| &latency.history.group),
+        &GAME_LATENCY_SENSORS,
+        GAME_NETWORK,
+        game_network::INTERVAL,
+        axis_limits,
+    );
+    if let Some(latency) = latency {
+        latency.history.update_metric(
+            &mut metrics[GAME_LATENCY_INDEX],
+            at,
+            latency.sampler.is_some(),
+        );
+    }
+    append_metrics(
+        &mut metrics,
+        at,
+        None,
+        &CUSTOM_PING_SENSORS,
+        CUSTOM_NETWORK,
+        custom_ping::INTERVAL,
+        axis_limits,
+    );
+    let mut custom_ping_metrics = Vec::new();
+    let mut custom_ping_status = Vec::new();
+    if let Some(ping) = &dashboard.custom_ping {
+        for series in &ping.series {
+            append_metrics(
+                &mut custom_ping_metrics,
+                at,
+                Some(&series.history.group),
+                &CUSTOM_PING_SENSORS,
+                CUSTOM_NETWORK,
+                custom_ping::INTERVAL,
+                axis_limits,
+            );
+            let metric = custom_ping_metrics.last_mut().expect("curva de ping");
+            metric.address_label = Some(Arc::clone(&series.address));
+            series
+                .history
+                .update_metric(metric, at, ping.sampler.is_ok());
+            custom_ping_status.push(format!("{} · {}", series.address, series.detail));
+        }
+    }
     Arc::new(Snapshot {
         at,
         notice: notice.into(),
@@ -1200,6 +1548,9 @@ fn build_snapshot(
         }),
         cpu_temperature_status,
         cpu_power_status,
+        game_latency_status: latency.map(|latency| latency.status.clone()),
+        custom_ping_metrics,
+        custom_ping_status,
     })
 }
 
@@ -1303,6 +1654,8 @@ fn append_metrics<const N: usize>(
     let capacity = group.map_or(0, |group| group.history.len());
     metrics.extend(sensors.iter().map(|&(_, name, unit, axis)| MetricSnapshot {
         name,
+        address_label: None,
+        remote_ip: None,
         unit,
         source,
         interval,
@@ -1708,6 +2061,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_ping_keeps_a_separate_curve_for_each_configured_address() {
+        let start = Instant::now();
+        let mut ping = CustomPingMonitor {
+            sampler: Err("coleta desativada no teste".to_owned()),
+            targets: Arc::default(),
+            series: Vec::new(),
+        };
+        let local = "127.0.0.1".to_owned();
+        let router = "192.0.2.1".to_owned();
+        assert!(ping.configure(Arc::from([local.clone(), router.clone()]), start));
+        ping.series[0].history.record(
+            start,
+            Some(IpAddr::from([127, 0, 0, 1])),
+            Reading::Value(0.0),
+        );
+        assert!(ping.configure(Arc::from([router.clone(), local.clone()]), start));
+        let dashboard = DashboardReadings {
+            custom_ping: Some(ping),
+            ..Default::default()
+        };
+        let system = Group::new(start, custom_ping::INTERVAL, custom_ping::INTERVAL);
+        let snapshot = build_snapshot(start, "", &system, &[], &dashboard, &FALLBACK_AXES);
+        let [first, second] = snapshot.custom_ping_metrics.as_slice() else {
+            panic!("cada endereço deve ter sua própria curva");
+        };
+        assert_eq!(first.address_label.as_deref(), Some(router.as_str()));
+        assert!(matches!(first.points[0].reading, Reading::Unavailable));
+        assert_eq!(second.address_label.as_deref(), Some(local.as_str()));
+        assert!(matches!(second.points[0].reading, Reading::Value(0.0)));
+    }
+
+    #[test]
+    fn ping_keeps_measurements_through_rediscovery_and_ip_changes() {
+        let start = Instant::now();
+        let first = Some(IpAddr::from([192, 0, 2, 1]));
+        let second = Some(IpAddr::from([192, 0, 2, 2]));
+        let mut latency = GameLatencyMonitor {
+            sampler: None,
+            history: PingHistory::new(start, game_network::INTERVAL),
+            pid: Some(1),
+            status: String::new(),
+        };
+        latency.history.record(start, first, Reading::Value(42.0));
+        for tick in 1..=400 {
+            latency.history.record(
+                start + Duration::from_millis(tick * 250),
+                None,
+                Reading::Pending,
+            );
+        }
+        assert_eq!(latency.history.group.history.len(), 1);
+        let mut dashboard = DashboardReadings {
+            game_latency: Some(latency),
+            ..Default::default()
+        };
+        let system = Group::new(start, game_network::INTERVAL, game_network::INTERVAL);
+        let waiting = start + Duration::from_secs(100);
+        let snapshot = build_snapshot(waiting, "", &system, &[], &dashboard, &FALLBACK_AXES);
+        let metric = &snapshot.metrics[GAME_LATENCY_INDEX];
+        let [previous, status] = metric.points.as_slice() else {
+            panic!("o gráfico deve manter a leitura e exibir o estado atual");
+        };
+        assert!(matches!(previous.reading, Reading::Value(42.0)));
+        assert!(matches!(status.reading, Reading::Pending));
+        let latency = dashboard.game_latency.as_mut().unwrap();
+        let resumed = start + Duration::from_secs(101);
+        latency.history.record(resumed, first, Reading::Value(43.0));
+        let switched = resumed + Duration::from_secs(1);
+        latency
+            .history
+            .record(switched, second, Reading::Value(55.0));
+        assert_eq!(latency.history.remote_ip, second);
+        let points: Vec<_> = latency
+            .history
+            .group
+            .history
+            .iter()
+            .map(|(at, sample)| (at, sample.frame.values[0]))
+            .collect();
+        assert!(matches!(
+            points.as_slice(),
+            [
+                (_, Reading::Value(42.0)),
+                (_, Reading::Pending),
+                (_, Reading::Value(43.0)),
+                (_, Reading::Pending),
+                (_, Reading::Value(55.0)),
+            ]
+        ));
+        assert_eq!(points[3].0, switched);
+        assert!(latency.set_pid(Some(2)));
+        assert_eq!(latency.history.remote_ip, None);
+        assert_eq!(latency.history.group.history.len(), 5);
+    }
+
+    #[test]
     fn collection_keeps_a_failure_and_recovers_at_the_next_interval() {
         let start = Instant::now();
         let interval = Duration::from_millis(1);
@@ -1810,7 +2259,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.metrics.len(),
-            CPU_TEMPERATURE_INDEX + CPU_SENSORS.len()
+            CUSTOM_PING_INDEX + CUSTOM_PING_SENSORS.len()
         );
         assert_eq!(snapshot.frame_target, FrameTarget::Foreground);
         assert_eq!(
@@ -1831,6 +2280,12 @@ mod tests {
                 ..
             }]
         ));
+        assert!(snapshot.game_latency_status.is_none());
+        let latency = &snapshot.metrics[GAME_LATENCY_INDEX];
+        assert_eq!(latency.name, "Ping");
+        assert!(latency.remote_ip.is_none());
+        assert_eq!(latency.interval, game_network::INTERVAL);
+        assert!(latency.points.is_empty());
         let mut keys = std::collections::HashSet::new();
         assert_eq!(sensor_catalog().count(), snapshot.metrics.len());
         assert!(

@@ -9,8 +9,9 @@ use std::time::Duration;
 use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 
 use self::etw::{Capture, PresentEvent, PresentKind, Runtime};
-use self::process::Target;
-pub(crate) use self::process::{Process, foreground_pid, visible_processes};
+pub(crate) use self::process::{
+    Process, Target as ProcessTarget, foreground_pid, process_name, visible_processes,
+};
 
 pub(crate) const SENSOR_COUNT: usize = 3;
 const MAX_PENDING: usize = 64;
@@ -55,7 +56,7 @@ pub(crate) struct FrameSampler(Result<ActiveCapture, &'static str>);
 
 struct ActiveCapture {
     capture: Capture,
-    target: Target,
+    target: ProcessTarget,
     presents: Presents,
 }
 
@@ -89,7 +90,7 @@ impl Sample {
 
 impl ActiveCapture {
     fn start(pid: u32) -> Result<Self, &'static str> {
-        let target = Target::open(pid).map_err(|_| "Processo indisponível para captura")?;
+        let target = ProcessTarget::open(pid).map_err(|_| "Processo indisponível para captura")?;
         let capture = Capture::start(pid).map_err(|error| match error.kind() {
             io::ErrorKind::PermissionDenied => ACCESS_DENIED,
             io::ErrorKind::AlreadyExists => "Outra instância do ARGOS já está capturando quadros",

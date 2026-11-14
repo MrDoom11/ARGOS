@@ -50,7 +50,7 @@ O ARGOS verifica novas versões estáveis em segundo plano ao abrir. No menu do 
 
 Abra o painel pelo instalador, pelo menu Iniciar ou pelo comando `gui`. Na primeira abertura, o guia rápido mostra os principais controles e o painel usa um monitor secundário, quando disponível. Clique com o botão direito em qualquer área para abrir as opções de configuração e os comandos da janela.
 
-O ícone do ARGOS fica na área de notificação, perto do relógio. Clique nele para mostrar o painel depois de minimizar. Pelo botão direito no ícone, escolha **Mostrar ARGOS** ou **Fechar ARGOS**.
+O ícone do ARGOS fica na área de notificação, perto do relógio. Clique nele para mostrar o painel depois de minimizar. Pelo botão direito no ícone, escolha **Mostrar ARGOS** ou **Fechar ARGOS**. Enquanto está aberto no modo normal, o painel também aparece na barra de tarefas e pode ser encaixado pelo FancyZones.
 
 Em **GPUs monitoradas**, marque as placas NVIDIA e Radeon que quer acompanhar ao mesmo tempo. O índice distingue placas do mesmo modelo. O modo automático coleta uma placa, com preferência pela NVIDIA. Cada placa tem seu próprio histórico e sua própria seção no menu **Sensores**. Ao desmarcar uma placa, seus gráficos ficam no layout e as demais placas continuam com seus históricos. CPU, RAM e quadros são coletados uma vez para todo o painel. Escolhas e gráficos são restaurados quando a placa tem uma identidade persistente. `gui --gpu 0` seleciona a primeira NVIDIA pelo índice NVML e `gui --gpu amd:0` seleciona a primeira Radeon pelo índice ADLX.
 
@@ -60,7 +60,7 @@ Os sensores Radeon usam a ADLX do driver AMD. Temperatura, uso, clocks, VRAM e p
 
 Os gráficos de codificação e decodificação de vídeo das Radeon usam os contadores que o Windows disponibiliza para a GPU selecionada. Se o driver reportar um motor compartilhado, o ARGOS mostra o uso desse motor. O menu **Sensores** lista os motores assim que o Windows os reporta, o que pode ocorrer só quando algum aplicativo usa vídeo por hardware naquela placa. As leituras são atualizadas no máximo uma vez por segundo. [Tipos de motor de GPU no Windows](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ne-d3dkmdt-dxgk_engine_type)
 
-Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Pressione `Esc` para cancelar. Arraste uma borda ou um canto para redimensionar. Ao reabrir, o painel restaura a última posição.
+Para mudar a posição da janela, selecione **Mover janela**, clique no painel e arraste com o botão esquerdo pressionado. Use o gesto configurado no **FancyZones** durante o arraste para encaixar o painel em uma zona. Pressione `Esc` para cancelar. Arraste uma borda ou um canto para redimensionar. Ao reabrir, o painel restaura a última posição.
 
 - **Intervalo de amostragem** escolhe 100, 200, 500 ou 1.000 ms. A troca preserva o histórico. Quando a opção é 100 ms, o coletor GPM respeita seu mínimo de 101 ms. [Funções GPM da NVML](https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlGpmFunctions.html)
 - **Grade** (`F4`) ajusta de 1 a 6 colunas e de 1 a 4 linhas visíveis. Na primeira abertura, o ARGOS mostra quatro gráficos numa linha, na ordem de uso da CPU, temperatura da CPU, RAM usada e FPS. Novos sensores ocupam os espaços livres. Use a roda do mouse ou a barra de rolagem à direita para ver os gráficos que ficam abaixo.
@@ -90,6 +90,18 @@ O ARGOS começa no modo **Aplicativo em foco**. Enquanto você interage com o pa
 | Tempo em Present() (pico) | Maior tempo que a thread passou dentro de `Present()` na janela de amostragem mais recente. |
 
 O FPS usa uma janela de até 1 s. Os dois picos usam o **Intervalo de amostragem**. As medições se referem a apresentações do aplicativo. Quadros efetivamente exibidos, quadros gerados pelo driver e espera da GPU exigem outras fontes de eventos. O Windows pode entregar eventos em lotes, mesmo com o painel configurado para atualizar a cada 100 ms. Os tempos são calculados a partir dos relógios dos próprios eventos. [Entrega de buffers do ETW](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties) · [Cálculo da espera no PresentMon](https://github.com/GameTechDev/PresentMon/blob/main/IntelPresentMon/CommonUtilities/mc/MetricsCalculatorCpuGpu.cpp#L35-L49)
+
+### Ping
+
+No painel, abra **Sensores → Rede do jogo / Windows** e marque **Ping**. O sensor acompanha o aplicativo selecionado no menu **FPS**. Se você não fixar um aplicativo, o Ping segue o aplicativo em foco, inclusive com o FPS desativado. O ARGOS usa o tráfego nos dois sentidos para identificar o destino provável e mostra o IP ao lado do título do gráfico. A descoberta usa metadados do ETW do Windows e pode exigir execução como administrador. O menu **Sensores** mostra o destino completo, o método e o motivo de indisponibilidade. [Captura de rede no Windows](https://learn.microsoft.com/en-us/windows/win32/etw/udpip)
+
+O gráfico amostra em milissegundos, uma vez por segundo. Para TCP, o Windows fornece o RTT suavizado da conexão. Para UDP, o ARGOS agrupa o tráfego entre os mesmos IPs, mesmo quando as portas mudam, e envia uma sondagem ICMP ao destino observado enquanto o sensor estiver ativo. O gráfico mantém o IP e mostra uma lacuna quando a sonda fica sem resposta. Também preserva as amostras anteriores dentro do período selecionado, com lacunas nas trocas de IP. [RTT TCP no Windows](https://learn.microsoft.com/en-us/windows/win32/api/tcpestats/ns-tcpestats-tcp_estats_path_rod_v0) · [Sondagem ICMP no Windows](https://learn.microsoft.com/en-us/windows/win32/api/icmpapi/)
+
+O IP pode ser de um jogador, de um relay ou de um servidor. A leitura ICMP mede o trajeto até o endereço exibido. No Warframe, uma missão pode ser hospedada por um jogador. O Elite Dangerous calcula sua própria média de latência a servidores e jogadores. [Warframe](https://www.warframe.com/uk/patch-notes/pc/37-0-0) · [Frontier](https://customersupport.frontier.co.uk/hc/en-us/articles/4405945325970-Network-Options-Configuration)
+
+### Ping personalizado
+
+Em **Sensores → Ping personalizado → Editar endereços…**, informe até quatro destinos, um por linha. A lista aceita IPv4, IPv6 e nomes de host. O painel salva os endereços e mostra uma curva por destino no mesmo gráfico. As sondagens ICMP rodam em segundo plano uma vez por segundo enquanto o gráfico está ativo. Destinos sem resposta aparecem como lacunas.
 
 ### Sensores de CPU
 

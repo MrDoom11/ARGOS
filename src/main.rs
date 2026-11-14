@@ -13,6 +13,8 @@ mod desktop;
 #[cfg(windows)]
 mod frames;
 #[cfg(windows)]
+mod game_network;
+#[cfg(windows)]
 mod gpu;
 #[cfg(windows)]
 mod gpu_video;

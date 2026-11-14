@@ -365,6 +365,8 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
         metrics: (0..=RAM_USED_INDEX)
             .map(|_| MetricSnapshot {
                 name: "Métrica de teste",
+                address_label: None,
+                remote_ip: None,
                 unit: "",
                 source: "",
                 interval: Duration::from_secs(1),
@@ -379,6 +381,9 @@ fn assert_translucent_color_menu(hwnd: HWND, app: &mut Window) {
         frame_status: None,
         cpu_temperature_status: None,
         cpu_power_status: None,
+        game_latency_status: None,
+        custom_ping_metrics: Vec::new(),
+        custom_ping_status: Vec::new(),
     }));
     let menu = options_menu(hwnd, app, MenuSection::All, &[], &[], Some(0)).unwrap();
     let color_item =
