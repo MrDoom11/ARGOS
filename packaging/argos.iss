@@ -18,7 +18,7 @@ SetupIconFile=..\assets\argos.ico
 UninstallDisplayIcon={app}\argos.exe
 PrivilegesRequired=lowest
 CloseApplications=no
-MinVersion=10.0.22000
+MinVersion=10.0.19045
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
 WizardStyle=modern
@@ -424,6 +424,9 @@ begin
 end;
 
 function InitializeSetup: Boolean;
+var
+  Version: TWindowsVersion;
+  Description: String;
 begin
   if RunPortableRequested then
   begin
@@ -436,8 +439,15 @@ begin
   if WizardSilent then
     Exit;
 
-  case TaskDialogMsgBox('Como você quer usar o ARGOS?',
-    'Escolha se deseja abrir o painel agora ou instalar o ARGOS neste computador.',
+  Description := 'Escolha se deseja abrir o painel agora ou instalar o ARGOS neste computador.';
+  GetWindowsVersionEx(Version);
+  if (Version.ProductType = VER_NT_WORKSTATION) and (Version.Major = 10) and
+    (Version.Minor = 0) and (Version.Build < 22000) then
+    Description := Description + #13#10#13#10 +
+      'O ARGOS é otimizado para o Windows 11 e pode apresentar problemas no Windows 10. ' +
+      'Recomendamos o Windows 11. O suporte regular da Microsoft ao Windows 10 22H2 terminou em 14 de outubro de 2025.';
+
+  case TaskDialogMsgBox('Como você quer usar o ARGOS?', Description,
     mbInformation, MB_YESNOCANCEL, ['&Somente executar', '&Instalar', '&Cancelar'], 0) of
     IDYES:
       begin
