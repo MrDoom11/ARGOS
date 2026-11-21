@@ -6,7 +6,9 @@ As etapas do projeto e os critérios para avançar estão no [roadmap](ROADMAP.m
 
 ## Distribuição para Windows
 
-Abra `ARGOS-Setup.exe` no Windows 11 x64 e escolha uma opção.
+Abra `ARGOS-Setup.exe` no Windows 11 x64 ou no Windows 10 22H2 x64 (build 19045) e escolha uma opção.
+
+**Recomendamos o Windows 11.** O ARGOS é otimizado para o Windows 11 e pode apresentar problemas no Windows 10. O suporte regular da Microsoft ao Windows 10 22H2 terminou em 14 de outubro de 2025. [Ciclo de vida do Windows 10](https://learn.microsoft.com/pt-br/windows/release-health/release-information)
 
 - **Somente executar** abre o painel a partir de uma pasta temporária. Se o painel estiver fechado e houver uma instalação, você pode escolher entre a versão instalada e a versão do pacote, inclusive quando o pacote for mais antigo. Os arquivos extraídos são removidos ao fechar o painel.
 - **Instalar** adiciona o ARGOS à conta atual e cria um atalho no menu Iniciar. Em CPUs compatíveis, o instalador prepara a leitura de temperatura e potência com uma confirmação de administrador do Windows. Para desinstalar, abra **Configurações → Aplicativos → Aplicativos instalados**.
