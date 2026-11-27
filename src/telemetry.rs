@@ -114,6 +114,17 @@ impl<T> History<T> {
         self.points.len()
     }
 
+    pub(crate) fn within(
+        &self,
+        now: Instant,
+        window: Duration,
+    ) -> impl ExactSizeIterator<Item = (Instant, &T)> + Clone + '_ {
+        let first = self
+            .points
+            .partition_point(|(at, _)| now.saturating_duration_since(*at) >= window);
+        self.points.range(first..).map(|(at, value)| (*at, value))
+    }
+
     pub(crate) fn iter(
         &self,
     ) -> impl DoubleEndedIterator<Item = (Instant, &T)> + ExactSizeIterator + '_ {

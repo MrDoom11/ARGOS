@@ -2056,6 +2056,7 @@ struct Window {
 
 impl Window {
     fn new(monitor: Monitor, board: Board, dpi: u32, source: Source) -> Self {
+        monitor.set_gpu_history_mask(board.gpu_history_mask());
         Self {
             monitor,
             updater: Updater::new(source),
@@ -2117,8 +2118,14 @@ impl Window {
         self.tray.as_ref().is_some_and(tray::Tray::available)
     }
 
+    fn request_snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.monitor
+            .set_gpu_history_mask(self.board.gpu_history_mask());
+        self.monitor.snapshot()
+    }
+
     fn refresh(&mut self) -> bool {
-        self.update_snapshot(self.monitor.snapshot())
+        self.update_snapshot(self.request_snapshot())
     }
 
     fn refresh_cached(&mut self) -> bool {

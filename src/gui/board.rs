@@ -269,6 +269,17 @@ impl Board {
         self.panels.iter().any(|panel| panel.contains(&sensor))
     }
 
+    pub(super) fn gpu_history_mask(&self) -> u32 {
+        const { assert!(CPU_USAGE_INDEX <= u32::BITS as usize) };
+        self.panels.iter().flatten().fold(0, |mask, &slot| {
+            let base = self
+                .gpu_sensor(slot)
+                .map(|(_, base)| base)
+                .or_else(|| (slot < CPU_USAGE_INDEX).then_some(slot));
+            base.map_or(mask, |base| mask | (1 << base))
+        })
+    }
+
     pub(super) fn gpu_sensor(&self, slot: usize) -> Option<(&str, usize)> {
         match self.device_sensor(slot)? {
             DeviceSensor::Gpu(binding) => Some((&binding.gpu_id, binding.base)),
@@ -878,6 +889,18 @@ pub(super) fn replace_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_history_follows_configured_curves_across_pages_and_devices() {
+        let mut board = Board::new([0, 2, CPU_USAGE_INDEX]);
+        let bound = board.register_gpu_sensor("gpu-test", false, 3);
+        board.panels.push(vec![bound, 2]);
+        assert_eq!(board.gpu_history_mask(), 0b1101);
+        board.panels = vec![vec![CPU_USAGE_INDEX], vec![bound]];
+        assert_eq!(board.gpu_history_mask(), 0b1000);
+        board.panels.clear();
+        assert_eq!(board.gpu_history_mask(), 0);
+    }
 
     #[test]
     fn initial_dashboard_has_four_requested_sensors_on_one_row() {
