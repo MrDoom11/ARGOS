@@ -403,6 +403,7 @@ struct WindowFeed {
     latest: Mutex<Option<Arc<Snapshot>>>,
     requested: AtomicBool,
     interval_ms: AtomicU32,
+    gpu_history_mask: AtomicU32,
     gpu_selections: Mutex<Vec<Selection>>,
     frame_target: Mutex<FrameTarget>,
     cpu_metrics: AtomicU8,
@@ -453,21 +454,9 @@ impl Monitor {
         if !GUI_INTERVALS_MS.contains(&interval_ms) {
             return Err(format!("intervalo de coleta inválido: {interval_ms} ms"));
         }
-        let feed = Arc::new(WindowFeed {
-            latest: Mutex::new(None),
-            requested: AtomicBool::new(true),
-            interval_ms: AtomicU32::new(interval_ms),
-            gpu_selections: Mutex::new(gpus),
-            frame_target: Mutex::default(),
-            cpu_metrics: AtomicU8::new(cpu_metrics.bits()),
-            game_latency_enabled: AtomicBool::new(false),
-            custom_ping_targets: Mutex::default(),
-            network_settings: Mutex::default(),
-            storage_selection: Mutex::default(),
-        });
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_feed = Arc::clone(&feed);
-        let stop = Arc::clone(&stopped);
+        let mut monitor = Self::idle(gpus, interval_ms, cpu_metrics);
+        let worker_feed = Arc::clone(&monitor.feed);
+        let stop = Arc::clone(&monitor.stopped);
         let interval = Duration::from_millis(u64::from(interval_ms));
         let options = WatchOptions {
             gpus: Vec::new(),
@@ -482,11 +471,33 @@ impl Monitor {
                 let _ = collect(options, Sink::Window(worker_feed), &stop);
             })
             .map_err(|error| format!("falha ao iniciar a coleta ({error})"))?;
-        Ok(Self {
+        monitor.worker = Some(worker);
+        Ok(monitor)
+    }
+
+    pub(crate) fn idle(gpus: Vec<Selection>, interval_ms: u32, cpu_metrics: CpuMetrics) -> Self {
+        let feed = Arc::new(WindowFeed {
+            latest: Mutex::new(None),
+            requested: AtomicBool::new(true),
+            interval_ms: AtomicU32::new(interval_ms),
+            gpu_history_mask: AtomicU32::new(u32::MAX),
+            gpu_selections: Mutex::new(gpus),
+            frame_target: Mutex::default(),
+            cpu_metrics: AtomicU8::new(cpu_metrics.bits()),
+            game_latency_enabled: AtomicBool::new(false),
+            custom_ping_targets: Mutex::default(),
+            network_settings: Mutex::default(),
+            storage_selection: Mutex::default(),
+        });
+        Self {
             feed,
-            stopped,
-            worker: Some(worker),
-        })
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
+    }
+
+    pub(crate) fn set_gpu_history_mask(&self, mask: u32) {
+        self.feed.gpu_history_mask.store(mask, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -637,12 +648,21 @@ struct Group<const N: usize> {
     capacity: usize,
 }
 
+struct SeriesSelection<'a, const N: usize> {
+    group: &'a Group<N>,
+    mask: u32,
+}
+
 struct StoredFrame<const N: usize> {
     frame: Frame<N>,
     interval: Duration,
 }
 
 impl<const N: usize> Group<N> {
+    fn series(&self, mask: u32) -> SeriesSelection<'_, N> {
+        SeriesSelection { group: self, mask }
+    }
+
     fn new(start: Instant, interval: Duration, fastest: Duration) -> Self {
         let capacity = HISTORY_WINDOW.as_millis().div_ceil(fastest.as_millis()) as usize;
         Self {
@@ -731,6 +751,7 @@ struct HistorySummary {
 struct FrameMonitor {
     pid: u32,
     sampler: FrameSampler,
+    pending_status: Option<Reading>,
     group: Group<{ FRAME_SENSORS.len() }>,
     status: Option<&'static str>,
     requires_admin: bool,
@@ -738,6 +759,7 @@ struct FrameMonitor {
 
 #[derive(Default)]
 struct DashboardReadings {
+    gpu_history_mask: u32,
     gpu_devices: Arc<[GpuInfo]>,
     gpu_selections: Vec<Selection>,
     frames: Option<FrameMonitor>,
@@ -1490,29 +1512,47 @@ impl FrameMonitor {
         Self {
             pid,
             sampler,
+            pending_status: None,
             group: Group::new(Instant::now(), interval, FASTEST_GUI_INTERVAL),
             status: None,
             requires_admin: false,
         }
     }
 
-    fn collect(&mut self, start: Instant) -> bool {
+    fn collect(&mut self) -> bool {
+        if Instant::now() < self.group.cadence.deadline() {
+            return false;
+        }
         let interval = self.group.cadence.interval();
-        self.group
-            .capture(start, || {
-                let sample = self.sampler.sample(interval);
-                self.status = Some(sample.status());
-                self.requires_admin = sample.requires_admin();
-                match sample {
-                    frames::Sample::Measured(values) => {
-                        values.map(|value| value.map_or(Reading::Pending, Reading::Value))
-                    }
-                    frames::Sample::Waiting(_) => [Reading::Pending; FRAME_SENSORS.len()],
-                    frames::Sample::Unavailable(_) => [Reading::Unavailable; FRAME_SENSORS.len()],
-                }
-                .into()
-            })
-            .is_some()
+        let history = &mut self.group.history;
+        let sample = self.sampler.sample(interval, |at, values| {
+            let frame = values
+                .map(|v| v.map_or(Reading::Pending, Reading::Value))
+                .into();
+            history.upsert(at, StoredFrame { frame, interval });
+        });
+        let now = Instant::now();
+        self.group.cadence.complete(now);
+        self.pending_status = match sample {
+            frames::Sample::Measured => None,
+            frames::Sample::Waiting(_) => Some(Reading::Pending),
+            frames::Sample::Unavailable(_) => Some(Reading::Unavailable),
+        };
+        if self.status != Some(sample.status())
+            && history.len() > 0
+            && let Some(reading) = self.pending_status
+        {
+            history.push(
+                now,
+                StoredFrame {
+                    frame: [reading; FRAME_SENSORS.len()].into(),
+                    interval,
+                },
+            );
+        }
+        self.status = Some(sample.status());
+        self.requires_admin = sample.requires_admin();
+        true
     }
 }
 
@@ -1621,6 +1661,11 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
 
     while !stopped.load(Ordering::Relaxed) && end.is_none_or(|end| Instant::now() < end) {
         if let Some(feed) = window {
+            let mask = feed.gpu_history_mask.load(Ordering::Relaxed);
+            if dashboard.gpu_history_mask != mask {
+                dashboard.gpu_history_mask = mask;
+                snapshot_pending = true;
+            }
             let interval =
                 Duration::from_millis(u64::from(feed.interval_ms.load(Ordering::Relaxed)));
             if interval != options.gpu_interval {
@@ -1664,7 +1709,7 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 snapshot_pending = true;
             }
             if let Some(frames) = &mut dashboard.frames {
-                snapshot_pending |= frames.collect(start);
+                snapshot_pending |= frames.collect();
             }
             if latency_enabled && dashboard.game_latency.is_none() {
                 dashboard.game_latency = Some(GameLatencyMonitor::new());
@@ -1860,12 +1905,12 @@ fn build_snapshot(
     base_limits: &AxisLimits,
 ) -> Arc<Snapshot> {
     let interval = system.cadence.interval();
-    let mut metrics = gpu_metrics(at, None, interval, base_limits);
+    let mut metrics = gpu_metrics(at, None, interval, base_limits, 0);
     let axis_limits = base_limits;
     append_metrics(
         &mut metrics,
         at,
-        Some(system),
+        Some(system.series(u32::MAX)),
         &SYSTEM_SENSORS,
         SYSTEM,
         interval,
@@ -1875,22 +1920,32 @@ fn build_snapshot(
     append_metrics(
         &mut metrics,
         at,
-        frames.map(|frames| &frames.group),
+        frames.map(|frames| frames.group.series(u32::MAX)),
         &FRAME_SENSORS,
         FRAMES,
         interval,
         axis_limits,
     );
-    if frames.is_some_and(|frames| frames.requires_admin) {
+    if let Some(frames) = frames {
         for metric in &mut metrics[FRAME_SENSOR_START..CPU_TEMPERATURE_INDEX] {
-            metric.requires_admin = true;
+            metric.requires_admin = frames.requires_admin;
+            if let Some(reading) = frames.pending_status {
+                metric.points.push(MetricPoint {
+                    at,
+                    reading,
+                    interval,
+                });
+            }
         }
+    }
+    for metric in &mut metrics[FRAME_SENSOR_START + 1..CPU_TEMPERATURE_INDEX] {
+        expand_axis_to_peak(metric);
     }
     let cpu = dashboard.cpu.as_ref();
     append_metrics(
         &mut metrics,
         at,
-        cpu.map(|monitor| &monitor.group),
+        cpu.map(|monitor| monitor.group.series(u32::MAX)),
         &CPU_SENSORS,
         CPU,
         interval,
@@ -1923,7 +1978,7 @@ fn build_snapshot(
     append_metrics(
         &mut metrics,
         at,
-        latency.map(|latency| &latency.history.group),
+        latency.map(|latency| latency.history.group.series(u32::MAX)),
         &GAME_LATENCY_SENSORS,
         GAME_NETWORK,
         game_network::INTERVAL,
@@ -1952,7 +2007,7 @@ fn build_snapshot(
             append_metrics(
                 &mut custom_ping_metrics,
                 at,
-                Some(&series.history.group),
+                Some(series.history.group.series(u32::MAX)),
                 &CUSTOM_PING_SENSORS,
                 CUSTOM_NETWORK,
                 custom_ping::INTERVAL,
@@ -1972,7 +2027,7 @@ fn build_snapshot(
         at,
         network
             .filter(|network| network.settings.enabled)
-            .map(|network| &network.group),
+            .map(|network| network.group.series(u32::MAX)),
         &NETWORK_SENSORS,
         NETWORK,
         NETWORK_RATE_INTERVAL,
@@ -1999,7 +2054,7 @@ fn build_snapshot(
         gpu_selections: dashboard.gpu_selections.clone(),
         gpus: gpus
             .iter()
-            .map(|gpu| gpu_snapshot(at, gpu, interval, base_limits))
+            .map(|gpu| gpu_snapshot(at, gpu, interval, base_limits, dashboard.gpu_history_mask))
             .collect(),
         frame_target: dashboard.frame_target,
         frame_status: frames.and_then(|frames| frames.status).or_else(|| {
@@ -2043,6 +2098,7 @@ fn gpu_snapshot(
     gpu: &GpuMonitor<'_>,
     interval: Duration,
     base_limits: &AxisLimits,
+    mask: u32,
 ) -> GpuSnapshot {
     let video = gpu.video.as_ref();
     let video_source = video.and_then(|video| video.source.as_ref());
@@ -2059,7 +2115,7 @@ fn gpu_snapshot(
     });
     GpuSnapshot {
         index: gpu.index,
-        metrics: gpu_metrics(at, Some(gpu), interval, base_limits),
+        metrics: gpu_metrics(at, Some(gpu), interval, base_limits, mask),
         gpu_video_support,
         gpu_video_status,
     }
@@ -2070,13 +2126,14 @@ fn gpu_metrics(
     gpu: Option<&GpuMonitor<'_>>,
     interval: Duration,
     base_limits: &AxisLimits,
+    mask: u32,
 ) -> Vec<MetricSnapshot> {
     let axis_limits = gpu.map_or(base_limits, |gpu| &gpu.limits);
     let mut metrics = Vec::with_capacity(CPU_USAGE_INDEX);
     append_metrics(
         &mut metrics,
         at,
-        gpu.map(|gpu| &gpu.group),
+        gpu.map(|gpu| gpu.group.series(mask)),
         &GPU_SENSORS,
         gpu.map_or(GPU, |gpu| gpu.source.label()),
         gpu.map_or(interval, |gpu| gpu.group.cadence.interval()),
@@ -2085,7 +2142,8 @@ fn gpu_metrics(
     append_metrics(
         &mut metrics,
         at,
-        gpu.and_then(|gpu| gpu.gpm.as_ref()),
+        gpu.and_then(|gpu| gpu.gpm.as_ref())
+            .map(|group| group.series(mask >> GPU_SENSORS.len())),
         &gpm_sensors(),
         GPM,
         interval.max(GPM_MIN_INTERVAL),
@@ -2099,7 +2157,7 @@ fn gpu_metrics(
     append_metrics(
         &mut metrics,
         at,
-        video_group,
+        video_group.map(|group| group.series(mask >> GPU_VIDEO_START)),
         &GPU_VIDEO_SENSORS,
         GPU_VIDEO,
         video_interval,
@@ -2128,14 +2186,13 @@ fn gpu_metrics(
 fn append_metrics<const N: usize>(
     metrics: &mut Vec<MetricSnapshot>,
     now: Instant,
-    group: Option<&Group<N>>,
+    selection: Option<SeriesSelection<'_, N>>,
     sensors: &[Sensor; N],
     source: &'static str,
     interval: Duration,
     axis_limits: &AxisLimits,
 ) {
     let start = metrics.len();
-    let capacity = group.map_or(0, |group| group.history.len());
     metrics.extend(sensors.iter().map(|&(_, name, unit, axis)| MetricSnapshot {
         name,
         address_label: None,
@@ -2145,19 +2202,21 @@ fn append_metrics<const N: usize>(
         requires_admin: false,
         interval,
         axis_max: axis_limits.max_for(axis),
-        points: Vec::with_capacity(capacity),
+        points: Vec::new(),
     }));
-    if let Some(group) = group {
-        for (at, sample) in group.history.iter() {
-            if now.saturating_duration_since(at) < HISTORY_WINDOW {
-                for (metric, reading) in metrics[start..].iter_mut().zip(sample.frame.values) {
-                    metric.points.push(MetricPoint {
-                        at,
-                        reading,
-                        interval: sample.interval,
-                    });
-                }
-            }
+    let Some(selection) = selection.filter(|s| s.mask != 0) else {
+        return;
+    };
+    let samples = selection.group.history.within(now, HISTORY_WINDOW);
+    for (index, metric) in metrics[start..].iter_mut().enumerate() {
+        if selection.mask & (1 << index) != 0 {
+            metric
+                .points
+                .extend(samples.clone().map(|(at, sample)| MetricPoint {
+                    at,
+                    reading: sample.frame.values[index],
+                    interval: sample.interval,
+                }));
         }
     }
 }
@@ -2817,6 +2876,59 @@ mod tests {
     }
 
     #[test]
+    fn switching_gpu_curves_recovers_retained_samples_without_copying_unused_series() {
+        let start = Instant::now();
+        let interval = FASTEST_GUI_INTERVAL;
+        let n = (HISTORY_WINDOW.as_millis() / interval.as_millis()) as u32;
+        let mut group = Group::new(start, interval, interval);
+        for i in 0..n {
+            group.history.push(
+                start + interval * i,
+                StoredFrame {
+                    frame: std::array::from_fn(|column| {
+                        Reading::Value(f64::from(i) + column as f64)
+                    })
+                    .into(),
+                    interval,
+                },
+            );
+        }
+        let at = start + interval * (n - 1);
+        let snapshot = |mask| {
+            let mut metrics = Vec::new();
+            append_metrics(
+                &mut metrics,
+                at,
+                Some(group.series(mask)),
+                &GPU_SENSORS,
+                GPU,
+                interval,
+                &FALLBACK_AXES,
+            );
+            metrics
+        };
+        let all = snapshot(u32::MAX);
+        assert_eq!(
+            all.iter().map(|m| m.points.len()).sum::<usize>(),
+            n as usize * GPU_SENSORS.len()
+        );
+        for index in [0, GPU_SENSORS.len() - 1] {
+            let selected = snapshot(1 << index);
+            assert!(
+                selected
+                    .iter()
+                    .enumerate()
+                    .all(|(i, m)| i == index || m.points.capacity() == 0)
+            );
+            let points = &selected[index].points;
+            assert_eq!(points.len(), n as usize);
+            assert_eq!((points[0].at, points.last().unwrap().at), (start, at));
+            assert!(matches!(points[0].reading, Reading::Value(v) if v == index as f64));
+        }
+        assert!(snapshot(0).iter().all(|m| m.points.capacity() == 0));
+    }
+
+    #[test]
     fn snapshot_keeps_sensor_order_and_preserves_only_the_live_history() {
         let start = Instant::now();
         let now = start + HISTORY_WINDOW;
@@ -3029,6 +3141,34 @@ mod tests {
         let again = wait_for_gpus(&[radeon, nvidia]);
         assert_eq!(again.gpus[0].metrics[0].points[0].at, first_radeon);
         assert!(again.gpus[1].metrics[0].points[0].at > first_nvidia);
+
+        monitor.set_gpu_history_mask(0);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if monitor.snapshot().is_some_and(|s| {
+                s.gpus.len() == 2 && s.gpus.iter().all(|gpu| gpu.metrics[0].points.is_empty())
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "históricos de GPU continuaram sendo copiados"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        monitor.set_gpu_history_mask(1);
+        let restored = wait_for_gpus(&[radeon, nvidia]);
+        assert_eq!(restored.gpus[0].metrics[0].points[0].at, first_radeon);
+        assert_eq!(
+            restored.gpus[1].metrics[0].points[0].at,
+            again.gpus[1].metrics[0].points[0].at
+        );
+        assert!(
+            restored
+                .gpus
+                .iter()
+                .all(|gpu| gpu.metrics[1].points.is_empty())
+        );
     }
     #[test]
     fn invalid_hardware_limit_uses_fixed_fallback() {

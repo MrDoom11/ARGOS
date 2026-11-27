@@ -50,7 +50,7 @@ impl FrameTarget {
 }
 
 pub(crate) enum Sample {
-    Measured([Option<f64>; SENSOR_COUNT]),
+    Measured,
     Waiting(&'static str),
     Unavailable(CaptureFailure),
 }
@@ -85,6 +85,7 @@ pub(crate) struct FrameSampler {
 struct ActiveCapture {
     capture: Capture,
     presents: Presents,
+    clock: (u64, Instant),
 }
 
 impl FrameSampler {
@@ -104,7 +105,11 @@ impl FrameSampler {
         }
     }
 
-    pub(crate) fn sample(&mut self, interval: Duration) -> Sample {
+    pub(crate) fn sample(
+        &mut self,
+        interval: Duration,
+        record: impl FnMut(Instant, [Option<f64>; SENSOR_COUNT]),
+    ) -> Sample {
         if self
             .target
             .as_ref()
@@ -119,7 +124,7 @@ impl FrameSampler {
             self.retry_at = retry_deadline(&self.capture, Instant::now());
         }
         match &mut self.capture {
-            Ok(capture) => match capture.sample(interval) {
+            Ok(capture) => match capture.sample(interval, record) {
                 Ok(sample) => sample,
                 Err(failure) => {
                     self.capture = Err(failure);
@@ -142,7 +147,7 @@ fn retry_deadline(
 impl Sample {
     pub(crate) fn status(&self) -> &'static str {
         match self {
-            Self::Measured(_) => ACTIVE,
+            Self::Measured => ACTIVE,
             Self::Waiting(reason)
             | Self::Unavailable(
                 CaptureFailure::Retryable(reason) | CaptureFailure::Other(reason),
@@ -160,10 +165,18 @@ impl ActiveCapture {
     fn start(pid: u32) -> Result<Self, CaptureFailure> {
         let capture = Capture::start(pid).map_err(CaptureFailure::from_trace_error)?;
         let presents = Presents::new(capture.ticks_per_second());
-        Ok(Self { capture, presents })
+        Ok(Self {
+            capture,
+            presents,
+            clock: (counter()?, Instant::now()),
+        })
     }
 
-    fn sample(&mut self, interval: Duration) -> Result<Sample, CaptureFailure> {
+    fn sample(
+        &mut self,
+        interval: Duration,
+        mut record: impl FnMut(Instant, [Option<f64>; SENSOR_COUNT]),
+    ) -> Result<Sample, CaptureFailure> {
         let mut lost = self.capture.take_loss();
         for _ in 0..MAX_EVENTS_PER_READ {
             match self.capture.try_recv() {
@@ -182,16 +195,31 @@ impl ActiveCapture {
                 "Eventos perdidos. Aguardando novas apresentações",
             ));
         }
-        let mut now = 0;
-        // SAFETY: `now` is a writable LARGE_INTEGER for the duration of the call.
-        if unsafe { QueryPerformanceCounter(&mut now) } == 0 {
-            return Err(CaptureFailure::Other("Relógio de captura indisponível"));
-        }
-        Ok(self
-            .presents
-            .measure(now as u64, interval)
-            .map_or(Sample::Waiting(WAITING), Sample::Measured))
+        let (origin, instant) = self.clock;
+        let frequency = self.presents.frequency as f64;
+        let active = self.presents.measure(counter()?, interval, |tick, values| {
+            let offset = Duration::from_secs_f64(tick.abs_diff(origin) as f64 / frequency);
+            let at = if tick >= origin {
+                instant + offset
+            } else {
+                instant - offset
+            };
+            record(at, values);
+        });
+        Ok(if active {
+            Sample::Measured
+        } else {
+            Sample::Waiting(WAITING)
+        })
     }
+}
+
+fn counter() -> Result<u64, CaptureFailure> {
+    let mut tick = 0;
+    if unsafe { QueryPerformanceCounter(&mut tick) } == 0 {
+        return Err(CaptureFailure::Other("Relógio de captura indisponível"));
+    }
+    Ok(tick as u64)
 }
 
 #[derive(Clone, Copy)]
@@ -208,11 +236,20 @@ struct Timing {
 
 type Stream = (Runtime, u64);
 
+struct PeakWindow {
+    start: u64,
+    width: u64,
+    interval: Option<u64>,
+    wait: u64,
+}
+
 struct Presents {
     frequency: u64,
     pending: HashMap<(Runtime, u32), Start>,
     streams: HashMap<Stream, VecDeque<Timing>>,
     selected: Option<Stream>,
+    consumed: Option<(u64, u64)>,
+    peak_window: Option<PeakWindow>,
 }
 
 impl Presents {
@@ -222,6 +259,8 @@ impl Presents {
             pending: HashMap::new(),
             streams: HashMap::new(),
             selected: None,
+            consumed: None,
+            peak_window: None,
         }
     }
 
@@ -229,6 +268,8 @@ impl Presents {
         self.pending.clear();
         self.streams.clear();
         self.selected = None;
+        self.consumed = None;
+        self.peak_window = None;
     }
 
     fn record(&mut self, event: PresentEvent) {
@@ -290,55 +331,107 @@ impl Presents {
         });
     }
 
-    fn measure(&mut self, now: u64, peak_window: Duration) -> Option<[Option<f64>; SENSOR_COUNT]> {
-        // ETW may deliver a full second of events in one batch. Only discard the
-        // last reading after allowing for that delay and one missed batch.
-        let oldest = now.saturating_sub(self.frequency.saturating_mul(2));
-        self.streams
-            .retain(|_, timings| timings.back().is_some_and(|timing| timing.stop >= oldest));
-        let latest = self
-            .streams
-            .values()
-            .filter_map(VecDeque::back)
-            .map(|timing| timing.stop)
-            .max()?;
-        let cutoff = latest.saturating_sub(self.frequency);
-        let peak_ticks = (u128::from(self.frequency) * peak_window.as_millis() / 1_000) as u64;
-        let peak_cutoff = latest.saturating_sub(peak_ticks);
+    fn measure(
+        &mut self,
+        now: u64,
+        interval: Duration,
+        mut emit: impl FnMut(u64, [Option<f64>; SENSOR_COUNT]),
+    ) -> bool {
+        // Allow for ETW delivery latency and keep the preceding second for rolling FPS.
+        let oldest = now.saturating_sub(2 * self.frequency);
         self.streams.retain(|_, timings| {
-            while timings.front().is_some_and(|timing| timing.stop < cutoff) {
+            while timings
+                .front()
+                .is_some_and(|frame| frame.stop < oldest.saturating_sub(self.frequency))
+            {
                 timings.pop_front();
             }
-            !timings.is_empty()
+            timings.back().is_some_and(|frame| frame.stop >= oldest)
         });
-        let (&stream, timings) = self.streams.iter().max_by_key(|(stream, timings)| {
-            (
-                timings.len(),
-                Some(**stream) == self.selected,
-                timings.back().map(|timing| timing.stop),
-            )
-        })?;
-        self.selected = Some(stream);
-        let to_ms = |ticks: u64| ticks as f64 * 1_000.0 / self.frequency as f64;
-        let mut interval_count = 0;
-        let mut total_ms = 0.0;
-        let mut peak_interval = None;
-        let mut peak_wait = None;
-        for timing in timings {
-            if timing.stop >= peak_cutoff {
-                peak_wait = peak_wait.max(Some(timing.stop - timing.start));
-                peak_interval = peak_interval.max(timing.interval);
-            }
-            if let Some(interval) = timing.interval {
-                interval_count += 1;
-                total_ms += to_ms(interval);
+        let Some(latest) = self
+            .streams
+            .values()
+            .filter_map(|frames| frames.back())
+            .map(|f| f.stop)
+            .max()
+        else {
+            return false;
+        };
+        let cutoff = latest.saturating_sub(self.frequency);
+        let (&stream, timings) = self
+            .streams
+            .iter()
+            .max_by_key(|(stream, frames)| {
+                let recent = frames.len() - frames.partition_point(|f| f.stop < cutoff);
+                (
+                    recent,
+                    Some(**stream) == self.selected,
+                    frames.back().map(|f| f.stop),
+                )
+            })
+            .expect("ao menos uma apresentação");
+        if self.selected != Some(stream) {
+            self.selected = Some(stream);
+            self.peak_window = None;
+        }
+        let first = timings
+            .partition_point(|f| self.consumed.is_some_and(|last| (f.stop, f.start) <= last));
+        if first == timings.len() {
+            return true;
+        }
+        let width = ((u128::from(self.frequency) * interval.as_millis()) / 1000).max(1) as u64;
+        let to_ms = |ticks: u64| ticks as f64 * 1000.0 / self.frequency as f64;
+        let mut left = timings
+            .partition_point(|f| f.stop < timings[first].stop.saturating_sub(self.frequency));
+        let mut sum = 0;
+        let mut count = 0usize;
+        for f in timings.range(left..first) {
+            if let Some(delta) = f.interval {
+                sum += delta;
+                count += 1;
             }
         }
-        Some([
-            (interval_count > 0).then(|| interval_count as f64 * 1_000.0 / total_ms),
-            peak_interval.map(to_ms),
-            peak_wait.map(to_ms),
-        ])
+        for i in first..timings.len() {
+            let f = &timings[i];
+            while timings[left].stop < f.stop.saturating_sub(self.frequency) {
+                if let Some(delta) = timings[left].interval {
+                    sum -= delta;
+                    count -= 1;
+                }
+                left += 1;
+            }
+            if let Some(delta) = f.interval {
+                sum += delta;
+                count += 1;
+            }
+            if self
+                .peak_window
+                .as_ref()
+                .is_none_or(|w| w.width != width || f.stop - w.start >= width)
+            {
+                self.peak_window = Some(PeakWindow {
+                    start: f.stop,
+                    width,
+                    interval: None,
+                    wait: 0,
+                });
+            }
+            let window = self.peak_window.as_mut().expect("janela de apresentações");
+            window.interval = window.interval.max(f.interval);
+            window.wait = window.wait.max(f.stop - f.start);
+            if timings
+                .get(i + 1)
+                .is_none_or(|next| next.stop - window.start >= width)
+            {
+                let fps = (count > 0).then(|| count as f64 * 1000.0 / to_ms(sum));
+                emit(
+                    window.start,
+                    [fps, window.interval.map(to_ms), Some(to_ms(window.wait))],
+                );
+            }
+            self.consumed = Some((f.stop, f.start));
+        }
+        true
     }
 }
 
@@ -364,7 +457,7 @@ mod tests {
         ));
         assert!(!Sample::Unavailable(busy).requires_admin());
         assert!(!Sample::Waiting(WAITING).requires_admin());
-        assert!(!Sample::Measured([None; SENSOR_COUNT]).requires_admin());
+        assert!(!Sample::Measured.requires_admin());
     }
 
     #[test]
@@ -385,7 +478,7 @@ mod tests {
             };
             assert_eq!(sampler.retry_at, Some(now + CAPTURE_RETRY));
             assert!(matches!(
-                sampler.sample(ONE_SECOND),
+                sampler.sample(ONE_SECOND, |_, _| unreachable!()),
                 Sample::Unavailable(CaptureFailure::Retryable(_))
             ));
             assert_eq!(sampler.retry_at, Some(now + CAPTURE_RETRY));
@@ -438,41 +531,54 @@ mod tests {
         }
     }
 
-    #[test]
-    fn measures_timestamps_and_keeps_spikes_inside_the_window() {
-        let mut presents = Presents::new(1_000);
-        present(&mut presents, 1, 10, 100, 0);
-        assert_eq!(
-            presents.measure(150, ONE_SECOND),
-            Some([None, None, Some(0.0)])
-        );
-        present(&mut presents, 1, 10, 120, 4);
-        present(&mut presents, 1, 10, 200, 9);
-        present(&mut presents, 1, 10, 220, 2);
-        assert_eq!(
-            presents.measure(300, ONE_SECOND),
-            Some([Some(25.0), Some(80.0), Some(9.0)])
-        );
-        present(&mut presents, 1, 10, 1_211, 1);
-        assert_eq!(presents.measure(1_212, ONE_SECOND).unwrap()[2], Some(2.0));
-        assert!(presents.measure(3_213, ONE_SECOND).is_none());
+    fn batch(
+        p: &mut Presents,
+        now: u64,
+        window: Duration,
+    ) -> Vec<(u64, [Option<f64>; SENSOR_COUNT])> {
+        let mut points = Vec::new();
+        p.measure(now, window, |at, readings| points.push((at, readings)));
+        points
     }
 
     #[test]
-    fn sampling_interval_limits_the_two_peaks_while_fps_uses_one_second() {
-        let mut presents = Presents::new(10_000);
-        present(&mut presents, 1, 10, 1_000, 0);
-        present(&mut presents, 1, 10, 5_000, 120);
-        present(&mut presents, 1, 10, 6_000, 30);
-        present(&mut presents, 1, 10, 6_200, 10);
-
+    fn delayed_batches_keep_peaks_at_event_time_without_replaying_old_events() {
+        let mut p = Presents::new(1000);
+        let interval = Duration::from_millis(100);
+        present(&mut p, 1, 10, 100, 0);
         assert_eq!(
-            presents.measure(6_500, Duration::from_millis(200)),
-            Some([Some(3_000.0 / 520.0), Some(400.0), Some(12.0)])
+            batch(&mut p, 100, interval),
+            [(100, [None, None, Some(0.0)])]
         );
+        for start in [
+            180, 196, 212, 228, 244, 260, 276, 292, 308, 324, 340, 356, 372, 388, 404,
+        ] {
+            present(&mut p, 1, 10, start, 1);
+        }
+        let points = batch(&mut p, 505, interval);
         assert_eq!(
-            presents.measure(6_500, Duration::from_millis(100)),
-            Some([Some(3_000.0 / 520.0), Some(100.0), Some(3.0)])
+            points.iter().map(|(at, v)| (*at, v[1])).collect::<Vec<_>>(),
+            [(100, Some(80.0)), (213, Some(16.0)), (325, Some(16.0))]
+        );
+        assert!(batch(&mut p, 605, interval).is_empty());
+        assert!(!p.measure(2500, interval, |_, _| unreachable!()));
+    }
+
+    #[test]
+    fn changed_cadence_opens_a_new_bucket_and_fps_uses_one_second() {
+        let mut p = Presents::new(1000);
+        for (start, wait) in [(100, 0), (120, 4), (200, 9), (220, 2)] {
+            present(&mut p, 1, 10, start, wait);
+        }
+        assert_eq!(
+            batch(&mut p, 300, ONE_SECOND),
+            [(100, [Some(25.0), Some(80.0), Some(9.0)])]
+        );
+        present(&mut p, 1, 10, 1211, 1);
+        let points = batch(&mut p, 1212, Duration::from_millis(100));
+        assert_eq!(
+            points,
+            [(1212, [Some(2000.0 / 1011.0), Some(991.0), Some(1.0)])]
         );
     }
 
@@ -495,13 +601,13 @@ mod tests {
         present(&mut presents, 2, 11, 160, 7);
         present(&mut presents, 1, 10, 200, 2);
         assert_eq!(
-            presents.measure(250, ONE_SECOND),
+            batch(&mut presents, 250, ONE_SECOND).last().map(|p| p.1),
             Some([Some(10.0), Some(100.0), Some(3.0)])
         );
         presents.clear();
         present(&mut presents, 1, 10, 300, 1);
         assert_eq!(
-            presents.measure(350, ONE_SECOND),
+            batch(&mut presents, 350, ONE_SECOND).last().map(|p| p.1),
             Some([None, None, Some(1.0)])
         );
     }

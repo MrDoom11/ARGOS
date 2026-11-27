@@ -362,7 +362,7 @@ pub(super) fn tick(hwnd: HWND, state: &RefCell<Window>) {
     match action {
         Action::None => stop_if_idle(hwnd, state),
         Action::Prefetch => {
-            let _ = state.borrow().monitor.snapshot();
+            let _ = state.borrow().request_snapshot();
         }
         Action::Show => show(hwnd, state),
         Action::Hide => hide(hwnd, state),

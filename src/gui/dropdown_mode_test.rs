@@ -7,6 +7,9 @@ use windows_sys::w;
 
 #[test]
 fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
+    let _desktop = crate::gui::TEST_DESKTOP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _dpi = DpiContext(unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     });
@@ -15,7 +18,7 @@ fn hotkey_and_relaunch_reveal_the_panel_without_taking_focus() {
     let start = initial_bounds(Some(display.work), dpi);
     let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX, CPU_POWER_INDEX]);
     board.columns = 1;
-    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let monitor = Monitor::idle(Vec::new(), 1_000, board.cpu_metrics());
     board.dropdown.enabled = true;
     board.dropdown.monitor = Some(display.id.clone());
     let trigger = display.trigger(board.dropdown.alignment, board.dropdown.width);
@@ -378,7 +381,7 @@ fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
     let mut board = Board::new([CPU_USAGE_INDEX, RAM_USED_INDEX]);
     board.columns = 1;
     board.dropdown.enabled = true;
-    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let monitor = Monitor::idle(Vec::new(), 1_000, board.cpu_metrics());
     let mut app = Window::new(monitor, board, 96, Source::PortableExact);
     app.elevated = false;
     assert!(app.update_snapshot(Some(Arc::new(test_snapshot()))));
@@ -506,7 +509,7 @@ fn options_menu_groups_related_commands_and_shortcuts_share_controls() {
 #[test]
 fn update_actions_remain_available_from_the_main_menu() {
     let board = Board::new([]);
-    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let monitor = Monitor::idle(Vec::new(), 1_000, board.cpu_metrics());
     let mut app = Window::new(monitor, board, 96, Source::PortableExact);
     let menu =
         |app: &Window| options_menu(null_mut(), app, MenuSection::All, &[], &[], None).unwrap();
@@ -621,7 +624,7 @@ fn menu_position(menu: HMENU, label: &str) -> Option<u32> {
 #[test]
 fn storage_menu_shows_independent_checks_and_drive_names() {
     let board = Board::new([]);
-    let monitor = Monitor::start(Vec::new(), 1_000, board.cpu_metrics()).unwrap();
+    let monitor = Monitor::idle(Vec::new(), 1_000, board.cpu_metrics());
     let mut app = Window::new(monitor, board, 96, Source::PortableExact);
     let mut snapshot = test_snapshot();
     let ids = [

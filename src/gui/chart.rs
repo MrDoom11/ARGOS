@@ -72,7 +72,6 @@ pub(super) fn paint(
                     window,
                     interval: metric.interval,
                 },
-                stats: Statistics::from_points(points),
             }
         })
         .collect();
@@ -254,7 +253,6 @@ struct SeriesView<'a> {
     color: COLORREF,
     gpu: Option<&'a str>,
     timeline: Timeline<'a>,
-    stats: Option<Statistics>,
 }
 
 impl SeriesView<'_> {
@@ -438,7 +436,7 @@ fn paint_statistics(
             );
             left += label_width;
         }
-        let line = view.stats.as_ref().map_or_else(
+        let line = Statistics::from_points(view.timeline.points).map_or_else(
             || "Mín —   Máx —   Méd —".to_owned(),
             |stats| {
                 format!(
@@ -954,7 +952,6 @@ mod tests {
                 window: Duration::from_secs(10),
                 interval: metric.interval,
             },
-            stats: None,
         };
         assert_eq!(view.label(false), "Ping · 2001:db8::10");
         assert_eq!(view.label(true), view.label(false));

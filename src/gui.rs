@@ -2056,6 +2056,7 @@ struct Window {
 
 impl Window {
     fn new(monitor: Monitor, board: Board, dpi: u32, source: Source) -> Self {
+        monitor.set_gpu_history_mask(board.gpu_history_mask());
         Self {
             monitor,
             updater: Updater::new(source),
@@ -2117,8 +2118,14 @@ impl Window {
         self.tray.as_ref().is_some_and(tray::Tray::available)
     }
 
+    fn request_snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.monitor
+            .set_gpu_history_mask(self.board.gpu_history_mask());
+        self.monitor.snapshot()
+    }
+
     fn refresh(&mut self) -> bool {
-        self.update_snapshot(self.monitor.snapshot())
+        self.update_snapshot(self.request_snapshot())
     }
 
     fn refresh_cached(&mut self) -> bool {
@@ -3691,6 +3698,10 @@ fn window_error(action: &str) -> String {
     format!("falha ao {action} ({})", io::Error::last_os_error())
 }
 
+// Native tests that show windows or change focus share the desktop's Z order.
+#[cfg(test)]
+static TEST_DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3745,6 +3756,7 @@ mod tests {
 
     #[test]
     fn window_drag_requests_native_move_at_the_screen_point() {
+        let _desktop = TEST_DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         use std::cell::Cell;
         use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 

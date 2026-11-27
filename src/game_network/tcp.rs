@@ -20,6 +20,7 @@ pub(super) struct TcpRtt {
     target: Target,
     table: Vec<u32>,
     enable_result: Option<u32>,
+    last_count: Option<u32>,
 }
 
 impl TcpRtt {
@@ -28,17 +29,23 @@ impl TcpRtt {
             target,
             table: Vec::new(),
             enable_result: None,
+            last_count: None,
         }
     }
 
     pub(super) fn sample(&mut self) -> Result<Option<f64>, Failure> {
         let Some(connection) = self.find_connection()? else {
             self.enable_result = None;
+            self.last_count = None;
             return Ok(None);
         };
         match connection.read() {
-            Ok(Some(stats)) => Ok((stats.CountRtt > 0).then_some(f64::from(stats.SmoothedRtt))),
+            Ok(Some(stats)) => {
+                self.enable_result = None;
+                Ok(fresh_rtt(&mut self.last_count, &stats))
+            }
             Ok(None) => {
+                self.last_count = None;
                 let status = *self
                     .enable_result
                     .get_or_insert_with(|| connection.enable());
@@ -57,6 +64,7 @@ impl TcpRtt {
                 }
             }
             Err(ERROR_NOT_FOUND) => {
+                self.last_count = None;
                 self.enable_result = None;
                 Ok(None)
             }
@@ -181,6 +189,12 @@ impl TcpRtt {
     }
 }
 
+// The first read establishes a baseline: a connection may already have old RTT samples.
+fn fresh_rtt(previous: &mut Option<u32>, stats: &TCP_ESTATS_PATH_ROD_v0) -> Option<f64> {
+    let before = previous.replace(stats.CountRtt)?;
+    (stats.CountRtt != before && stats.CountRtt != 0).then_some(f64::from(stats.SmoothedRtt))
+}
+
 // SAFETY: `R` must be the owner-PID row type corresponding to the table, aligned
 // to at most four bytes and valid for all integer bit patterns.
 unsafe fn table_rows<R>(table: &[u32], offset: usize) -> &[R] {
@@ -267,4 +281,30 @@ fn api_error(operation: &str, status: u32) -> Failure {
     Failure::Other(format!(
         "O Windows não conseguiu {operation} (código {status})."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publishes_only_after_new_tcp_measurements() {
+        let mut previous = None;
+        let mut observe = |count| {
+            fresh_rtt(
+                &mut previous,
+                &TCP_ESTATS_PATH_ROD_v0 {
+                    CountRtt: count,
+                    SmoothedRtt: 17,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(observe(12), None);
+        assert_eq!(observe(12), None);
+        assert_eq!(observe(13), Some(17.0));
+        assert_eq!(observe(13), None);
+        assert_eq!(observe(0), None);
+        assert_eq!(observe(1), Some(17.0));
+    }
 }

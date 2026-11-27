@@ -184,6 +184,7 @@ struct Destination {
     active: usize,
     lookup_at: Option<Instant>,
     lookup_error: Option<String>,
+    last_resolution: Option<Instant>,
     probe: Option<IcmpRtt>,
     failures: u8,
 }
@@ -200,6 +201,7 @@ impl Destination {
             active: 0,
             lookup_at: literal.is_none().then_some(now),
             lookup_error: None,
+            last_resolution: None,
             probe: None,
             failures: 0,
         }
@@ -207,22 +209,30 @@ impl Destination {
 
     fn sample(&mut self, now: Instant, selected: impl FnOnce() -> bool) -> Option<Observation> {
         if self.lookup_at.is_some_and(|deadline| now >= deadline) {
-            self.refresh_dns();
+            let result = resolve(&self.address);
+            self.apply_resolution(result, Instant::now());
         }
         // A destination removed while DNS was in progress must never start a new probe.
         if !selected() {
             return None;
         }
-        let Some(&address) = self.addresses.get(self.active) else {
-            return Some(
-                self.observation(
-                    None,
-                    Rtt::Unavailable,
-                    self.lookup_error
-                        .clone()
-                        .unwrap_or_else(|| "Endereço indisponível para sondagem".to_owned()),
+        if let Some(error) = &self.lookup_error {
+            let detail = match (self.addresses.get(self.active), self.last_resolution) {
+                (Some(address), Some(at)) => format!(
+                    "{error} · último IP {} resolvido há {} s",
+                    address.ip(),
+                    now.saturating_duration_since(at).as_secs()
                 ),
-            );
+                _ => error.clone(),
+            };
+            return Some(self.observation(None, Rtt::Unavailable, detail));
+        }
+        let Some(&address) = self.addresses.get(self.active) else {
+            return Some(self.observation(
+                None,
+                Rtt::Unavailable,
+                "Endereço indisponível para sondagem".into(),
+            ));
         };
         let probe = self
             .probe
@@ -246,8 +256,8 @@ impl Destination {
         Some(self.observation(Some(address), rtt, detail))
     }
 
-    fn refresh_dns(&mut self) {
-        match resolve(&self.address) {
+    fn apply_resolution(&mut self, result: io::Result<Vec<SocketAddr>>, at: Instant) {
+        match result {
             Ok(addresses) => {
                 let previous = self.addresses.get(self.active);
                 if let Some(active) = previous
@@ -258,11 +268,14 @@ impl Destination {
                     self.select_address(0);
                 }
                 self.addresses = addresses;
-                self.lookup_at = Some(Instant::now() + DNS_REFRESH);
+                self.last_resolution = Some(at);
+                self.lookup_at = Some(at + DNS_REFRESH);
                 self.lookup_error = None;
             }
             Err(error) => {
-                self.lookup_at = Some(Instant::now() + DNS_RETRY);
+                self.probe = None;
+                self.failures = 0;
+                self.lookup_at = Some(at + DNS_RETRY);
                 self.lookup_error = Some(format!("Falha na resolução DNS ({error})"));
             }
         }
@@ -323,6 +336,26 @@ fn valid_destination(address: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_refresh_pauses_icmp_until_dns_recovers() {
+        let start = Instant::now();
+        let mut dest = Destination::new("router.example".into(), start);
+        let old = "192.0.2.1:0".parse().unwrap();
+        dest.apply_resolution(Ok(vec![old]), start);
+        let failed = start + DNS_REFRESH;
+        dest.apply_resolution(Err(io::Error::other("DNS indisponível")), failed);
+        let reading = dest
+            .sample(failed + Duration::from_secs(2), || true)
+            .unwrap();
+        assert!(matches!(reading.rtt, Rtt::Unavailable));
+        assert!(reading.resolved_ip.is_none() && dest.probe.is_none());
+        assert!(reading.detail.contains("192.0.2.1") && reading.detail.contains("62 s"));
+        let new = "192.0.2.2:0".parse().unwrap();
+        dest.apply_resolution(Ok(vec![new]), failed + DNS_RETRY);
+        assert!(dest.lookup_error.is_none());
+        assert_eq!(dest.addresses[dest.active], new);
+    }
 
     #[test]
     fn keeps_retained_targets_and_invalidates_removed_workers() {
