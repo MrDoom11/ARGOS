@@ -1,0 +1,5 @@
+• Quadros — o gráfico preserva picos de frametime no horário do evento, inclusive quando o Windows entrega vários quadros de uma vez.
+
+• Ping — o gráfico do aplicativo deixa uma lacuna quando a conexão TCP não tem uma nova medição. Se a renovação do DNS falhar, o ping personalizado pausa até o nome voltar a resolver.
+
+• Desempenho — a interface copia o histórico das curvas de GPU configuradas. Ao ativar uma curva, você pode ver as amostras já coletadas. Os cards compactos calculam mínimo, máximo e média apenas quando há espaço para exibir as estatísticas.
