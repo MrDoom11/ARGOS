@@ -649,6 +649,9 @@ mod tests {
 
     #[test]
     fn slide_frame_crops_the_bitmap_at_the_fixed_top_edge() {
+        let _desktop = crate::gui::TEST_DESKTOP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let bounds = area(24, 48, 104, 108);
         let hwnd = unsafe {
             CreateWindowExW(

@@ -460,6 +460,9 @@ mod tests {
 
     #[test]
     fn notice_grows_with_its_text_and_limits_height_to_the_monitor() {
+        let _desktop = crate::gui::TEST_DESKTOP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let short = notice_height("Uma linha.", false, Theme::Dark);
         let multiline = notice_height(
             "Primeira linha.\nSegunda linha.\nTerceira linha.",

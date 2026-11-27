@@ -3691,6 +3691,10 @@ fn window_error(action: &str) -> String {
     format!("falha ao {action} ({})", io::Error::last_os_error())
 }
 
+// Native tests that show windows or change focus share the desktop's Z order.
+#[cfg(test)]
+static TEST_DESKTOP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3745,6 +3749,7 @@ mod tests {
 
     #[test]
     fn window_drag_requests_native_move_at_the_screen_point() {
+        let _desktop = TEST_DESKTOP.lock().unwrap_or_else(|e| e.into_inner());
         use std::cell::Cell;
         use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 

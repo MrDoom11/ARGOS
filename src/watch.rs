@@ -453,21 +453,9 @@ impl Monitor {
         if !GUI_INTERVALS_MS.contains(&interval_ms) {
             return Err(format!("intervalo de coleta inválido: {interval_ms} ms"));
         }
-        let feed = Arc::new(WindowFeed {
-            latest: Mutex::new(None),
-            requested: AtomicBool::new(true),
-            interval_ms: AtomicU32::new(interval_ms),
-            gpu_selections: Mutex::new(gpus),
-            frame_target: Mutex::default(),
-            cpu_metrics: AtomicU8::new(cpu_metrics.bits()),
-            game_latency_enabled: AtomicBool::new(false),
-            custom_ping_targets: Mutex::default(),
-            network_settings: Mutex::default(),
-            storage_selection: Mutex::default(),
-        });
-        let stopped = Arc::new(AtomicBool::new(false));
-        let worker_feed = Arc::clone(&feed);
-        let stop = Arc::clone(&stopped);
+        let mut monitor = Self::idle(gpus, interval_ms, cpu_metrics);
+        let worker_feed = Arc::clone(&monitor.feed);
+        let stop = Arc::clone(&monitor.stopped);
         let interval = Duration::from_millis(u64::from(interval_ms));
         let options = WatchOptions {
             gpus: Vec::new(),
@@ -482,11 +470,28 @@ impl Monitor {
                 let _ = collect(options, Sink::Window(worker_feed), &stop);
             })
             .map_err(|error| format!("falha ao iniciar a coleta ({error})"))?;
-        Ok(Self {
+        monitor.worker = Some(worker);
+        Ok(monitor)
+    }
+
+    pub(crate) fn idle(gpus: Vec<Selection>, interval_ms: u32, cpu_metrics: CpuMetrics) -> Self {
+        let feed = Arc::new(WindowFeed {
+            latest: Mutex::new(None),
+            requested: AtomicBool::new(true),
+            interval_ms: AtomicU32::new(interval_ms),
+            gpu_selections: Mutex::new(gpus),
+            frame_target: Mutex::default(),
+            cpu_metrics: AtomicU8::new(cpu_metrics.bits()),
+            game_latency_enabled: AtomicBool::new(false),
+            custom_ping_targets: Mutex::default(),
+            network_settings: Mutex::default(),
+            storage_selection: Mutex::default(),
+        });
+        Self {
             feed,
-            stopped,
-            worker: Some(worker),
-        })
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -731,6 +736,7 @@ struct HistorySummary {
 struct FrameMonitor {
     pid: u32,
     sampler: FrameSampler,
+    pending_status: Option<Reading>,
     group: Group<{ FRAME_SENSORS.len() }>,
     status: Option<&'static str>,
     requires_admin: bool,
@@ -1490,29 +1496,47 @@ impl FrameMonitor {
         Self {
             pid,
             sampler,
+            pending_status: None,
             group: Group::new(Instant::now(), interval, FASTEST_GUI_INTERVAL),
             status: None,
             requires_admin: false,
         }
     }
 
-    fn collect(&mut self, start: Instant) -> bool {
+    fn collect(&mut self) -> bool {
+        if Instant::now() < self.group.cadence.deadline() {
+            return false;
+        }
         let interval = self.group.cadence.interval();
-        self.group
-            .capture(start, || {
-                let sample = self.sampler.sample(interval);
-                self.status = Some(sample.status());
-                self.requires_admin = sample.requires_admin();
-                match sample {
-                    frames::Sample::Measured(values) => {
-                        values.map(|value| value.map_or(Reading::Pending, Reading::Value))
-                    }
-                    frames::Sample::Waiting(_) => [Reading::Pending; FRAME_SENSORS.len()],
-                    frames::Sample::Unavailable(_) => [Reading::Unavailable; FRAME_SENSORS.len()],
-                }
-                .into()
-            })
-            .is_some()
+        let history = &mut self.group.history;
+        let sample = self.sampler.sample(interval, |at, values| {
+            let frame = values
+                .map(|v| v.map_or(Reading::Pending, Reading::Value))
+                .into();
+            history.upsert(at, StoredFrame { frame, interval });
+        });
+        let now = Instant::now();
+        self.group.cadence.complete(now);
+        self.pending_status = match sample {
+            frames::Sample::Measured => None,
+            frames::Sample::Waiting(_) => Some(Reading::Pending),
+            frames::Sample::Unavailable(_) => Some(Reading::Unavailable),
+        };
+        if self.status != Some(sample.status())
+            && history.len() > 0
+            && let Some(reading) = self.pending_status
+        {
+            history.push(
+                now,
+                StoredFrame {
+                    frame: [reading; FRAME_SENSORS.len()].into(),
+                    interval,
+                },
+            );
+        }
+        self.status = Some(sample.status());
+        self.requires_admin = sample.requires_admin();
+        true
     }
 }
 
@@ -1664,7 +1688,7 @@ fn collect(mut options: WatchOptions, sink: Sink, stopped: &AtomicBool) -> Resul
                 snapshot_pending = true;
             }
             if let Some(frames) = &mut dashboard.frames {
-                snapshot_pending |= frames.collect(start);
+                snapshot_pending |= frames.collect();
             }
             if latency_enabled && dashboard.game_latency.is_none() {
                 dashboard.game_latency = Some(GameLatencyMonitor::new());
@@ -1881,10 +1905,20 @@ fn build_snapshot(
         interval,
         axis_limits,
     );
-    if frames.is_some_and(|frames| frames.requires_admin) {
+    if let Some(frames) = frames {
         for metric in &mut metrics[FRAME_SENSOR_START..CPU_TEMPERATURE_INDEX] {
-            metric.requires_admin = true;
+            metric.requires_admin = frames.requires_admin;
+            if let Some(reading) = frames.pending_status {
+                metric.points.push(MetricPoint {
+                    at,
+                    reading,
+                    interval,
+                });
+            }
         }
+    }
+    for metric in &mut metrics[FRAME_SENSOR_START + 1..CPU_TEMPERATURE_INDEX] {
+        expand_axis_to_peak(metric);
     }
     let cpu = dashboard.cpu.as_ref();
     append_metrics(

@@ -76,6 +76,32 @@ impl<T> History<T> {
         self.points.push_back((at, value));
     }
 
+    /// ETW can deliver a measured window after a newer status marker was recorded.
+    pub(crate) fn upsert(&mut self, at: Instant, value: T) {
+        let Some(&(latest, _)) = self.points.back() else {
+            return self.push(at, value);
+        };
+        if at > latest {
+            return self.push(at, value);
+        }
+        if latest.duration_since(at) >= self.retention {
+            return;
+        }
+        match self.points.binary_search_by_key(&at, |(time, _)| *time) {
+            Ok(index) => self.points[index].1 = value,
+            Err(mut index) => {
+                if self.points.len() == self.capacity {
+                    if index == 0 {
+                        return;
+                    }
+                    self.points.pop_front();
+                    index -= 1;
+                }
+                self.points.insert(index, (at, value));
+            }
+        }
+    }
+
     pub(crate) fn prune(&mut self, at: Instant) {
         while self.points.front().is_some_and(|(timestamp, _)| {
             at.saturating_duration_since(*timestamp) >= self.retention
@@ -130,6 +156,31 @@ mod tests {
         cadence.set_interval(fast);
         assert_eq!(cadence.interval(), fast);
         assert_eq!(cadence.deadline(), completion + fast);
+    }
+
+    #[test]
+    fn backfilled_samples_update_their_window_and_preserve_later_gaps() {
+        let start = Instant::now();
+        let at = |s| start + Duration::from_secs(s);
+        let mut history = History::new(Duration::from_secs(5), 3);
+        history.push(at(3), Some(16));
+        history.push(at(6), None);
+        history.upsert(at(4), Some(50));
+        history.upsert(at(4), Some(80));
+        history.upsert(at(1), Some(90));
+        assert!(
+            history
+                .iter()
+                .map(|(_, v)| *v)
+                .eq([Some(16), Some(80), None])
+        );
+        history.upsert(at(5), Some(12));
+        assert!(
+            history
+                .iter()
+                .map(|(_, v)| *v)
+                .eq([Some(80), Some(12), None])
+        );
     }
 
     #[test]
